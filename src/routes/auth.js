@@ -1,0 +1,99 @@
+const router = require('express').Router();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
+const { body, validationResult } = require('express-validator');
+const { getDb } = require('../db/schema');
+const { authenticate } = require('../middleware/auth');
+
+const makeToken = (user) => jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
+const safe = ({ password, ...u }) => u;
+
+router.post('/register', [
+  body('email').isEmail().normalizeEmail(),
+  body('password').isLength({ min: 6 }),
+  body('first_name').trim().notEmpty(),
+  body('last_name').trim().notEmpty(),
+  body('role').isIn(['client','oeil']),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const db = getDb();
+  const { email, password, first_name, last_name, role, phone, city } = req.body;
+  const { rows: existing } = await db.query('SELECT id FROM users WHERE email=$1', [email]);
+  if (existing.length) return res.status(409).json({ error: 'Email déjà utilisé' });
+
+  const id = uuidv4();
+  const { rows: [user] } = await db.query(
+    `INSERT INTO users (id,email,password,role,first_name,last_name,phone,city) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [id, email, bcrypt.hashSync(password, 10), role, first_name, last_name, phone||null, city||null]
+  );
+  if (role === 'oeil') await db.query(`INSERT INTO oeil_profiles (user_id) VALUES ($1)`, [id]);
+
+  await db.query(`INSERT INTO notifications (user_id,title,body,type) VALUES ($1,$2,$3,'info')`, [
+    id, 'Bienvenue sur SHOOFLY 👁️',
+    role === 'oeil' ? 'Votre profil sera vérifié sous 24h.' : 'Vous pouvez commander votre première mission.'
+  ]);
+
+  res.status(201).json({ token: makeToken(user), user: safe(user) });
+});
+
+router.post('/login', [
+  body('email').isEmail().normalizeEmail(),
+  body('password').notEmpty(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const db = getDb();
+  const { rows: [user] } = await db.query('SELECT * FROM users WHERE email=$1', [req.body.email]);
+  if (!user || !bcrypt.compareSync(req.body.password, user.password))
+    return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
+  if (!user.is_active) return res.status(403).json({ error: 'Compte suspendu' });
+
+  let profile = null;
+  if (user.role === 'oeil') {
+    const { rows: [p] } = await db.query('SELECT * FROM oeil_profiles WHERE user_id=$1', [user.id]);
+    profile = p;
+  }
+  res.json({ token: makeToken(user), user: safe(user), profile });
+});
+
+router.get('/me', authenticate, async (req, res) => {
+  const db = getDb();
+  const { rows: [user] } = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+  if (!user) return res.status(404).json({ error: 'Introuvable' });
+  let profile = null;
+  if (user.role === 'oeil') {
+    const { rows: [p] } = await db.query('SELECT * FROM oeil_profiles WHERE user_id=$1', [user.id]);
+    profile = p;
+  }
+  res.json({ user: safe(user), profile });
+});
+
+router.put('/me', authenticate, async (req, res) => {
+  const db = getDb();
+  const { first_name, last_name, phone, city, bio, coverage_zone } = req.body;
+  const { rows: [user] } = await db.query(
+    `UPDATE users SET first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name),
+     phone=COALESCE($3,phone), city=COALESCE($4,city), updated_at=NOW() WHERE id=$5 RETURNING *`,
+    [first_name||null, last_name||null, phone||null, city||null, req.user.id]
+  );
+  if (req.user.role === 'oeil') {
+    await db.query(`UPDATE oeil_profiles SET bio=COALESCE($1,bio), coverage_zone=COALESCE($2,coverage_zone) WHERE user_id=$3`,
+      [bio||null, coverage_zone||null, req.user.id]);
+  }
+  res.json({ user: safe(user) });
+});
+
+router.put('/password', authenticate, async (req, res) => {
+  const db = getDb();
+  const { rows: [user] } = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+  if (!bcrypt.compareSync(req.body.current_password, user.password))
+    return res.status(400).json({ error: 'Mot de passe actuel incorrect' });
+  await db.query('UPDATE users SET password=$1 WHERE id=$2', [bcrypt.hashSync(req.body.new_password, 10), req.user.id]);
+  res.json({ message: 'Mot de passe modifié' });
+});
+
+module.exports = router;
