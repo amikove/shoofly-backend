@@ -1,9 +1,10 @@
-const seed = require('./src/db/seed.js')
 const { execSync } = require('child_process')
 
-seed().then(() => {
-  require('./src/index.js')
-}).catch((err) => {
-  console.error('Seed error:', err.message)
-  require('./src/index.js')
-})
+try {
+  console.log('🌱 Lancement du seed...')
+  execSync('node src/db/seed.js', { stdio: 'inherit' })
+} catch (e) {
+  console.log('Seed déjà fait ou erreur ignorée:', e.message)
+}
+
+require('./src/index.js')
