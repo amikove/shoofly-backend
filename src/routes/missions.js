@@ -87,19 +87,23 @@ router.post('/', authenticate, requireRole('client'), [
   const id = uuidv4();
   const { commission, oeil_earning } = pricing(+price);
 
-  const { rows: [mission] } = await db.query(`
-    INSERT INTO missions (
-      id,client_id,type,status,title,description,address,city,scheduled_at,
-      duration_est,price,commission,oeil_earning,is_urgent,
-      property_type,visit_type,video_call,institution,purpose,
-      company_name,audit_type,frequency,criteria, oeil_id
-    ) VALUES ($1,$2,$3,oeil_id ? 'assigned' : 'pending',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-    RETURNING *
-  `, [id, req.user.id, type, title, description||null, address, city,
-      new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
-      !!is_urgent, property_type||null, visit_type||null, !!video_call,
-      institution||null, purpose||null, company_name||null, audit_type||null,
-      frequency||null, criteria||null], oeil_id||null);
+const status = oeil_id ? 'assigned' : 'pending';
+
+const { rows: [mission] } = await db.query(`
+  INSERT INTO missions (
+    id,client_id,type,status,title,description,address,city,scheduled_at,
+    duration_est,price,commission,oeil_earning,is_urgent,
+    property_type,visit_type,video_call,institution,purpose,
+    company_name,audit_type,frequency,criteria,oeil_id
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+  RETURNING *
+`, [
+  id, req.user.id, type, status, title, description||null, address, city,
+  new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
+  !!is_urgent, property_type||null, visit_type||null, !!video_call,
+  institution||null, purpose||null, company_name||null, audit_type||null,
+  frequency||null, criteria||null, oeil_id||null
+]);
 
   // Notify verified available oeils
   const { rows: oeils } = await db.query(
