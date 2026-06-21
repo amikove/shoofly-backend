@@ -78,7 +78,7 @@ router.post('/', authenticate, requireRole('client'), [
 
   const {
     type, title, description, address, city, scheduled_at,
-    durationd_est, price, is_urgent, oeil_id,
+    duration_est, price, is_urgent, oeil_id,
     property_type, visit_type, video_call,
     institution, purpose,
     company_name, audit_type, frequency, criteria
