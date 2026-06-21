@@ -5,6 +5,13 @@ const { initDb, getDb } = require('./schema');
 
 async function seed() {
   await initDb();
+  // Vérifier si les données existent déjà
+const { rows } = await db.query("SELECT COUNT(*) FROM users WHERE email='admin@shoofly.ma'")
+if (parseInt(rows[0].count) > 0) {
+  console.log('✅ Données déjà présentes — seed ignoré')
+  await db.end()
+  return
+}
   const db = getDb();
 
   console.log('🌱 Seeding...');
