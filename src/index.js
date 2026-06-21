@@ -28,14 +28,21 @@ app.set('io', io);
 // ── Security & middleware ─────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'http://localhost',
-    'http://127.0.0.1:5173',
-  ],
+  origin: function(origin, callback) {
+    const allowed = [
+      'https://shoofly.netlify.app',
+      'http://localhost:5173',
+      'http://localhost:3000',
+      'http://localhost',
+    ];
+    if (!origin || allowed.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS bloqué: ' + origin));
+    }
+  },
   credentials: true,
-}))
+}));
 app.use(rateLimit({ windowMs: 15*60*1000, max: 300, skip: (req) => req.path === '/health' }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json({ limit: '5mb' }));
