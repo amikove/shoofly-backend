@@ -4,7 +4,7 @@
   "description": "SHOOFLY — Plateforme de présence physique à distance",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node src/db/seed.js && node src/index.js"
     "dev": "nodemon src/index.js",
     "seed": "node src/db/seed.js"
   },
