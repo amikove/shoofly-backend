@@ -26,7 +26,11 @@ const io     = new Server(server, {
 app.set('io', io);
 
 // ── Security & middleware ─────────────────────────────────
-app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  crossOriginOpenerPolicy: false,
+}))
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', 'https://shoofly.netlify.app')
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
@@ -35,6 +39,8 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200)
   next()
 })
+
+
 app.use(rateLimit({ windowMs: 15*60*1000, max: 300, skip: (req) => req.path === '/health' }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json({ limit: '5mb' }));
