@@ -191,16 +191,20 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) =
 // ── POST /missions/:id/refuse ──────────────────────────────
 router.post('/:id/refuse', authenticate, requireRole('oeil'), async (req, res) => {
   const db = getDb();
-  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
-  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (mission.oeil_id !== req.user.id && mission.status !== 'pending') return res.status(400).json({ error: 'Action impossible' });
-
-  // Just reset if this oeil had it assigned
-  if (mission.oeil_id === req.user.id) {
-    await db.query(`UPDATE missions SET oeil_id=NULL, status='pending', assigned_at=NULL WHERE id=$1`, [req.params.id]);
+  try {
+    const { rows: [mission] } = await db.query(
+      `UPDATE missions 
+       SET status='pending', oeil_id=NULL, updated_at=NOW() 
+       WHERE id=$1 AND oeil_id=$2 
+       RETURNING *`,
+      [req.params.id, req.user.id]
+    );
+    if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+    res.json({ mission });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
-
-  res.json({ message: 'Mission refusée' });
 });
 
 // ── POST /missions/:id/status ──────────────────────────────
@@ -220,7 +224,13 @@ router.post('/:id/status', authenticate, [
   if (req.user.role === 'oeil' && mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
   if (req.user.role === 'client' && mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
 
-  const transitions = { assigned:['en_route','cancelled'], en_route:['active','cancelled'], active:['completed','cancelled'] };
+  const transitions = {
+  pending:  ['cancelled'],
+  assigned: ['en_route', 'cancelled'],
+  en_route: ['active',   'cancelled'],
+  active:   ['completed','cancelled'],
+};
+
   const { status, cancel_reason } = req.body;
   if (!transitions[mission.status]?.includes(status))
     return res.status(400).json({ error: `Transition invalide: ${mission.status} → ${status}` });
