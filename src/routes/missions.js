@@ -316,6 +316,43 @@ router.post('/:id/report', authenticate, requireRole('oeil','admin'), [
 });
 
 // ── POST /missions/:id/rate ────────────────────────────────
+// ── POST /:id/messages ─────────────────────────────────
+router.post('/:id/messages', authenticate, async (req, res) => {
+  const db = getDb();
+  const { content } = req.body;
+  if (!content?.trim()) return res.status(400).json({ error: 'Message vide' });
+
+  const { rows: [mission] } = await db.query(
+    'SELECT * FROM missions WHERE id=$1', [req.params.id]
+  );
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  // Vérifier que l'utilisateur est client ou oeil de cette mission
+  const isClient = mission.client_id === req.user.id;
+  const isOeil   = mission.oeil_id   === req.user.id;
+  const isAdmin  = req.user.role === 'admin';
+  if (!isClient && !isOeil && !isAdmin) {
+    return res.status(403).json({ error: 'Accès refusé' });
+  }
+
+  const { rows: [msg] } = await db.query(
+    `INSERT INTO mission_messages (mission_id, sender_id, content, type)
+     VALUES ($1, $2, $3, 'text') RETURNING *`,
+    [req.params.id, req.user.id, content.trim()]
+  );
+
+  // Notifier via Socket.io
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`mission_${req.params.id}`).emit('new_message', {
+      ...msg,
+      sender_role: req.user.role,
+    });
+  }
+
+  res.status(201).json({ message: msg });
+});
+
 router.post('/:id/rate', authenticate, requireRole('client'), [
   body('score').isInt({ min: 1, max: 5 }),
 ], async (req, res) => {
