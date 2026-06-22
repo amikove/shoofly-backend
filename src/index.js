@@ -165,6 +165,13 @@ app.set('emitToUser', (userId, event, data) => {
 const PORT = parseInt(process.env.PORT) || 3000;
 
 initDb().then(() => {
+  // Keep-alive pour Render plan gratuit
+if (process.env.NODE_ENV === 'production') {
+  setInterval(() => {
+    require('https').get('https://shoofly-api.onrender.com/health', () => {})
+  }, 10 * 60 * 1000) // toutes les 10 minutes
+}
+
   server.listen(PORT, () => {
     console.log(`\n🚀 SHOOFLY API + WebSocket on port ${PORT}`);
     console.log(`   Health  : http://localhost:${PORT}/health`);
