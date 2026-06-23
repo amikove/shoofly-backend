@@ -60,6 +60,7 @@ async function initDb() {
       client_id     TEXT NOT NULL REFERENCES users(id),
       oeil_id       TEXT REFERENCES users(id),
       type          TEXT NOT NULL CHECK(type IN ('immobilier','file_attente','audit','personnalisee')),
+      subcategory   VARCHAR(150),
       status        TEXT NOT NULL DEFAULT 'pending'
                     CHECK(status IN ('pending','assigned','en_route','active','completed','cancelled')),
       title         TEXT NOT NULL,
