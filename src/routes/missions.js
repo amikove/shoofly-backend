@@ -91,11 +91,11 @@ const status = oeil_id ? 'assigned' : 'pending';
 
 const { rows: [mission] } = await db.query(`
   INSERT INTO missions (
-    id,client_id,type,status,title,description,address,city,scheduled_at,
+    id,client_id,type,subcategory,status,title,description,address,city,scheduled_at,
     duration_est,price,commission,oeil_earning,is_urgent,
     property_type,visit_type,video_call,institution,purpose,
     company_name,audit_type,frequency,criteria,oeil_id
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+  ) VALUES ($1,$2,$3,subcategory||null,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
   RETURNING *
 `, [
   id, req.user.id, type, status, title, description||null, address, city,
