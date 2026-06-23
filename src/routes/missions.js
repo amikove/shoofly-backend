@@ -349,7 +349,26 @@ router.post('/:id/messages', authenticate, async (req, res) => {
       sender_role: req.user.role,
     });
   }
+// Notification à l'autre partie
+  const recipientId = req.user.id === mission.client_id 
+    ? mission.oeil_id 
+    : mission.client_id;
 
+  if (recipientId) {
+    await db.query(
+      `INSERT INTO notifications (user_id, title, body, type, ref_id)
+       VALUES ($1, 'Nouveau message', $2, 'message', $3)`,
+      [recipientId, content.trim().slice(0, 80), req.params.id]
+    );
+    const emitToUser = req.app.get('emitToUser');
+    if (emitToUser) {
+      emitToUser(recipientId, 'notification', {
+        title: 'Nouveau message',
+        body: content.trim().slice(0, 80),
+        missionId: req.params.id
+      });
+    }
+  }
   res.status(201).json({ message: msg });
 });
 
