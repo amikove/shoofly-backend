@@ -355,16 +355,17 @@ router.post('/:id/messages', authenticate, async (req, res) => {
     : mission.client_id;
 
   if (recipientId) {
+    const notifBody = `${mission.title} : ${content.trim().slice(0, 60)}`
     await db.query(
-  `INSERT INTO notifications (user_id, title, body, type, mission_id)
-   VALUES ($1, 'Nouveau message', $2, 'message', $3)`,
-  [recipientId, content.trim().slice(0, 80), req.params.id]
+      `INSERT INTO notifications (user_id, title, body, type, mission_id)
+      VALUES ($1, 'Nouveau message', $2, 'message', $3)`,
+      [recipientId, notifBody, req.params.id]
     );
     const emitToUser = req.app.get('emitToUser');
     if (emitToUser) {
       emitToUser(recipientId, 'notification', {
         title: 'Nouveau message',
-        body: content.trim().slice(0, 80),
+        body: notifBody,
         missionId: req.params.id
       });
     }
