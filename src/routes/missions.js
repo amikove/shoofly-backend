@@ -41,12 +41,14 @@ router.get('/', authenticate, async (req, res) => {
 
   const wc = where.length ? 'WHERE ' + where.join(' AND ') : '';
 
+
   const { rows: missions } = await db.query(`
     SELECT m.*,
       c.first_name||' '||c.last_name AS client_name, c.phone AS client_phone,
       o.first_name||' '||o.last_name AS oeil_name,   o.phone AS oeil_phone,
       (SELECT COUNT(*) FROM mission_media WHERE mission_id=m.id)::int AS media_count,
-      (SELECT COUNT(*) FROM mission_messages WHERE mission_id=m.id)::int AS message_count
+      (SELECT COUNT(*) FROM mission_messages WHERE mission_id=m.id)::int AS message_count,
+      (SELECT COUNT(*) FROM mission_interests WHERE mission_id=m.id AND oeil_id='${req.user.id}')::int > 0 AS has_interested
     FROM missions m
     LEFT JOIN users c ON c.id=m.client_id
     LEFT JOIN users o ON o.id=m.oeil_id
@@ -54,6 +56,9 @@ router.get('/', authenticate, async (req, res) => {
     ORDER BY m.created_at DESC
     LIMIT $${p++} OFFSET $${p++}
   `, [...params, limit, offset]);
+
+
+
 
   const { rows: [{ n: total }] } = await db.query(`SELECT COUNT(*)::int AS n FROM missions m ${wc}`, params);
 
