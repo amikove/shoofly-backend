@@ -356,9 +356,9 @@ router.post('/:id/messages', authenticate, async (req, res) => {
 
   if (recipientId) {
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, ref_id)
-       VALUES ($1, 'Nouveau message', $2, 'message', $3)`,
-      [recipientId, content.trim().slice(0, 80), req.params.id]
+  `INSERT INTO notifications (user_id, title, body, type, mission_id)
+   VALUES ($1, 'Nouveau message', $2, 'message', $3)`,
+  [recipientId, content.trim().slice(0, 80), req.params.id]
     );
     const emitToUser = req.app.get('emitToUser');
     if (emitToUser) {
