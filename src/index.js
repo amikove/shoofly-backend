@@ -19,7 +19,9 @@ const userRoutes    = require('./routes/users');
 const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server, {
-  cors: { origin: process.env.FRONTEND_URL || '*', credentials: true }
+  
+  cors: { origin: ['https://shoofly.netlify.app', 'https://shoofly-react.vercel.app'], credentials: true }
+
 });
 
 // ── Expose io to routes ───────────────────────────────────
@@ -32,7 +34,11 @@ app.use(helmet({
   crossOriginOpenerPolicy: false,
 }))
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', 'https://shoofly.netlify.app')
+  const allowedOrigins = ['https://shoofly.netlify.app', 'https://shoofly-react.vercel.app']
+const origin = req.headers.origin
+if (allowedOrigins.includes(origin)) {
+  res.header('Access-Control-Allow-Origin', origin)
+}
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
   res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization')
   res.header('Access-Control-Allow-Credentials', 'true')
