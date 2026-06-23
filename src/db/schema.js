@@ -166,12 +166,15 @@ async function initDb() {
       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE INDEX IF NOT EXISTS idx_missions_client ON missions(client_id);
+CREATE INDEX IF NOT EXISTS idx_missions_client ON missions(client_id);
     CREATE INDEX IF NOT EXISTS idx_missions_oeil   ON missions(oeil_id);
     CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
     CREATE INDEX IF NOT EXISTS idx_messages_mission ON mission_messages(mission_id);
     CREATE INDEX IF NOT EXISTS idx_notifs_user ON notifications(user_id, is_read);
+
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
   `);
+
   console.log('✅ PostgreSQL schema ready');
 }
 
