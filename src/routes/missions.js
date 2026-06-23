@@ -344,7 +344,7 @@ router.post('/:id/messages', authenticate, async (req, res) => {
   // Notifier via Socket.io
   const io = req.app.get('io');
   if (io) {
-    io.to(`mission_${req.params.id}`).emit('new_message', {
+    io.to(`mission:${req.params.id}`).emit('new_message', {
       ...msg,
       sender_role: req.user.role,
     });
