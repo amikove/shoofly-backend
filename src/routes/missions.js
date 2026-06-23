@@ -156,6 +156,9 @@ router.get('/:id', authenticate, async (req, res) => {
 });
 
 // ── POST /missions/:id/accept ──────────────────────────────
+
+
+
 router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
@@ -188,6 +191,38 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) =
   res.json({ mission: updated });
 });
 
+
+
+// ── GET /:id/interests ── Liste des Œils intéressés ────────
+router.get('/:id/interests', authenticate, async (req, res) => {
+  const db = getDb();
+
+  const { rows: [mission] } = await db.query(
+    'SELECT * FROM missions WHERE id=$1', [req.params.id]
+  );
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  // Seul le client de la mission ou un admin peut voir les intéressés
+  if (mission.client_id !== req.user.id && req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Accès refusé' });
+  }
+
+  const { rows } = await db.query(
+    `SELECT u.id, u.first_name, u.last_name, u.city,
+            p.rating_avg, p.rating_count, p.total_missions, p.bio, p.coverage_zone,
+            mi.message, mi.created_at as interested_at
+     FROM mission_interests mi
+     JOIN users u ON u.id = mi.oeil_id
+     LEFT JOIN oeil_profiles p ON p.user_id = mi.oeil_id
+     WHERE mi.mission_id = $1
+     ORDER BY mi.created_at ASC`,
+    [req.params.id]
+  );
+
+  res.json({ interests: rows });
+});
+
+-
 // ── POST /missions/:id/refuse ──────────────────────────────
 router.post('/:id/refuse', authenticate, requireRole('oeil'), async (req, res) => {
   const db = getDb();
@@ -398,6 +433,100 @@ router.post('/:id/rate', authenticate, requireRole('client'), [
   await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${mission.title}" notée par un client.`, 'rating', mission.id, emitToUser);
 
   res.status(201).json({ rating_avg: avg.a, rating_count: avg.c });
+});
+
+// ── POST /:id/interest ── Œil exprime son intérêt ─────────
+router.post('/:id/interest', authenticate, requireRole('oeil'), async (req, res) => {
+  const db = getDb();
+  const { message } = req.body;
+
+  const { rows: [mission] } = await db.query(
+    'SELECT * FROM missions WHERE id=$1', [req.params.id]
+  );
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
+
+  await db.query(
+    `INSERT INTO mission_interests (mission_id, oeil_id, message)
+     VALUES ($1, $2, $3) ON CONFLICT (mission_id, oeil_id) DO NOTHING`,
+    [req.params.id, req.user.id, message || null]
+  );
+
+  const emitToUser = req.app.get('emitToUser');
+  const notifBody = `Un Œil est intéressé par votre mission : ${mission.title}`
+  await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser);
+
+  res.status(201).json({ ok: true });
+});
+
+// ── GET /:id/interests ── Liste des Œils intéressés ────────
+router.get('/:id/interests', authenticate, async (req, res) => {
+  const db = getDb();
+
+  const { rows: [mission] } = await db.query(
+    'SELECT * FROM missions WHERE id=$1', [req.params.id]
+  );
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.client_id !== req.user.id && req.user.role !== 'admin')
+    return res.status(403).json({ error: 'Accès refusé' });
+
+  const { rows } = await db.query(
+    `SELECT u.id, u.first_name, u.last_name, u.city,
+            p.rating_avg, p.rating_count, p.total_missions, p.bio, p.coverage_zone,
+            mi.message, mi.created_at AS interested_at
+     FROM mission_interests mi
+     JOIN users u ON u.id = mi.oeil_id
+     LEFT JOIN oeil_profiles p ON p.user_id = mi.oeil_id
+     WHERE mi.mission_id = $1
+     ORDER BY mi.created_at ASC`,
+    [req.params.id]
+  );
+
+  res.json({ interests: rows });
+});
+
+// ── POST /:id/hire/:oeilId ── Client choisit un Œil ───────
+router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+
+  const { rows: [mission] } = await db.query(
+    'SELECT * FROM missions WHERE id=$1 AND client_id=$2',
+    [req.params.id, req.user.id]
+  );
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
+
+  const { rows: [interest] } = await db.query(
+    'SELECT * FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2',
+    [req.params.id, req.params.oeilId]
+  );
+  if (!interest) return res.status(400).json({ error: "Cet Œil n'a pas exprimé son intérêt" });
+
+  const { rows: [updated] } = await db.query(
+    `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), updated_at=NOW()
+     WHERE id=$2 RETURNING *`,
+    [req.params.oeilId, req.params.id]
+  );
+
+  // Notifier l'Œil embauché
+  await notify(db, req.params.oeilId, '🎉 Vous avez été sélectionné !',
+    `Le client vous a choisi pour : ${mission.title}`, 'hired', req.params.id, emitToUser);
+
+  // Notifier les Œils non retenus
+  const { rows: others } = await db.query(
+    'SELECT oeil_id FROM mission_interests WHERE mission_id=$1 AND oeil_id!=$2',
+    [req.params.id, req.params.oeilId]
+  );
+  for (const o of others) {
+    await notify(db, o.oeil_id, 'Mission pourvue',
+      `"${mission.title}" a été attribuée à un autre Œil.`, 'info', req.params.id, emitToUser);
+  }
+
+  if (io) io.to('room:admin').emit('mission_assigned', updated);
+
+  res.json({ mission: updated });
 });
 
 module.exports = router;

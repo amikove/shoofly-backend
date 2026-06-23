@@ -172,6 +172,17 @@ CREATE INDEX IF NOT EXISTS idx_missions_client ON missions(client_id);
     CREATE INDEX IF NOT EXISTS idx_messages_mission ON mission_messages(mission_id);
     CREATE INDEX IF NOT EXISTS idx_notifs_user ON notifications(user_id, is_read);
 
+    CREATE TABLE IF NOT EXISTS mission_interests (
+  id         SERIAL PRIMARY KEY,
+  mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+  oeil_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  message    TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(mission_id, oeil_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id);
+
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
   `);
 
