@@ -162,8 +162,10 @@ io.on('connection', (socket) => {
 });
 
 // Helper: emit to a specific user across all their sockets
+
 app.set('emitToUser', (userId, event, data) => {
   const sockets = userSockets.get(userId);
+  console.log(`📡 emitToUser → ${userId} | sockets: ${sockets?.size || 0} | event: ${event}`);
   if (sockets) sockets.forEach(sid => io.to(sid).emit(event, data));
 });
 
