@@ -182,7 +182,7 @@ CREATE INDEX IF NOT EXISTS idx_missions_client ON missions(client_id);
 );
 
 CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id);
-
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS quartier TEXT;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
   `);
 

@@ -31,8 +31,11 @@ router.get('/', authenticate, async (req, res) => {
     where.push(`m.client_id=$${p++}`); params.push(req.user.id);
   } else if (req.user.role === 'oeil') {
     if (mode === 'available') {
-      where.push(`m.status='pending' AND m.oeil_id IS NULL`);
-    } else {
+  where.push(`m.status='pending' AND m.oeil_id IS NULL AND m.city=$${p++}`);
+  params.push(req.user.city);
+}
+    
+    else {
       where.push(`m.oeil_id=$${p++}`); params.push(req.user.id);
     }
   }
