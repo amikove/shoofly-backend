@@ -6,7 +6,7 @@ const { authenticate, requireRole } = require('../middleware/auth');
 // ── Oeils publics ──────────────────────────────────────────
 router.get('/oeils', authenticate, async (req, res) => {
   const db = getDb();
-  const { city, available } = req.query;
+  const { city, available, search } = req.query;
   let where = ["u.role='oeil'", "p.is_verified=true"], params = [], p = 1;
   if (city)          { where.push(`u.city ILIKE $${p++}`); params.push(`%${city}%`); }
   if (available==='1') { where.push('p.is_available=true'); }
