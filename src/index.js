@@ -20,7 +20,11 @@ const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server, {
   
-  cors: { origin: ['https://shoofly.netlify.app', 'https://shoofly-react.vercel.app'], credentials: true }
+ cors: { 
+  origin: ['https://shoofly.netlify.app', 'https://shoofly-react.vercel.app'],
+  credentials: true,
+  methods: ['GET', 'POST']
+}
 
 });
 
