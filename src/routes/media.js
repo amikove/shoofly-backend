@@ -74,11 +74,15 @@ router.post('/:missionId', authenticate, upload.array('files', 10), async (req, 
       `INSERT INTO notifications (user_id,title,body,type,mission_id) VALUES ($1,$2,$3,'media',$4)`,
       [mission.client_id, '📸 Médias reçus', notifBody, mission.id]
     );
-    if (emitToUser) emitToUser(mission.client_id, 'notification', {
-      title: '📸 Médias reçus',
-      body: notifBody,
-      missionId: mission.id
-    });
+
+    const recipientId = req.user.id === mission.client_id ? mission.oeil_id : mission.client_id;
+      if (emitToUser) emitToUser(recipientId, 'notification', {
+        title: '📸 Médias reçus',
+        body: notifBody,
+        missionId: mission.id,
+        type: 'message'
+      });
+
   }
 
   res.status(201).json({ media: inserted, count: inserted.length });
