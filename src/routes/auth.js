@@ -76,7 +76,13 @@ router.get('/me', authenticate, async (req, res) => {
     const { rows: [p] } = await db.query('SELECT * FROM oeil_profiles WHERE user_id=$1', [user.id]);
     profile = p;
   }
-  res.json({ user: safe(user), profile });
+ 
+      if (user.disponibilites && typeof user.disponibilites === 'string') {
+      try { user.disponibilites = JSON.parse(user.disponibilites) } catch {}
+    }
+    res.json({ user: safe(user), profile });
+
+
 });
 
 router.put('/me', authenticate, async (req, res) => {
@@ -101,8 +107,14 @@ router.put('/me', authenticate, async (req, res) => {
       [bio||null, coverage_zone||null, req.user.id]
     );
   }
+
+    if (user.disponibilites && typeof user.disponibilites === 'string') {
+    try { user.disponibilites = JSON.parse(user.disponibilites) } catch {}
+  }
   res.json({ user: safe(user) });
-});
+
+
+  });
 
 router.put('/password', authenticate, async (req, res) => {
   const db = getDb();
