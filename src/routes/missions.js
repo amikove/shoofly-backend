@@ -18,6 +18,56 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 }
 
+
+// ── GET /missions/inbox ─────────────────────────────────────
+router.get('/inbox', authenticate, async (req, res) => {
+  const db = getDb();
+  const userId = req.user.id;
+
+  const { rows } = await db.query(`
+    SELECT
+      m.id, m.title, m.type, m.status,
+      c.first_name || ' ' || c.last_name AS client_name,
+      o.first_name || ' ' || o.last_name AS oeil_name,
+      last_msg.content                   AS last_message,
+      last_msg.created_at                AS last_message_at,
+      (
+        SELECT COUNT(*) FROM mission_messages mm
+        WHERE mm.mission_id = m.id
+          AND mm.sender_id != $1
+          AND mm.created_at > COALESCE(
+            (SELECT seen_at FROM mission_chat_seen WHERE user_id=$1 AND mission_id=m.id),
+            '1970-01-01'
+          )
+      )::int AS unread_count
+    FROM missions m
+    LEFT JOIN users c ON c.id = m.client_id
+    LEFT JOIN users o ON o.id = m.oeil_id
+    LEFT JOIN LATERAL (
+      SELECT content, created_at FROM mission_messages
+      WHERE mission_id = m.id
+      ORDER BY created_at DESC LIMIT 1
+    ) last_msg ON true
+    WHERE (m.client_id = $1 OR m.oeil_id = $1)
+      AND EXISTS (SELECT 1 FROM mission_messages WHERE mission_id = m.id)
+    ORDER BY last_msg.created_at DESC NULLS LAST
+  `, [userId]);
+
+  res.json({ inbox: rows });
+});
+
+// ── POST /missions/:id/seen ─────────────────────────────────
+router.post('/:id/seen', authenticate, async (req, res) => {
+  const db = getDb();
+  await db.query(`
+    INSERT INTO mission_chat_seen (user_id, mission_id, seen_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (user_id, mission_id) DO UPDATE SET seen_at = NOW()
+  `, [req.user.id, req.params.id]);
+  res.json({ ok: true });
+});
+
+
 // ── GET /missions ──────────────────────────────────────────
 router.get('/', authenticate, async (req, res) => {
   const db = getDb();
