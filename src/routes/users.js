@@ -3,20 +3,43 @@ const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 
+function isWithinSchedule(disponibilites) {
+  if (!disponibilites) return false;
+  const d = typeof disponibilites === 'string' ? JSON.parse(disponibilites) : disponibilites;
+  if (!Array.isArray(d)) return false;
+  const now = new Date();
+  const jourIdx = now.getDay(); // 0=Dim, 1=Lun...
+  const map = { 0:'Dim', 1:'Lun', 2:'Mar', 3:'Mer', 4:'Jeu', 5:'Ven', 6:'Sam' };
+  const aujourdhui = d.find(x => x.jour === map[jourIdx]);
+  if (!aujourdhui?.actif) return false;
+  const [hd, md] = aujourdhui.debut.split(':').map(Number);
+  const [hf, mf] = aujourdhui.fin.split(':').map(Number);
+  const mins = now.getHours() * 60 + now.getMinutes();
+  return mins >= hd * 60 + md && mins <= hf * 60 + mf;
+}
+
+
+
 // ── Oeils publics ──────────────────────────────────────────
 router.get('/oeils', authenticate, async (req, res) => {
   const db = getDb();
   const { city, available, search } = req.query;
   let where = ["u.role='oeil'", "p.is_verified=true"], params = [], p = 1;
   if (city)          { where.push(`u.city ILIKE $${p++}`); params.push(`%${city}%`); }
+  if (search) { where.push(`(u.first_name ILIKE $${p} OR u.last_name ILIKE $${p} OR u.city ILIKE $${p})`); params.push(`%${search}%`); p++; }
   if (available==='1') { where.push('p.is_available=true'); }
   const { rows } = await db.query(`
-    SELECT u.id,u.first_name,u.last_name,u.city,u.avatar_url,
-      p.bio,p.coverage_zone,p.is_verified,p.is_available,p.rating_avg,p.rating_count,p.total_missions
-    FROM users u JOIN oeil_profiles p ON p.user_id=u.id
+    SELECT u.id,u.first_name,u.last_name,u.city,u.avatar_url,u.disponibilites,
+  p.bio,p.coverage_zone,p.is_verified,p.is_available,p.rating_avg,p.rating_count,p.total_missions
+FROM users u JOIN oeil_profiles p ON p.user_id=u.id
+
     WHERE ${where.join(' AND ')} ORDER BY p.rating_avg DESC, p.total_missions DESC
   `, params);
-  res.json({ oeils: rows });
+  const oeils = rows.map(o => ({
+  ...o,
+  is_available: o.is_available && isWithinSchedule(o.disponibilites)
+}))
+res.json({ oeils });
 });
 
 router.get('/oeils/:id', authenticate, async (req, res) => {
