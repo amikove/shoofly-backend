@@ -191,6 +191,7 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
     ALTER TABLE users ADD COLUMN IF NOT EXISTS situation TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS disponibilite TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS motivation TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS disponibilites JSONB;
     CREATE TABLE IF NOT EXISTS airbnb_reports (
   id          SERIAL PRIMARY KEY,
   mission_id  TEXT UNIQUE NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
