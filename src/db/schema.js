@@ -206,12 +206,13 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
 
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
-CREATE TABLE IF NOT EXISTS mission_chat_seen (
-  user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
-  mission_id UUID REFERENCES missions(id) ON DELETE CASCADE,
-  seen_at    TIMESTAMPTZ DEFAULT NOW(),
-  PRIMARY KEY (user_id, mission_id)
-);
+    CREATE TABLE IF NOT EXISTS mission_chat_seen (
+    user_id    TEXT REFERENCES users(id) ON DELETE CASCADE,
+    mission_id TEXT REFERENCES missions(id) ON DELETE CASCADE,
+    seen_at    TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, mission_id)
+  );
+
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS quartier VARCHAR(150);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
   `);
