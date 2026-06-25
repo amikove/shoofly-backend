@@ -18,6 +18,68 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 }
 
+// ── POST /missions/:id/claim ────────────────────────────────
+router.post('/:id/claim', authenticate, async (req, res) => {
+  const db = getDb();
+  const { comment } = req.body;
+  if (!comment?.trim()) return res.status(400).json({ error: 'Commentaire obligatoire' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+  if (mission.status !== 'completed') return res.status(400).json({ error: 'Mission non terminée' });
+
+  const hoursSinceCompletion = (Date.now() - new Date(mission.completed_by_oeil_at).getTime()) / 3600000;
+  if (hoursSinceCompletion > 12) return res.status(400).json({ error: 'Délai de réclamation dépassé (12h)' });
+
+  const emitToUser = req.app.get('emitToUser');
+
+  await db.query(`UPDATE missions SET status='sous_reclamation', updated_at=NOW() WHERE id=$1`, [req.params.id]);
+  await db.query(`INSERT INTO claims (mission_id, client_id, comment) VALUES ($1, $2, $3)`, [req.params.id, req.user.id, comment.trim()]);
+
+  // Notifier les admins
+  const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`);
+  for (const admin of admins) {
+    await notify(db, admin.id, '🚨 Nouvelle réclamation', `Mission "${mission.title}" contestée par le client.`, 'claim', req.params.id, emitToUser);
+  }
+
+  res.json({ ok: true });
+});
+
+// ── PUT /missions/:id/resolve-claim ────────────────────────
+router.put('/:id/resolve-claim', authenticate, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Accès refusé' });
+  const db = getDb();
+  const { decision } = req.body; // 'oeil' ou 'client'
+  if (!['oeil','client'].includes(decision)) return res.status(400).json({ error: 'Décision invalide' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  const emitToUser = req.app.get('emitToUser');
+
+  if (decision === 'oeil') {
+    // Payer l'Œil
+    await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
+    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Mission validée après réclamation',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
+    await db.query(`UPDATE missions SET status='completed', validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
+    await db.query(`UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
+    await notify(db, mission.oeil_id, '✅ Réclamation résolue', 'La réclamation a été résolue en votre faveur. Votre paiement a été crédité.', 'info', mission.id, emitToUser);
+    await notify(db, mission.client_id, 'Réclamation résolue', 'La réclamation a été examinée et résolue en faveur de l\'Œil.', 'info', mission.id, emitToUser);
+  } else {
+    // Rembourser le client
+    await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
+    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement suite à réclamation',$3)`, [mission.client_id, mission.price, mission.id]);
+    await db.query(`UPDATE missions SET status='cancelled', updated_at=NOW() WHERE id=$1`, [mission.id]);
+    await db.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
+    await notify(db, mission.client_id, '✅ Réclamation résolue', `${mission.price} MAD ont été crédités sur votre portefeuille.`, 'info', mission.id, emitToUser);
+    await notify(db, mission.oeil_id, 'Réclamation résolue', 'La réclamation a été résolue en faveur du client.', 'info', mission.id, emitToUser);
+  }
+
+  res.json({ ok: true });
+});
+
+
 // ── GET /missions/inbox ─────────────────────────────────────
 router.get('/inbox', authenticate, async (req, res) => {
   const db = getDb();
@@ -389,15 +451,22 @@ router.post('/:id/status', authenticate, [
     WHERE id=$3 RETURNING *
   `, [status, cancel_reason||null, mission.id]);
 
-  // Credit oeil on completion
+// Oeil marque terminée → démarrer le délai de 12h pour réclamation
   if (status === 'completed' && mission.oeil_id) {
     await db.query(
-      `UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1, total_missions=total_missions+1 WHERE user_id=$2`,
-      [mission.oeil_earning, mission.oeil_id]
+      `UPDATE missions SET completed_by_oeil_at=NOW() WHERE id=$1`,
+      [mission.id]
     );
-    await notify(db, mission.client_id, 'Mission complétée ✅', `"${mission.title}" terminée. Notez votre Œil !`, 'mission', mission.id, emitToUser);
-    await notify(db, mission.oeil_id, '💰 Paiement crédité', `${mission.oeil_earning} MAD sur votre solde.`, 'mission', mission.id, emitToUser);
+    await db.query(
+      `UPDATE oeil_profiles SET total_missions=total_missions+1 WHERE user_id=$1`,
+      [mission.oeil_id]
+    );
+    await notify(db, mission.client_id, 'Mission terminée ✅', `"${mission.title}" est terminée. Vous avez 12h pour réclamer si nécessaire.`, 'mission', mission.id, emitToUser);
+    await notify(db, mission.oeil_id, 'Mission terminée', `"${mission.title}" marquée comme terminée. Paiement en attente de validation.`, 'mission', mission.id, emitToUser);
   }
+  
+
+
 
   const labels = { en_route:'en route', active:'démarrée', cancelled:'annulée', completed:'complétée' };
   const sysMsg = { en_route:"L'Œil est en route.", active:"Mission démarrée.", completed:"Mission terminée avec succès.", cancelled:"Mission annulée." };

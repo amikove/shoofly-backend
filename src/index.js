@@ -10,6 +10,7 @@ const path = require('path');
 const jwt = require('jsonwebtoken');
 
 const { initDb, getDb } = require('./db/schema');
+const cron = require('node-cron');
 const authRoutes    = require('./routes/auth');
 const fraudRoutes   = require('./routes/antiFraud');
 const missionRoutes = require('./routes/missions');
@@ -179,6 +180,26 @@ app.set('emitToUser', (userId, event, data) => {
 const PORT = parseInt(process.env.PORT) || 3000;
 
 initDb().then(() => {
+
+  // Job toutes les heures — valider automatiquement les missions après 12h sans réclamation
+  cron.schedule('0 * * * *', async () => {
+    try {
+      const db = getDb();
+      const { rows: missions } = await db.query(`
+        SELECT * FROM missions
+        WHERE status='completed'
+          AND completed_by_oeil_at IS NOT NULL
+          AND completed_by_oeil_at < NOW() - INTERVAL '12 hours'
+          AND validated_at IS NULL
+      `);
+      for (const mission of missions) {
+        await db.query(`UPDATE missions SET validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
+        await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
+        await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Validation automatique après 12h',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
+        console.log(`✅ Auto-validé mission ${mission.id}`);
+      }
+    } catch (e) { console.error('❌ Cron error:', e.message); }
+  });
   // Keep-alive pour Render plan gratuit
 if (process.env.NODE_ENV === 'production') {
   setInterval(() => {

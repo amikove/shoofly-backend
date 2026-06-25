@@ -62,7 +62,7 @@ async function initDb() {
       type          TEXT NOT NULL CHECK(type IN ('immobilier','file_attente','audit','personnalisee')),
       subcategory   VARCHAR(150),
       status        TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending','assigned','en_route','active','completed','cancelled')),
+                    CHECK(status IN ('pending','assigned','en_route','active','completed','cancelled','sous_reclamation')),
       title         TEXT NOT NULL,
       description   TEXT,
       address       TEXT NOT NULL,
@@ -213,8 +213,35 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
     PRIMARY KEY (user_id, mission_id)
   );
 
-    ALTER TABLE missions ADD COLUMN IF NOT EXISTS quartier VARCHAR(150);
+
+  ALTER TABLE missions ADD COLUMN IF NOT EXISTS quartier VARCHAR(150);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS completed_by_oeil_at TIMESTAMPTZ;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS claim_comment TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(10,2) NOT NULL DEFAULT 0;
+
+    CREATE TABLE IF NOT EXISTS wallet_transactions (
+      id          SERIAL PRIMARY KEY,
+      user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type        TEXT NOT NULL CHECK(type IN ('credit','debit')),
+      amount      NUMERIC(10,2) NOT NULL,
+      reason      TEXT NOT NULL,
+      mission_id  TEXT REFERENCES missions(id),
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS claims (
+      id          SERIAL PRIMARY KEY,
+      mission_id  TEXT UNIQUE NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      client_id   TEXT NOT NULL REFERENCES users(id),
+      comment     TEXT NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','resolved_oeil','resolved_client')),
+      resolved_by TEXT REFERENCES users(id),
+      resolved_at TIMESTAMPTZ,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
   `);
 
   console.log('✅ PostgreSQL schema ready');
