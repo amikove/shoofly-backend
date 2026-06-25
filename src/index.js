@@ -15,6 +15,7 @@ const fraudRoutes   = require('./routes/antiFraud');
 const missionRoutes = require('./routes/missions');
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
+const reportRoutes = require('./routes/reports');
 
 const app    = express();
 const server = http.createServer(app);
@@ -62,6 +63,7 @@ app.use('/api/missions', missionRoutes);
 app.use('/api/media',    mediaRoutes);
 app.use('/api/users',    userRoutes);
 app.use('/api/anti-fraud', fraudRoutes);
+app.use('/api/reports', reportRoutes);
 
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 app.get('/api', (_, res) => res.json({ name: 'SHOOFLY API', version: '1.0.0' }));

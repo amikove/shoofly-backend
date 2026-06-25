@@ -191,6 +191,17 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
     ALTER TABLE users ADD COLUMN IF NOT EXISTS situation TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS disponibilite TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS motivation TEXT;
+    CREATE TABLE IF NOT EXISTS airbnb_reports (
+  id          SERIAL PRIMARY KEY,
+  mission_id  TEXT UNIQUE NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+  oeil_id     TEXT NOT NULL REFERENCES users(id),
+  data        JSONB NOT NULL DEFAULT '{}',
+  score       INTEGER,
+  submitted   BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
   `);
 
