@@ -30,10 +30,16 @@ router.get('/', authenticate, async (req, res) => {
   if (req.user.role === 'client') {
     where.push(`m.client_id=$${p++}`); params.push(req.user.id);
   } else if (req.user.role === 'oeil') {
+
     if (mode === 'available') {
   where.push(`m.status='pending' AND m.oeil_id IS NULL AND m.city=$${p++}`);
   params.push(req.user.city);
+  if (req.query.quartier) {
+    where.push(`m.address ILIKE $${p++}`);
+    params.push(`%${req.query.quartier}%`);
+  }
 }
+
     
     else {
       where.push(`m.oeil_id=$${p++}`); params.push(req.user.id);
