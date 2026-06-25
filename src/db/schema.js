@@ -202,6 +202,9 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+
+
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS quartier VARCHAR(150);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
   `);
 

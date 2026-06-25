@@ -34,10 +34,12 @@ router.get('/', authenticate, async (req, res) => {
     if (mode === 'available') {
   where.push(`m.status='pending' AND m.oeil_id IS NULL AND m.city=$${p++}`);
   params.push(req.user.city);
+
   if (req.query.quartier) {
-    where.push(`m.address ILIKE $${p++}`);
-    params.push(`%${req.query.quartier}%`);
-  }
+  where.push(`m.quartier ILIKE $${p++}`);
+  params.push(`%${req.query.quartier}%`);
+}
+
 }
 
     
@@ -91,7 +93,7 @@ router.post('/', authenticate, requireRole('client'), [
   const io = req.app.get('io');
 
   const {
-    type, title, description, address, city, scheduled_at,
+    type, title, description, address, city, quartier, scheduled_at,
     duration_est, price, is_urgent, oeil_id,
     property_type, visit_type, video_call,
     institution, purpose,
@@ -105,19 +107,21 @@ const status = oeil_id ? 'assigned' : 'pending';
 
 const { rows: [mission] } = await db.query(`
   INSERT INTO missions (
-    id,client_id,type,subcategory,status,title,description,address,city,scheduled_at,
+    id,client_id,type,subcategory,status,title,description,address,city,quartier,scheduled_at,
     duration_est,price,commission,oeil_earning,is_urgent,
     property_type,visit_type,video_call,institution,purpose,
     company_name,audit_type,frequency,criteria,oeil_id
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
   RETURNING *
 `, [
-  id, req.user.id, type, subcategory||null, status, title, description||null, address, city,
+  id, req.user.id, type, subcategory||null, status, title, description||null, address, city, quartier||null,
   new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
   !!is_urgent, property_type||null, visit_type||null, !!video_call,
   institution||null, purpose||null, company_name||null, audit_type||null,
   frequency||null, criteria||null, oeil_id||null
 ]);
+
+
 
   // Notify verified available oeils
   const { rows: oeils } = await db.query(
