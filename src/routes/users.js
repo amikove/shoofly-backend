@@ -220,6 +220,43 @@ router.get('/admin/claims', authenticate, requireRole('admin'), async (req, res)
   res.json({ claims: rows });
 });
 
+// ── Admin : résoudre une réclamation ───────────────────────
+router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { decision } = req.body;
+  if (!['oeil','client'].includes(decision)) return res.status(400).json({ error: 'Décision invalide' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.missionId]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  const emitToUser = req.app.get('emitToUser');
+  const notify = async (userId, title, body) => {
+    await db.query(
+      `INSERT INTO notifications (user_id,title,body,type,mission_id) VALUES ($1,$2,$3,'info',$4)`,
+      [userId, title, body, mission.id]
+    );
+    if (emitToUser) emitToUser(userId, 'notification', { title, body });
+  }
+
+  if (decision === 'oeil') {
+    await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
+    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Mission validée après réclamation',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
+    await db.query(`UPDATE missions SET status='completed', validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
+    await db.query(`UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
+    await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.');
+    await notify(mission.client_id, 'Réclamation résolue', 'Résolue en faveur de l\'Œil.');
+  } else {
+    await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
+    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement suite à réclamation',$3)`, [mission.client_id, mission.price, mission.id]);
+    await db.query(`UPDATE missions SET status='cancelled', updated_at=NOW() WHERE id=$1`, [mission.id]);
+    await db.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
+    await notify(mission.client_id, '✅ Réclamation résolue', `${mission.price} MAD crédités sur votre portefeuille.`);
+    await notify(mission.oeil_id, 'Réclamation résolue', 'Résolue en faveur du client.');
+  }
+
+  res.json({ ok: true });
+});
+
 
 router.get('/admin/withdrawals', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();
