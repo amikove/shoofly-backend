@@ -81,15 +81,25 @@ router.get('/me', authenticate, async (req, res) => {
 
 router.put('/me', authenticate, async (req, res) => {
   const db = getDb();
-  const { first_name, last_name, phone, city, bio, coverage_zone } = req.body;
+  const { first_name, last_name, phone, city, bio, coverage_zone, disponibilites } = req.body;
   const { rows: [user] } = await db.query(
-    `UPDATE users SET first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name),
-     phone=COALESCE($3,phone), city=COALESCE($4,city), updated_at=NOW() WHERE id=$5 RETURNING *`,
-    [first_name||null, last_name||null, phone||null, city||null, req.user.id]
+    `UPDATE users SET
+      first_name=COALESCE($1,first_name),
+      last_name=COALESCE($2,last_name),
+      phone=COALESCE($3,phone),
+      city=COALESCE($4,city),
+      disponibilites=COALESCE($5,disponibilites),
+      updated_at=NOW()
+     WHERE id=$6 RETURNING *`,
+    [first_name||null, last_name||null, phone||null, city||null,
+     disponibilites ? JSON.stringify(disponibilites) : null,
+     req.user.id]
   );
   if (req.user.role === 'oeil') {
-    await db.query(`UPDATE oeil_profiles SET bio=COALESCE($1,bio), coverage_zone=COALESCE($2,coverage_zone) WHERE user_id=$3`,
-      [bio||null, coverage_zone||null, req.user.id]);
+    await db.query(
+      `UPDATE oeil_profiles SET bio=COALESCE($1,bio), coverage_zone=COALESCE($2,coverage_zone) WHERE user_id=$3`,
+      [bio||null, coverage_zone||null, req.user.id]
+    );
   }
   res.json({ user: safe(user) });
 });
