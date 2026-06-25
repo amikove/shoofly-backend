@@ -202,6 +202,25 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), async
   res.json({ is_active: u.is_active });
 });
 
+// ── Admin : réclamations ────────────────────────────────────
+router.get('/admin/claims', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT cl.*, 
+      m.title AS mission_title, m.price AS mission_price, m.oeil_earning,
+      c.first_name||' '||c.last_name AS client_name,
+      o.first_name||' '||o.last_name AS oeil_name
+    FROM claims cl
+    JOIN missions m ON m.id = cl.mission_id
+    JOIN users c ON c.id = cl.client_id
+    JOIN users o ON o.id = m.oeil_id
+    WHERE cl.status = 'pending'
+    ORDER BY cl.created_at ASC
+  `);
+  res.json({ claims: rows });
+});
+
+
 router.get('/admin/withdrawals', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
