@@ -3,14 +3,14 @@ const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 
+
 function isWithinSchedule(disponibilites) {
-  if (!disponibilites) return false;
+  if (!disponibilites) return true; // pas de créneaux = on se fie au toggle manuel
   const d = typeof disponibilites === 'string' ? JSON.parse(disponibilites) : disponibilites;
-  if (!Array.isArray(d)) return false;
+  if (!Array.isArray(d) || d.length === 0) return true;
   const now = new Date();
-  const jourIdx = now.getDay(); // 0=Dim, 1=Lun...
   const map = { 0:'Dim', 1:'Lun', 2:'Mar', 3:'Mer', 4:'Jeu', 5:'Ven', 6:'Sam' };
-  const aujourdhui = d.find(x => x.jour === map[jourIdx]);
+  const aujourdhui = d.find(x => x.jour === map[now.getDay()]);
   if (!aujourdhui?.actif) return false;
   const [hd, md] = aujourdhui.debut.split(':').map(Number);
   const [hf, mf] = aujourdhui.fin.split(':').map(Number);
