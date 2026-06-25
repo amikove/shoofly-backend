@@ -213,8 +213,10 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
     PRIMARY KEY (user_id, mission_id)
   );
 
+    ALTER TABLE missions DROP CONSTRAINT IF EXISTS missions_status_check;
+    ALTER TABLE missions ADD CONSTRAINT missions_status_check CHECK(status IN ('pending','assigned','en_route','active','completed','cancelled','sous_reclamation'));
 
-  ALTER TABLE missions ADD COLUMN IF NOT EXISTS quartier VARCHAR(150);
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS quartier VARCHAR(150);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS completed_by_oeil_at TIMESTAMPTZ;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ;
