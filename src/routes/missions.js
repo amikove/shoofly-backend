@@ -10,12 +10,20 @@ function pricing(price) {
   return { commission, oeil_earning: price - commission };
 }
 
+
 async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null) {
   const r = await db.query(
     `INSERT INTO notifications (user_id,title,body,type,mission_id) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
     [userId, title, body, type, missionId]
   );
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
+}
+
+async function logStatus(db, missionId, status, userId, note = null) {
+  await db.query(
+    `INSERT INTO mission_status_history (mission_id, status, changed_by, note) VALUES ($1, $2, $3, $4)`,
+    [missionId, status, userId, note]
+  );
 }
 
 
@@ -34,8 +42,9 @@ router.post('/:id/validate', authenticate, requireRole('client'), async (req, re
   await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
   await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Validation client',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
 
-  await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser);
+await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser);
   await notify(db, mission.client_id, '✅ Mission validée', `Vous avez validé "${mission.title}".`, 'info', mission.id, emitToUser);
+  await logStatus(db, mission.id, 'validated', req.user.id, 'Validée par le client');
 
   res.json({ ok: true });
 });
@@ -57,8 +66,11 @@ router.post('/:id/claim', authenticate, async (req, res) => {
 
   const emitToUser = req.app.get('emitToUser');
 
+
   await db.query(`UPDATE missions SET status='sous_reclamation', updated_at=NOW() WHERE id=$1`, [req.params.id]);
   await db.query(`INSERT INTO claims (mission_id, client_id, comment) VALUES ($1, $2, $3)`, [req.params.id, req.user.id, comment.trim()]);
+  await logStatus(db, mission.id, 'sous_reclamation', req.user.id, 'Réclamation client');
+  
 
   // Notifier les admins
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`);
@@ -255,6 +267,7 @@ const { rows: [mission] } = await db.query(`
     company_name,audit_type,frequency,criteria,oeil_id
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
   RETURNING *
+
 `, [
   id, req.user.id, type, subcategory||null, status, title, description||null, address, city, quartier||null,
   new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
@@ -263,7 +276,7 @@ const { rows: [mission] } = await db.query(`
   frequency||null, criteria||null, oeil_id||null
 ]);
 
-
+await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
 
   // Notify verified available oeils
   const { rows: oeils } = await db.query(
@@ -375,6 +388,7 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) =
     `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), updated_at=NOW() WHERE id=$2 RETURNING *`,
     [req.user.id, req.params.id]
   );
+  await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil sélectionné par le client');
 
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [req.user.id]);
   const oeilName = `${oeil.first_name} ${oeil.last_name}`;
@@ -506,14 +520,21 @@ const { status, cancel_reason } = req.body;
       started_at   = CASE WHEN $1='active'    THEN NOW() ELSE started_at END,
       updated_at   = NOW()
     WHERE id=$3 RETURNING *
-  `, [status, cancel_reason||null, mission.id]);
+`, [status, cancel_reason||null, mission.id]);
+
+  // Logger le changement de statut (sauf completed géré plus bas)
+  if (status !== 'completed') {
+    await logStatus(db, mission.id, status, req.user.id, null);
+  }
 
 // Oeil marque terminée → démarrer le délai de 12h pour réclamation
+
   if (status === 'completed' && mission.oeil_id) {
     await db.query(
       `UPDATE missions SET completed_by_oeil_at=NOW() WHERE id=$1`,
       [mission.id]
     );
+    await logStatus(db, mission.id, 'completed', req.user.id, 'Mission terminée par l\'Œil');
     await db.query(
       `UPDATE oeil_profiles SET total_missions=total_missions+1 WHERE user_id=$1`,
       [mission.oeil_id]
