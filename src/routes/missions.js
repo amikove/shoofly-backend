@@ -436,9 +436,25 @@ router.post('/:id/status', authenticate, [
   active:   ['completed','cancelled'],
 };
 
-  const { status, cancel_reason } = req.body;
+
+const { status, cancel_reason } = req.body;
   if (!transitions[mission.status]?.includes(status))
     return res.status(400).json({ error: `Transition invalide: ${mission.status} → ${status}` });
+
+  // Bloquer si rapport non soumis pour audit ou airbnb
+  if (status === 'completed' && req.user.role === 'oeil') {
+    const isAudit  = mission.type === 'audit'
+    const isAirbnb = mission.subcategory && ['airbnb','booking'].some(s => mission.subcategory.toLowerCase().includes(s.toLowerCase()))
+    if (isAudit || isAirbnb) {
+      const { rows: [report] } = await db.query(
+        `SELECT * FROM airbnb_reports WHERE mission_id=$1 AND submitted=true`,
+        [mission.id]
+      )
+      if (!report) {
+        return res.status(400).json({ error: 'Vous devez soumettre le rapport avant de terminer la mission' })
+      }
+    }
+  }
 
   const { rows: [updated] } = await db.query(`
     UPDATE missions SET
