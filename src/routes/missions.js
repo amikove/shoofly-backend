@@ -18,6 +18,29 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 }
 
+
+// ── POST /missions/:id/validate ────────────────────────────
+router.post('/:id/validate', authenticate, requireRole('client'), async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+  if (mission.status !== 'completed') return res.status(400).json({ error: 'Mission non terminée' });
+  if (mission.validated_at) return res.status(400).json({ error: 'Mission déjà validée' });
+
+  await db.query(`UPDATE missions SET validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
+  await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
+  await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Validation client',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
+
+  await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser);
+  await notify(db, mission.client_id, '✅ Mission validée', `Vous avez validé "${mission.title}".`, 'info', mission.id, emitToUser);
+
+  res.json({ ok: true });
+});
+
+
 // ── POST /missions/:id/claim ────────────────────────────────
 router.post('/:id/claim', authenticate, async (req, res) => {
   const db = getDb();
