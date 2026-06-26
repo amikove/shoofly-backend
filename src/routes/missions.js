@@ -143,16 +143,23 @@ router.get('/', authenticate, async (req, res) => {
     where.push(`m.client_id=$${p++}`); params.push(req.user.id);
   } else if (req.user.role === 'oeil') {
 
+// placer les missions ignorées dans une table à part
+
     if (mode === 'available') {
   where.push(`m.status='pending' AND m.oeil_id IS NULL AND m.city=$${p++}`);
   params.push(req.user.city);
 
   if (req.query.quartier) {
-  where.push(`m.quartier ILIKE $${p++}`);
-  params.push(`%${req.query.quartier}%`);
+    where.push(`m.quartier ILIKE $${p++}`);
+    params.push(`%${req.query.quartier}%`);
+  }
+
+  // Exclure les missions ignorées
+  where.push(`m.id NOT IN (SELECT mission_id FROM mission_ignored WHERE oeil_id=$${p++})`);
+  params.push(req.user.id);
 }
 
-}
+
 
     
     else {
@@ -393,15 +400,23 @@ router.get('/:id/interests', authenticate, async (req, res) => {
 });
 
 -
+
 // ── POST /missions/:id/refuse ──────────────────────────────
 router.post('/:id/refuse', authenticate, requireRole('oeil'), async (req, res) => {
   const db = getDb();
+  const { ignore } = req.body;
   try {
+    if (ignore) {
+      // Mission disponible — juste ignorer
+      await db.query(
+        `INSERT INTO mission_ignored (oeil_id, mission_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [req.user.id, req.params.id]
+      );
+      return res.json({ ok: true });
+    }
+    // Mission assignée — refuser
     const { rows: [mission] } = await db.query(
-      `UPDATE missions 
-       SET status='pending', oeil_id=NULL, updated_at=NOW() 
-       WHERE id=$1 AND oeil_id=$2 
-       RETURNING *`,
+      `UPDATE missions SET status='pending', oeil_id=NULL, updated_at=NOW() WHERE id=$1 AND oeil_id=$2 RETURNING *`,
       [req.params.id, req.user.id]
     );
     if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
@@ -411,6 +426,9 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), async (req, res) =
     res.status(500).json({ error: err.message });
   }
 });
+
+
+
 
 // ── POST /missions/:id/status ──────────────────────────────
 router.post('/:id/status', authenticate, [
