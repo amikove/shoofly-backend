@@ -114,6 +114,22 @@ router.put('/:id/resolve-claim', authenticate, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ── GET /missions/:id/history ──────────────────────────────
+router.get('/:id/history', authenticate, async (req, res) => {
+  const db = getDb();
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (req.user.role === 'client' && mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+  if (req.user.role === 'oeil' && mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+  const { rows } = await db.query(`
+    SELECT h.*, u.first_name||' '||u.last_name AS changed_by_name, u.role AS changed_by_role
+    FROM mission_status_history h
+    LEFT JOIN users u ON u.id = h.changed_by
+    WHERE h.mission_id = $1
+    ORDER BY h.created_at ASC
+  `, [req.params.id]);
+  res.json({ history: rows });
+});
 
 // ── GET /missions/inbox ─────────────────────────────────────
 router.get('/inbox', authenticate, async (req, res) => {
@@ -296,42 +312,6 @@ await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
 
 
 
-// ── GET /missions/inbox ─────────────────────────────────────
-router.get('/inbox', authenticate, async (req, res) => {
-  const db = getDb();
-  const userId = req.user.id;
-
-  const { rows } = await db.query(`
-    SELECT
-      m.id, m.title, m.type, m.status,
-      c.first_name || ' ' || c.last_name AS client_name,
-      o.first_name || ' ' || o.last_name AS oeil_name,
-      last_msg.content                   AS last_message,
-      last_msg.created_at                AS last_message_at,
-      (
-        SELECT COUNT(*) FROM mission_messages mm
-        WHERE mm.mission_id = m.id
-          AND mm.sender_id != $1
-          AND mm.created_at > COALESCE(
-            (SELECT seen_at FROM mission_chat_seen WHERE user_id=$1 AND mission_id=m.id),
-            '1970-01-01'
-          )
-      )::int AS unread_count
-    FROM missions m
-    LEFT JOIN users c ON c.id = m.client_id
-    LEFT JOIN users o ON o.id = m.oeil_id
-    LEFT JOIN LATERAL (
-      SELECT content, created_at FROM mission_messages
-      WHERE mission_id = m.id
-      ORDER BY created_at DESC LIMIT 1
-    ) last_msg ON true
-    WHERE (m.client_id = $1 OR m.oeil_id = $1)
-      AND EXISTS (SELECT 1 FROM mission_messages WHERE mission_id = m.id)
-    ORDER BY last_msg.created_at DESC NULLS LAST
-  `, [userId]);
-
-  res.json({ inbox: rows });
-});
 
 
 // ── GET /missions/:id ──────────────────────────────────────
@@ -714,31 +694,7 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), async (req, res)
   res.status(201).json({ ok: true });
 });
 
-// ── GET /:id/interests ── Liste des Œils intéressés ────────
-router.get('/:id/interests', authenticate, async (req, res) => {
-  const db = getDb();
 
-  const { rows: [mission] } = await db.query(
-    'SELECT * FROM missions WHERE id=$1', [req.params.id]
-  );
-  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (mission.client_id !== req.user.id && req.user.role !== 'admin')
-    return res.status(403).json({ error: 'Accès refusé' });
-
-  const { rows } = await db.query(
-    `SELECT u.id, u.first_name, u.last_name, u.city,
-            p.rating_avg, p.rating_count, p.total_missions, p.bio, p.coverage_zone,
-            mi.message, mi.created_at AS interested_at
-     FROM mission_interests mi
-     JOIN users u ON u.id = mi.oeil_id
-     LEFT JOIN oeil_profiles p ON p.user_id = mi.oeil_id
-     WHERE mi.mission_id = $1
-     ORDER BY mi.created_at ASC`,
-    [req.params.id]
-  );
-
-  res.json({ interests: rows });
-});
 
 // ── POST /:id/hire/:oeilId ── Client choisit un Œil ───────
 router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req, res) => {
