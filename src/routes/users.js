@@ -153,6 +153,30 @@ router.get('/admin/all', authenticate, requireRole('admin'), async (req, res) =>
   res.json({ users: rows });
 });
 
+// ── Client : stats dashboard ────────────────────────────────
+router.get('/client/stats', authenticate, requireRole('client'), async (req, res) => {
+  const db = getDb();
+  const userId = req.user.id;
+  const { rows: [stats] } = await db.query(`
+    SELECT
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE status IN ('active','en_route','assigned'))::int AS active,
+      COUNT(*) FILTER (WHERE status='completed')::int AS completed,
+      COUNT(*) FILTER (WHERE status='cancelled')::int AS cancelled,
+      COALESCE(SUM(price) FILTER (WHERE status='completed' AND validated_at IS NOT NULL), 0)::numeric AS total_spent,
+      COALESCE(SUM(price) FILTER (WHERE status IN ('pending','assigned','en_route','active')), 0)::numeric AS budget_en_cours
+    FROM missions
+    WHERE client_id = $1
+  `, [userId]);
+
+  const { rows: [wallet] } = await db.query(
+    `SELECT balance FROM users WHERE id=$1`, [userId]
+  );
+
+  res.json({ ...stats, wallet_balance: wallet?.balance || 0 });
+});
+
+
 router.get('/admin/stats', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
