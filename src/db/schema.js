@@ -223,6 +223,15 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
   PRIMARY KEY (oeil_id, mission_id)
 );
 
+    CREATE TABLE IF NOT EXISTS mission_status_history (
+      id          SERIAL PRIMARY KEY,
+      mission_id  TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      status      TEXT NOT NULL,
+      changed_by  TEXT REFERENCES users(id),
+      note        TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS quartier VARCHAR(150);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS completed_by_oeil_at TIMESTAMPTZ;
