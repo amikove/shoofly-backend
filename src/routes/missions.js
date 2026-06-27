@@ -509,6 +509,32 @@ const { status, cancel_reason } = req.body;
     await logStatus(db, mission.id, status, req.user.id, null);
   }
 
+  // Remboursement si annulation par le client
+  if (status === 'cancelled' && req.user.role === 'client' && mission.status === 'assigned') {
+    const hoursBeforeMission = (new Date(mission.scheduled_at).getTime() - Date.now()) / 3600000
+    if (hoursBeforeMission > 2) {
+      // Remboursement 50%
+      const refund = Math.round(mission.price * 0.5 * 100) / 100
+      await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [refund, mission.client_id])
+      await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement annulation (50%)',$3)`, [mission.client_id, refund, mission.id])
+      await notify(db, mission.client_id, '💰 Remboursement partiel', `${refund} MAD crédités sur votre portefeuille suite à l'annulation.`, 'info', mission.id, emitToUser)
+      await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser)
+    } else {
+      // Aucun remboursement
+      await notify(db, mission.client_id, 'Mission annulée', `Annulation dans les 2h — aucun remboursement conformément aux CGV.`, 'info', mission.id, emitToUser)
+      await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser)
+    }
+  }
+
+  // Remboursement intégral si annulation avant assignation
+  if (status === 'cancelled' && req.user.role === 'client' && mission.status === 'pending') {
+    await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id])
+    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement annulation avant assignation',$3)`, [mission.client_id, mission.price, mission.id])
+    await notify(db, mission.client_id, '💰 Remboursement intégral', `${mission.price} MAD crédités sur votre portefeuille.`, 'info', mission.id, emitToUser)
+  }
+
+  
+
 // Oeil marque terminée → démarrer le délai de 12h pour réclamation
 
   if (status === 'completed' && mission.oeil_id) {
