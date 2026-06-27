@@ -229,7 +229,9 @@ router.get('/', authenticate, async (req, res) => {
       o.first_name||' '||o.last_name AS oeil_name,   o.phone AS oeil_phone,
       (SELECT COUNT(*) FROM mission_media WHERE mission_id=m.id)::int AS media_count,
       (SELECT COUNT(*) FROM mission_messages WHERE mission_id=m.id)::int AS message_count,
-      (SELECT COUNT(*) FROM mission_interests WHERE mission_id=m.id AND oeil_id='${req.user.id}')::int > 0 AS has_interested
+      (SELECT COUNT(*) FROM mission_interests WHERE mission_id=m.id AND oeil_id='${req.user.id}')::int > 0 AS has_interested,
+      (SELECT score FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_score,
+      (SELECT comment FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_comment
     FROM missions m
     LEFT JOIN users c ON c.id=m.client_id
     LEFT JOIN users o ON o.id=m.oeil_id
