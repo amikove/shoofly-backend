@@ -533,7 +533,7 @@ const { status, cancel_reason } = req.body;
     await notify(db, mission.client_id, '💰 Remboursement intégral', `${mission.price} MAD crédités sur votre portefeuille.`, 'info', mission.id, emitToUser)
   }
 
-  
+
 
 // Oeil marque terminée → démarrer le délai de 12h pour réclamation
 
@@ -749,6 +749,7 @@ router.post('/:id/rate', authenticate, requireRole('client'), [
 });
 
 // ── POST /:id/interest ── Œil exprime son intérêt ─────────
+
 router.post('/:id/interest', authenticate, requireRole('oeil'), async (req, res) => {
   const db = getDb();
   const { message } = req.body;
@@ -758,6 +759,18 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), async (req, res)
   );
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
   if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
+
+  // Vérifier les conflits de créneau
+  const { rows: conflicts } = await db.query(`
+    SELECT m.id, m.title, m.scheduled_at FROM missions m
+    WHERE m.oeil_id = $1
+      AND m.status IN ('assigned','en_route','active')
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $2)) / 3600) < 4
+  `, [req.user.id, mission.scheduled_at])
+
+  if (conflicts.length > 0) {
+    return res.status(400).json({ error: 'Vous avez déjà une mission dans le même créneau.' })
+  }
 
   await db.query(
     `INSERT INTO mission_interests (mission_id, oeil_id, message)
@@ -798,6 +811,38 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req
      WHERE id=$2 RETURNING *`,
     [req.params.oeilId, req.params.id]
   );
+
+  // Re-vérifier le créneau avant assignation
+  const { rows: creneauConflicts } = await db.query(`
+    SELECT m.id FROM missions m
+    WHERE m.oeil_id = $1
+      AND m.status IN ('assigned','en_route','active')
+      AND m.id != $2
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
+  `, [req.params.oeilId, req.params.id, mission.scheduled_at])
+
+  if (creneauConflicts.length > 0) {
+    return res.status(400).json({ error: 'Cet Œil a déjà une mission dans le même créneau.' })
+  }
+
+  // Supprimer les intérêts en conflit de créneau
+  const { rows: conflictInterests } = await db.query(`
+    SELECT mi.mission_id FROM mission_interests mi
+    JOIN missions m ON m.id = mi.mission_id
+    WHERE mi.oeil_id = $1
+      AND mi.mission_id != $2
+      AND m.status = 'pending'
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
+  `, [req.params.oeilId, req.params.id, mission.scheduled_at])
+
+  for (const ci of conflictInterests) {
+    await db.query(
+      `DELETE FROM mission_interests WHERE oeil_id=$1 AND mission_id=$2`,
+      [req.params.oeilId, ci.mission_id]
+    )
+  }
+
+  
 
   // Notifier l'Œil embauché
   await notify(db, req.params.oeilId, '🎉 Vous avez été sélectionné !',
