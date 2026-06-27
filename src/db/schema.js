@@ -204,6 +204,18 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+
+      CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      INSERT INTO settings (key, value) VALUES
+        ('commission', '0.20'),
+        ('min_price', '80'),
+        ('urgency_fee', '0.30'),
+        ('accept_delay', '15')
+      ON CONFLICT (key) DO NOTHING;
+
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS is_flagged BOOLEAN DEFAULT false;
 
 

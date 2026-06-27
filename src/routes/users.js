@@ -226,6 +226,30 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), async
   res.json({ is_active: u.is_active });
 });
 
+// ── Admin : paramètres ─────────────────────────────────────
+router.get('/admin/settings', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query('SELECT * FROM settings');
+  const settings = {}
+  rows.forEach(r => settings[r.key] = r.value)
+  res.json({ settings })
+})
+
+router.put('/admin/settings', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { commission, min_price, urgency_fee, accept_delay } = req.body
+  const updates = { commission, min_price, urgency_fee, accept_delay }
+  for (const [key, value] of Object.entries(updates)) {
+    if (value !== undefined) {
+      await db.query(
+        `INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value=$2`,
+        [key, String(value)]
+      )
+    }
+  }
+  res.json({ ok: true })
+})
+
 // ── Admin : messages suspects ───────────────────────────────
 router.get('/admin/flagged-messages', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();

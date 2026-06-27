@@ -4,12 +4,17 @@ const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 
-const COMMISSION = 0.20;
-function pricing(price) {
-  const commission = Math.round(price * COMMISSION * 100) / 100;
-  return { commission, oeil_earning: price - commission };
+
+async function getCommissionRate(db) {
+  const { rows } = await db.query("SELECT value FROM settings WHERE key='commission'")
+  return rows.length ? parseFloat(rows[0].value) : 0.20
 }
 
+async function pricing(price, db) {
+  const rate = await getCommissionRate(db)
+  const commission = Math.round(price * rate * 100) / 100;
+  return { commission, oeil_earning: price - commission };
+}
 
 async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null) {
   const r = await db.query(
@@ -251,7 +256,7 @@ router.get('/', authenticate, async (req, res) => {
 // ── POST /missions ─────────────────────────────────────────
 router.post('/', authenticate, requireRole('client'), [
   body('type').isIn(['immobilier','file_attente','audit','personnalisee']),
-  body('title').trim().isLength({ min: 3, max: 200 }),
+  body('title').trim().isLength({ min: 6, max: 200 }),
   body('address').trim().notEmpty(),
   body('city').trim().notEmpty(),
   body('scheduled_at').isISO8601(),
@@ -273,7 +278,7 @@ router.post('/', authenticate, requireRole('client'), [
   } = req.body;
 
   const id = uuidv4();
-  const { commission, oeil_earning } = pricing(+price);
+ const { commission, oeil_earning } = await pricing(+price, db);
 
 const status = oeil_id ? 'assigned' : 'pending';
 
@@ -842,7 +847,7 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req
     )
   }
 
-  
+
 
   // Notifier l'Œil embauché
   await notify(db, req.params.oeilId, '🎉 Vous avez été sélectionné !',
