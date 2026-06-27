@@ -587,7 +587,7 @@ router.post('/:id/report', authenticate, requireRole('oeil','admin'), [
   res.status(201).json({ report });
 });
 
-// ── POST /missions/:id/rate ────────────────────────────────
+
 // ── POST /:id/messages ─────────────────────────────────
 router.post('/:id/messages', authenticate, async (req, res) => {
   const db = getDb();
@@ -607,11 +607,61 @@ router.post('/:id/messages', authenticate, async (req, res) => {
     return res.status(403).json({ error: 'Accès refusé' });
   }
 
-  const { rows: [msg] } = await db.query(
-    `INSERT INTO mission_messages (mission_id, sender_id, content, type)
-     VALUES ($1, $2, $3, 'text') RETURNING *`,
-    [req.params.id, req.user.id, content.trim()]
-  );
+const cleanContent = content.trim()
+
+// Détection de contenu sensible
+function detectSensitiveContent(text) {
+  const normalized = text
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/[.\-_\/\\|]/g, '')
+    .replace(/zero/g, '0').replace(/zéro/g, '0')
+    .replace(/un/g, '1').replace(/deux/g, '2')
+    .replace(/trois/g, '3').replace(/quatre/g, '4')
+    .replace(/cinq/g, '5').replace(/six/g, '6')
+    .replace(/sept/g, '7').replace(/huit/g, '8')
+    .replace(/neuf/g, '9')
+
+  const patterns = [
+    /0[567]\d{8}/,
+    /\+212\d{9}/,
+    /\d{10}/,
+    /@(gmail|hotmail|yahoo|outlook|live|icloud)/,
+    /(whatsapp|telegram|instagram|facebook|tiktok|snapchat|signal)/,
+    /(http|www\.|\.com|\.ma|\.net|\.org)/,
+  ]
+  return patterns.some(p => p.test(normalized))
+}
+
+const isFlagged = detectSensitiveContent(cleanContent)
+
+const { rows: [msg] } = await db.query(
+  `INSERT INTO mission_messages (mission_id, sender_id, content, type, is_flagged)
+   VALUES ($1, $2, $3, 'text', $4) RETURNING *`,
+  [req.params.id, req.user.id, cleanContent, isFlagged]
+);
+
+// Notifier l'admin si message suspect
+if (isFlagged) {
+  const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`)
+  const sender = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [req.user.id])
+  const senderName = `${sender.rows[0]?.first_name} ${sender.rows[0]?.last_name}`
+  for (const admin of admins) {
+    await db.query(
+      `INSERT INTO notifications (user_id, title, body, type, mission_id)
+       VALUES ($1, $2, $3, 'warning', $4)`,
+      [admin.id, '⚠️ Message suspect détecté',
+       `${senderName} a peut-être partagé un contact externe dans la mission "${mission.title}"`,
+       req.params.id]
+    )
+    const emitToUser = req.app.get('emitToUser')
+    if (emitToUser) emitToUser(admin.id, 'notification', {
+      title: '⚠️ Message suspect détecté',
+      body: `${senderName} — mission "${mission.title}"`,
+      missionId: req.params.id
+    })
+  }
+}
 
   // Notifier via Socket.io
   const io = req.app.get('io');

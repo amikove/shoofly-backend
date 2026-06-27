@@ -204,6 +204,8 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+    ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS is_flagged BOOLEAN DEFAULT false;
+
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
     CREATE TABLE IF NOT EXISTS mission_chat_seen (
