@@ -226,6 +226,23 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), async
   res.json({ is_active: u.is_active });
 });
 
+// ── Admin : messages suspects ───────────────────────────────
+router.get('/admin/flagged-messages', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT mm.id, mm.content, mm.created_at, mm.mission_id,
+      u.first_name||' '||u.last_name AS sender_name, u.role AS sender_role,
+      m.title AS mission_title
+    FROM mission_messages mm
+    JOIN users u ON u.id = mm.sender_id
+    JOIN missions m ON m.id = mm.mission_id
+    WHERE mm.is_flagged = true
+    ORDER BY mm.created_at DESC
+    LIMIT 50
+  `);
+  res.json({ messages: rows });
+});
+
 // ── Admin : réclamations ────────────────────────────────────
 router.get('/admin/claims', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();
