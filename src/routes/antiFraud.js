@@ -200,9 +200,9 @@ if (u.role === 'client') {
     }
 
     // Demandes de remboursement répétées (14 jours)
-    const refunds = await db.query(
+const refunds = await db.query(
       `SELECT COUNT(*)::int AS n FROM claims
-       WHERE client_id=$1 AND type='refund'
+       WHERE client_id=$1
        AND created_at > NOW() - INTERVAL '14 days'`,
       [userId]
     );
