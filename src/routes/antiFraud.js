@@ -271,14 +271,22 @@ router.post('/scan-all', authenticate, requireRole('admin'), async (req, res) =>
 // ── POST /anti-fraud/warn/:userId ────────────────────────
 router.post('/warn/:userId', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();
+  const { userId } = req.params;
   const { reason, rule_code, rule_label } = req.body;
+
+  if (!userId || userId === 'undefined') {
+    return res.status(400).json({ error: 'userId manquant' });
+  }
+
+  const { rows: [target] } = await db.query('SELECT id FROM users WHERE id=$1', [userId]);
+  if (!target) return res.status(404).json({ error: 'Utilisateur introuvable' });
 
   // 1. Logger dans la base
   await db.query(
     `INSERT INTO notifications (user_id, title, body, type)
      VALUES ($1, $2, $3, 'warning')`,
-    [
-      req.params.userId,
+[
+      userId,
       '⚠️ Activité inhabituelle détectée sur votre compte',
       reason || `Une activité suspecte a été détectée sur votre compte (${rule_label || rule_code}). Merci de vous assurer que vos actions respectent les conditions d'utilisation de Shoofly. En cas de récidive, votre compte pourra être suspendu.`
     ]
@@ -290,7 +298,7 @@ router.post('/warn/:userId', authenticate, requireRole('admin'), async (req, res
     `SELECT id FROM missions 
      WHERE (client_id=$1 OR oeil_id=$1) AND status NOT IN ('cancelled')
      ORDER BY created_at DESC LIMIT 1`,
-    [req.params.userId]
+    [userId]
   );
 
   if (mission) {
@@ -311,7 +319,7 @@ router.post('/warn/:userId', authenticate, requireRole('admin'), async (req, res
     }
   }
 
-  res.json({ message: 'Avertissement envoyé', user_id: req.params.userId });
+  res.json({ message: 'Avertissement envoyé', user_id: userId });
 });
 
 // ── POST /anti-fraud/block/:userId ───────────────────────
