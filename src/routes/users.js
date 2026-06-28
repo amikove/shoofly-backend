@@ -43,6 +43,7 @@ res.json({ oeils });
 });
 
 router.get('/oeils/:id', authenticate, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
   const db = getDb();
   const { rows: [oeil] } = await db.query(`
     SELECT u.id,u.first_name,u.last_name,u.city,u.avatar_url,u.created_at,p.*
