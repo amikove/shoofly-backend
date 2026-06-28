@@ -268,6 +268,52 @@ router.post('/scan-all', authenticate, requireRole('admin'), async (req, res) =>
   res.json({ scanned: users.length, flagged: results.filter(r => r.score >= 25).length, results });
 });
 
+// ── POST /anti-fraud/warn/:userId ────────────────────────
+router.post('/warn/:userId', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { reason, rule_code, rule_label } = req.body;
+
+  // 1. Logger dans la base
+  await db.query(
+    `INSERT INTO notifications (user_id, title, body, type)
+     VALUES ($1, $2, $3, 'warning')`,
+    [
+      req.params.userId,
+      '⚠️ Activité inhabituelle détectée sur votre compte',
+      reason || `Une activité suspecte a été détectée sur votre compte (${rule_label || rule_code}). Merci de vous assurer que vos actions respectent les conditions d'utilisation de Shoofly. En cas de récidive, votre compte pourra être suspendu.`
+    ]
+  );
+
+  // 2. Envoyer un message dans la messagerie admin → utilisateur
+  // Trouver une mission active liée à cet utilisateur pour ouvrir un canal
+  const { rows: [mission] } = await db.query(
+    `SELECT id FROM missions 
+     WHERE (client_id=$1 OR oeil_id=$1) AND status NOT IN ('cancelled')
+     ORDER BY created_at DESC LIMIT 1`,
+    [req.params.userId]
+  );
+
+  if (mission) {
+    // Récupérer l'admin
+    const { rows: [admin] } = await db.query(
+      `SELECT id FROM users WHERE role='admin' LIMIT 1`
+    );
+    if (admin) {
+      await db.query(
+        `INSERT INTO mission_messages (mission_id, sender_id, content)
+         VALUES ($1, $2, $3)`,
+        [
+          mission.id,
+          admin.id,
+          `⚠️ *Message officiel Shoofly*\n\nNous avons détecté une activité inhabituelle sur votre compte : *${rule_label || rule_code}*.\n\n${reason || 'Merci de vous assurer que vos actions sont conformes aux conditions générales d\'utilisation de la plateforme.'}\n\nEn cas de récidive, des mesures supplémentaires pourront être prises, pouvant aller jusqu\'à la suspension de votre compte.\n\n— L\'équipe Shoofly`
+        ]
+      );
+    }
+  }
+
+  res.json({ message: 'Avertissement envoyé', user_id: req.params.userId });
+});
+
 // ── POST /anti-fraud/block/:userId ───────────────────────
 router.post('/block/:userId', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();
