@@ -143,7 +143,36 @@ async function analyzeUser(db, userId) {
       alerts.push({ ...RULES.OEIL_NO_MEDIA, count: noMedia.rows.length, detected_at: new Date() });
       totalScore += RULES.OEIL_NO_MEDIA.score;
     }
+// Vérifier missions complétées trop rapidement (< 5 min)
+    const tooFast = await db.query(
+      `SELECT COUNT(*)::int AS n FROM missions
+       WHERE oeil_id=$1 AND status='completed'
+       AND completed_at > NOW() - INTERVAL '30 days'
+       AND EXTRACT(EPOCH FROM (completed_at - started_at)) < 300`,
+      [userId]
+    );
+    if (tooFast.rows[0].n >= 2) {
+      alerts.push({ ...RULES.OEIL_TOO_FAST_COMPLETE, count: tooFast.rows[0].n, detected_at: new Date() });
+      totalScore += RULES.OEIL_TOO_FAST_COMPLETE.score;
+    }
 
+    // Vérifier manipulation de note
+    const ratingSpike = await db.query(
+      `SELECT COUNT(*)::int AS n FROM ratings
+       WHERE oeil_id=$1 AND score=5
+       AND created_at > NOW() - INTERVAL '48 hours'`,
+      [userId]
+    );
+    const avgBefore = await db.query(
+      `SELECT AVG(score) AS avg FROM ratings
+       WHERE oeil_id=$1
+       AND created_at < NOW() - INTERVAL '48 hours'`,
+      [userId]
+    );
+    if (ratingSpike.rows[0].n >= 3 && avgBefore.rows[0].avg && parseFloat(avgBefore.rows[0].avg) < 3) {
+      alerts.push({ ...RULES.OEIL_RATING_MANIPULATION, spike: ratingSpike.rows[0].n, avg_before: parseFloat(avgBefore.rows[0].avg).toFixed(1), detected_at: new Date() });
+      totalScore += RULES.OEIL_RATING_MANIPULATION.score;
+    }
     // Vérifier spike de virement
     const avgWithdraw = await db.query(
       `SELECT AVG(amount) AS avg FROM withdrawals WHERE oeil_id=$1 AND status IN ('paid','approved')`, [userId]
@@ -160,7 +189,7 @@ async function analyzeUser(db, userId) {
     }
   }
 
-  if (u.role === 'client') {
+if (u.role === 'client') {
     // Annulations abusives (30 jours)
     const clientCancels = await db.query(
       `SELECT COUNT(*)::int AS n FROM missions WHERE client_id=$1 AND status='cancelled' AND cancelled_at > NOW() - INTERVAL '30 days'`, [userId]
@@ -169,6 +198,43 @@ async function analyzeUser(db, userId) {
       alerts.push({ ...RULES.CLIENT_ABUSE_CANCEL, count: clientCancels.rows[0].n, detected_at: new Date() });
       totalScore += RULES.CLIENT_ABUSE_CANCEL.score;
     }
+
+    // Demandes de remboursement répétées (14 jours)
+    const refunds = await db.query(
+      `SELECT COUNT(*)::int AS n FROM claims
+       WHERE client_id=$1 AND type='refund'
+       AND created_at > NOW() - INTERVAL '14 days'`,
+      [userId]
+    );
+    if (refunds.rows[0].n >= 2) {
+      alerts.push({ ...RULES.CLIENT_REFUND_ABUSE, count: refunds.rows[0].n, detected_at: new Date() });
+      totalScore += RULES.CLIENT_REFUND_ABUSE.score;
+    }
+
+    // Mission fictive — acceptée et annulée immédiatement (< 10 min)
+    const fakeMissions = await db.query(
+      `SELECT COUNT(*)::int AS n FROM missions
+       WHERE client_id=$1 AND status='cancelled'
+       AND cancelled_at > NOW() - INTERVAL '30 days'
+       AND EXTRACT(EPOCH FROM (cancelled_at - created_at)) < 600`,
+      [userId]
+    );
+    if (fakeMissions.rows[0].n >= 2) {
+      alerts.push({ ...RULES.CLIENT_FAKE_MISSION, count: fakeMissions.rows[0].n, detected_at: new Date() });
+      totalScore += RULES.CLIENT_FAKE_MISSION.score;
+    }
+  }
+
+  // Anomalie de paiement — transactions échouées répétées
+  const paymentFails = await db.query(
+    `SELECT COUNT(*)::int AS n FROM payments
+     WHERE user_id=$1 AND status='failed'
+     AND created_at > NOW() - INTERVAL '7 days'`,
+    [userId]
+  );
+  if (paymentFails.rows[0]?.n >= 3) {
+    alerts.push({ ...RULES.PAYMENT_ANOMALY, count: paymentFails.rows[0].n, detected_at: new Date() });
+    totalScore += RULES.PAYMENT_ANOMALY.score;
   }
 
   // Bypass plateforme (scan des messages)
