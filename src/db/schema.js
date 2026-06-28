@@ -287,7 +287,8 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+    ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+    ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS platform_amount NUMERIC(10,2);
 
     CREATE TABLE IF NOT EXISTS promo_codes (
       id              SERIAL PRIMARY KEY,
