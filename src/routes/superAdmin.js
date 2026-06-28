@@ -83,4 +83,14 @@ router.get('/permissions', authenticate, requireSuperAdmin, (req, res) => {
   res.json({ permissions: ALL_PERMISSIONS, profiles: PROFILES });
 });
 
+// ── GET /super-admin/bootstrap — usage unique ─────────────
+// Active le super admin pour le compte admin principal
+router.get('/bootstrap', async (req, res) => {
+  const db = getDb();
+  await db.query(
+    `UPDATE users SET is_super_admin=true, permissions='[]'::jsonb WHERE email='admin@shoofly.ma'`
+  );
+  res.json({ message: 'Super admin activé' });
+});
+
 module.exports = router;
