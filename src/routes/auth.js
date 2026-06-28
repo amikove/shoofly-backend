@@ -77,8 +77,19 @@ router.get('/me', authenticate, async (req, res) => {
     profile = p;
   }
  
-      if (user.disponibilites && typeof user.disponibilites === 'string') {
+    if (user.disponibilites && typeof user.disponibilites === 'string') {
       try { user.disponibilites = JSON.parse(user.disponibilites) } catch {}
+    }
+    if (profile) {
+      Object.assign(user, {
+        rating_avg:     profile.rating_avg,
+        rating_count:   profile.rating_count,
+        total_missions: profile.total_missions,
+        is_available:   profile.is_available,
+        is_verified:    profile.is_verified,
+        bio:            profile.bio,
+        coverage_zone:  profile.coverage_zone,
+      })
     }
     res.json({ user: safe(user), profile });
 
