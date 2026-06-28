@@ -353,5 +353,115 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), async (
   res.json({ message: `Virement ${status}` });
 });
 
+
+// ── POST /users/oeil/identity — upload documents identité ──
+router.post('/oeil/identity', authenticate, requireRole('oeil'), async (req, res) => {
+  const db = getDb();
+  const { cin_recto, cin_verso, selfie } = req.body;
+
+  if (!cin_recto || !cin_verso || !selfie) {
+    return res.status(400).json({ error: 'Les 3 documents sont requis (CIN recto, verso, selfie)' });
+  }
+
+  // Supprimer l'ancienne demande si rejetée
+  await db.query(
+    `DELETE FROM identity_documents WHERE user_id=$1 AND status='rejected'`,
+    [req.user.id]
+  );
+
+  // Vérifier qu'il n'y a pas déjà une demande en attente ou approuvée
+  const { rows: [existing] } = await db.query(
+    `SELECT id, status FROM identity_documents WHERE user_id=$1 AND status IN ('pending','approved')`,
+    [req.user.id]
+  );
+  if (existing) {
+    return res.status(400).json({ error: existing.status === 'approved' ? 'Identité déjà vérifiée' : 'Demande déjà en attente de vérification' });
+  }
+
+  const { rows: [doc] } = await db.query(
+    `INSERT INTO identity_documents (user_id, cin_recto, cin_verso, selfie)
+     VALUES ($1, $2, $3, $4) RETURNING *`,
+    [req.user.id, cin_recto, cin_verso, selfie]
+  );
+
+  res.json({ message: 'Documents soumis avec succès', document: doc });
+});
+
+// ── GET /users/admin/identity-requests — liste demandes en attente ──
+router.get('/admin/identity-requests', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { status = 'pending' } = req.query;
+
+  const { rows } = await db.query(`
+    SELECT d.*, u.first_name, u.last_name, u.email, u.phone, u.city
+    FROM identity_documents d
+    JOIN users u ON u.id=d.user_id
+    WHERE d.status=$1
+    ORDER BY d.created_at ASC
+  `, [status]);
+
+  res.json({ requests: rows });
+});
+
+// ── POST /users/admin/identity-requests/:id/approve ──
+router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+
+  const { rows: [doc] } = await db.query(
+    `UPDATE identity_documents SET status='approved', reviewed_by=$1, reviewed_at=NOW()
+     WHERE id=$2 RETURNING *`,
+    [req.user.id, req.params.id]
+  );
+  if (!doc) return res.status(404).json({ error: 'Demande introuvable' });
+
+  // Marquer l'Œil comme vérifié
+  await db.query(
+    `UPDATE oeil_profiles SET is_verified=true WHERE user_id=$1`,
+    [doc.user_id]
+  );
+  await db.query(
+    `UPDATE users SET updated_at=NOW() WHERE id=$1`,
+    [doc.user_id]
+  );
+
+  // Notification in-app
+  await db.query(
+    `INSERT INTO notifications (user_id, title, body, type)
+     VALUES ($1, '✅ Identité vérifiée', 'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.', 'success')`,
+    [doc.user_id]
+  );
+
+  res.json({ message: 'Identité approuvée', user_id: doc.user_id });
+});
+
+// ── POST /users/admin/identity-requests/:id/reject ──
+router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { reason } = req.body;
+
+  const { rows: [doc] } = await db.query(
+    `UPDATE identity_documents SET status='rejected', rejected_reason=$1, reviewed_by=$2, reviewed_at=NOW()
+     WHERE id=$3 RETURNING *`,
+    [reason || 'Documents non conformes', req.user.id, req.params.id]
+  );
+  if (!doc) return res.status(404).json({ error: 'Demande introuvable' });
+
+  // Mettre à jour le profil avec la raison du rejet
+  await db.query(
+    `UPDATE oeil_profiles SET is_verified=false, rejection_reason=$1 WHERE user_id=$2`,
+    [reason || 'Documents non conformes', doc.user_id]
+  );
+
+  // Notification in-app
+  await db.query(
+    `INSERT INTO notifications (user_id, title, body, type)
+     VALUES ($1, '❌ Vérification refusée', $2, 'error')`,
+    [doc.user_id, `Votre demande de vérification a été refusée. Raison : ${reason || 'Documents non conformes'}. Vous pouvez soumettre de nouveaux documents.`]
+  );
+
+  res.json({ message: 'Identité rejetée', user_id: doc.user_id });
+});
+
+
 // Admin joins its own WS room on connect (done client-side)
 module.exports = router;

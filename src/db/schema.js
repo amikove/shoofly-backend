@@ -274,6 +274,20 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+CREATE TABLE IF NOT EXISTS identity_documents (
+      id          SERIAL PRIMARY KEY,
+      user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      cin_recto   TEXT NOT NULL,
+      cin_verso   TEXT NOT NULL,
+      selfie      TEXT NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+      rejected_reason TEXT,
+      reviewed_by TEXT REFERENCES users(id),
+      reviewed_at TIMESTAMPTZ,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
   `);
 
   console.log('✅ PostgreSQL schema ready');
