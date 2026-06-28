@@ -231,8 +231,7 @@ router.get('/dashboard', authenticate, requireRole('admin'), async (req, res) =>
     db.query(`
       SELECT
         (SELECT COUNT(*)::int FROM missions WHERE status='cancelled' AND cancelled_at > NOW() - INTERVAL '30 days') AS cancellations_30d,
-        (SELECT COUNT(*)::int FROM missions m LEFT JOIN mission_media mm ON mm.mission_id=m.id WHERE m.status='completed' AND m.completed_at > NOW() - INTERVAL '7 days' GROUP BY m.id HAVING COUNT(mm.id)=0) AS no_media_missions,
-        (SELECT COUNT(*)::int FROM withdrawals WHERE status='pending') AS pending_withdrawals,
+        (SELECT COUNT(*)::int FROM missions m WHERE m.status='completed' AND m.completed_at > NOW() - INTERVAL '7 days' AND NOT EXISTS (SELECT 1 FROM mission_media mm WHERE mm.mission_id=m.id)) AS no_media_missions,(SELECT COUNT(*)::int FROM withdrawals WHERE status='pending') AS pending_withdrawals,
         (SELECT COUNT(*)::int FROM users WHERE is_active=false) AS blocked_accounts
     `),
   ]);
