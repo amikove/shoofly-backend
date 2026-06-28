@@ -197,7 +197,7 @@ router.get('/dashboard', authenticate, requireRole('admin'), async (req, res) =>
   const [flaggedMissions, suspiciousWithdrawals, recentAlerts, stats] = await Promise.all([
     // Missions suspectes: complétées sans médias récemment
     db.query(`
-      SELECT m.id, m.title, m.status, m.price, m.completed_at,
+      SELECT m.id, m.title, m.status, m.price, m.completed_at, m.oeil_id,
         c.first_name||' '||c.last_name AS client_name,
         o.first_name||' '||o.last_name AS oeil_name,
         COUNT(mm.id)::int AS media_count
