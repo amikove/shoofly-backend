@@ -2,7 +2,35 @@ const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+const identityStorage = new CloudinaryStorage({
+  cloudinary,
+  params: async (req, file) => ({
+    folder: `shoofly/identity/${req.user?.id}`,
+    resource_type: 'image',
+    allowed_formats: ['jpg','jpeg','png','webp'],
+    transformation: [{ width: 1200, crop: 'limit' }],
+  }),
+});
+
+const uploadIdentity = multer({
+  storage: identityStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = /jpeg|jpg|png|webp/;
+    if (allowed.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Format non supporté. Utilisez JPG ou PNG.'));
+  }
+});
 
 function isWithinSchedule(disponibilites) {
   if (!disponibilites) return true; // pas de créneaux = on se fie au toggle manuel
@@ -355,9 +383,15 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), async (
 
 
 // ── POST /users/oeil/identity — upload documents identité ──
-router.post('/oeil/identity', authenticate, requireRole('oeil'), async (req, res) => {
+router.post('/oeil/identity', authenticate, requireRole('oeil'), uploadIdentity.fields([
+  { name: 'cin_recto', maxCount: 1 },
+  { name: 'cin_verso', maxCount: 1 },
+  { name: 'selfie',    maxCount: 1 },
+]), async (req, res) => {
   const db = getDb();
-  const { cin_recto, cin_verso, selfie } = req.body;
+  const cin_recto = req.files?.cin_recto?.[0]?.path;
+  const cin_verso = req.files?.cin_verso?.[0]?.path;
+  const selfie    = req.files?.selfie?.[0]?.path;
 
   if (!cin_recto || !cin_verso || !selfie) {
     return res.status(400).json({ error: 'Les 3 documents sont requis (CIN recto, verso, selfie)' });
