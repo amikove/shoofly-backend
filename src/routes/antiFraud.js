@@ -272,7 +272,7 @@ router.post('/scan-all', authenticate, requireRole('admin'), async (req, res) =>
 router.post('/warn/:userId', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();
   const { userId } = req.params;
-  const { reason, rule_code, rule_label } = req.body;
+  const { reason, rule_code, rule_label, mission_id } = req.body;
 
   if (!userId || userId === 'undefined') {
     return res.status(400).json({ error: 'userId manquant' });
@@ -295,10 +295,10 @@ router.post('/warn/:userId', authenticate, requireRole('admin'), async (req, res
   // 2. Envoyer un message dans la messagerie admin → utilisateur
   // Trouver une mission active liée à cet utilisateur pour ouvrir un canal
   const { rows: [mission] } = await db.query(
-    `SELECT id FROM missions 
-     WHERE (client_id=$1 OR oeil_id=$1) AND status NOT IN ('cancelled')
-     ORDER BY created_at DESC LIMIT 1`,
-    [userId]
+    mission_id
+      ? `SELECT id FROM missions WHERE id=$1`
+      : `SELECT id FROM missions WHERE (client_id=$1 OR oeil_id=$1) AND status NOT IN ('cancelled') ORDER BY created_at DESC LIMIT 1`,
+    [mission_id || userId]
   );
 
   if (mission) {
