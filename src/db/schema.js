@@ -287,7 +287,34 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+
+    CREATE TABLE IF NOT EXISTS promo_codes (
+      id              SERIAL PRIMARY KEY,
+      code            TEXT NOT NULL UNIQUE,
+      type            TEXT NOT NULL CHECK(type IN ('percent','fixed','free')),
+      value           NUMERIC(10,2) NOT NULL DEFAULT 0,
+      max_uses        INTEGER,
+      max_uses_per_user INTEGER NOT NULL DEFAULT 1,
+      used_count      INTEGER NOT NULL DEFAULT 0,
+      expires_at      TIMESTAMPTZ,
+      is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+      created_by      TEXT REFERENCES users(id),
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS promo_uses (
+      id          SERIAL PRIMARY KEY,
+      promo_id    INTEGER NOT NULL REFERENCES promo_codes(id) ON DELETE CASCADE,
+      user_id     TEXT NOT NULL REFERENCES users(id),
+      mission_id  TEXT REFERENCES missions(id),
+      discount    NUMERIC(10,2) NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS promo_code TEXT;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS discount NUMERIC(10,2) NOT NULL DEFAULT 0;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS original_price NUMERIC(10,2);
   `);
 
   console.log('✅ PostgreSQL schema ready');

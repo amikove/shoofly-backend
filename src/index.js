@@ -13,6 +13,7 @@ const { initDb, getDb } = require('./db/schema');
 const cron = require('node-cron');
 const authRoutes    = require('./routes/auth');
 const fraudRoutes   = require('./routes/antiFraud');
+const promoRoutes   = require('./routes/promo');
 const missionRoutes = require('./routes/missions');
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
@@ -64,6 +65,7 @@ app.use('/api/missions', missionRoutes);
 app.use('/api/media',    mediaRoutes);
 app.use('/api/users',    userRoutes);
 app.use('/api/anti-fraud', fraudRoutes);
+app.use('/api/promo', promoRoutes);
 app.use('/api/reports', reportRoutes);
 
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
