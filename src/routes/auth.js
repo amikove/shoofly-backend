@@ -47,54 +47,65 @@ router.post('/register', [
 });
 
 router.post('/login', [
-  body('email').isEmail().normalizeEmail(),
-  body('password').notEmpty(),
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      body('email').isEmail().normalizeEmail(),
+      body('password').notEmpty(),
+    ], async (req, res) => {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-  const db = getDb();
-  const { rows: [user] } = await db.query('SELECT * FROM users WHERE email=$1', [req.body.email]);
-  if (!user || !bcrypt.compareSync(req.body.password, user.password))
-    return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
-  if (!user.is_active) return res.status(403).json({ error: 'Compte suspendu' });
+      const db = getDb();
+      const { rows: [user] } = await db.query('SELECT * FROM users WHERE email=$1', [req.body.email]);
+      if (!user || !bcrypt.compareSync(req.body.password, user.password))
+        return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
+      if (!user.is_active) return res.status(403).json({ error: 'Compte suspendu' });
 
-  let profile = null;
-  if (user.role === 'oeil') {
-    const { rows: [p] } = await db.query('SELECT * FROM oeil_profiles WHERE user_id=$1', [user.id]);
-    profile = p;
-  }
-  res.json({ token: makeToken(user), user: safe(user), profile });
-});
+      let profile = null;
+      if (user.role === 'oeil') {
+        const { rows: [p] } = await db.query('SELECT * FROM oeil_profiles WHERE user_id=$1', [user.id]);
+        profile = p;
+      }
+     if (profile) {
+        Object.assign(user, {
+          rating_avg:     profile.rating_avg,
+          rating_count:   profile.rating_count,
+          total_missions: profile.total_missions,
+          is_available:   profile.is_available,
+          is_verified:    profile.is_verified,
+          bio:            profile.bio,
+          coverage_zone:  profile.coverage_zone,
+        })
+      }
+      res.json({ token: makeToken(user), user: safe(user), profile });
+    });
 
 router.get('/me', authenticate, async (req, res) => {
-  const db = getDb();
-  const { rows: [user] } = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
-  if (!user) return res.status(404).json({ error: 'Introuvable' });
-  let profile = null;
-  if (user.role === 'oeil') {
-    const { rows: [p] } = await db.query('SELECT * FROM oeil_profiles WHERE user_id=$1', [user.id]);
-    profile = p;
-  }
- 
-    if (user.disponibilites && typeof user.disponibilites === 'string') {
-      try { user.disponibilites = JSON.parse(user.disponibilites) } catch {}
-    }
-    if (profile) {
-      Object.assign(user, {
-        rating_avg:     profile.rating_avg,
-        rating_count:   profile.rating_count,
-        total_missions: profile.total_missions,
-        is_available:   profile.is_available,
-        is_verified:    profile.is_verified,
-        bio:            profile.bio,
-        coverage_zone:  profile.coverage_zone,
-      })
-    }
-    res.json({ user: safe(user), profile });
+      const db = getDb();
+      const { rows: [user] } = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+      if (!user) return res.status(404).json({ error: 'Introuvable' });
+      let profile = null;
+      if (user.role === 'oeil') {
+        const { rows: [p] } = await db.query('SELECT * FROM oeil_profiles WHERE user_id=$1', [user.id]);
+        profile = p;
+      }
+    
+        if (user.disponibilites && typeof user.disponibilites === 'string') {
+          try { user.disponibilites = JSON.parse(user.disponibilites) } catch {}
+        }
+        if (profile) {
+          Object.assign(user, {
+            rating_avg:     profile.rating_avg,
+            rating_count:   profile.rating_count,
+            total_missions: profile.total_missions,
+            is_available:   profile.is_available,
+            is_verified:    profile.is_verified,
+            bio:            profile.bio,
+            coverage_zone:  profile.coverage_zone,
+          })
+        }
+        res.json({ user: safe(user), profile });
 
 
-});
+    });
 
 router.put('/me', authenticate, async (req, res) => {
   const db = getDb();
