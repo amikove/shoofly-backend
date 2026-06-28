@@ -2,6 +2,7 @@ const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const { requirePermission } = require('../middleware/permissions');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
@@ -207,7 +208,7 @@ router.get('/client/stats', authenticate, requireRole('client'), async (req, res
 });
 
 
-router.get('/admin/stats', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
     db.query(`SELECT
@@ -298,7 +299,7 @@ router.get('/admin/flagged-messages', authenticate, requireRole('admin'), async 
 });
 
 // ── Admin : réclamations ────────────────────────────────────
-router.get('/admin/claims', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/claims', authenticate, requireRole('admin'), requirePermission('claims'), async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT cl.*, 
@@ -353,7 +354,7 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
 });
 
 
-router.get('/admin/withdrawals', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/withdrawals', authenticate, requireRole('admin'), requirePermission('finance'), async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT w.*, u.first_name||' '||u.last_name AS oeil_name, u.phone AS oeil_phone
@@ -423,7 +424,7 @@ router.post('/oeil/identity', authenticate, requireRole('oeil'), uploadIdentity.
 });
 
 // ── GET /users/admin/identity-requests — liste demandes en attente ──
-router.get('/admin/identity-requests', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/identity-requests', authenticate, requireRole('admin'), requirePermission('identity'), async (req, res) => {
   const db = getDb();
   const { status = 'pending' } = req.query;
 

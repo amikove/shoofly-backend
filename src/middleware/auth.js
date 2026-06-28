@@ -6,9 +6,19 @@ async function authenticate(req, res, next) {
   if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Token manquant' });
   try {
     const payload = jwt.verify(header.slice(7), process.env.JWT_SECRET);
-    const { rows: [user] } = await getDb().query('SELECT id,role,is_active,city,quartier FROM users WHERE id=$1', [payload.id]);
+    const { rows: [user] } = await getDb().query(
+      'SELECT id, role, is_active, city, quartier, is_super_admin, permissions FROM users WHERE id=$1',
+      [payload.id]
+    );
     if (!user || !user.is_active) return res.status(401).json({ error: 'Compte introuvable ou suspendu' });
-    req.user = { id: user.id, role: user.role, city: user.city, quartier: user.quartier };
+    req.user = {
+      id:             user.id,
+      role:           user.role,
+      city:           user.city,
+      quartier:       user.quartier,
+      is_super_admin: user.is_super_admin || false,
+      permissions:    Array.isArray(user.permissions) ? user.permissions : [],
+    };
     next();
   } catch { return res.status(401).json({ error: 'Token invalide ou expiré' }); }
 }

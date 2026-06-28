@@ -15,7 +15,8 @@ const xss = require('xss-clean');
 const hpp = require('hpp');
 const mongoSanitize = require('express-mongo-sanitize');
 const authRoutes    = require('./routes/auth');
-const fraudRoutes   = require('./routes/antiFraud');
+const fraudRoutes      = require('./routes/antiFraud');
+const superAdminRoutes = require('./routes/superAdmin');
 const promoRoutes   = require('./routes/promo');
 const missionRoutes = require('./routes/missions');
 const mediaRoutes   = require('./routes/media');
@@ -101,6 +102,7 @@ app.use('/api/missions', missionRoutes);
 app.use('/api/media',    mediaRoutes);
 app.use('/api/users',    userRoutes);
 app.use('/api/anti-fraud', fraudRoutes);
+app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/promo', promoRoutes);
 app.use('/api/reports', reportRoutes);
 

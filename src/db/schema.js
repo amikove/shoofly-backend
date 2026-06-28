@@ -288,7 +288,9 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
 
     ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
-    ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS platform_amount NUMERIC(10,2);
+   ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS platform_amount NUMERIC(10,2);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_super_admin BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]';
 
     CREATE TABLE IF NOT EXISTS promo_codes (
       id              SERIAL PRIMARY KEY,
