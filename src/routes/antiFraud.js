@@ -225,17 +225,17 @@ const refunds = await db.query(
     }
   }
 
-  // Anomalie de paiement — transactions échouées répétées
-  const paymentFails = await db.query(
-    `SELECT COUNT(*)::int AS n FROM payments
-     WHERE user_id=$1 AND status='failed'
-     AND created_at > NOW() - INTERVAL '7 days'`,
-    [userId]
-  );
-  if (paymentFails.rows[0]?.n >= 3) {
-    alerts.push({ ...RULES.PAYMENT_ANOMALY, count: paymentFails.rows[0].n, detected_at: new Date() });
-    totalScore += RULES.PAYMENT_ANOMALY.score;
-  }
+// Anomalie de paiement — à activer après intégration CMI
+  // const paymentFails = await db.query(
+  //   `SELECT COUNT(*)::int AS n FROM payments
+  //    WHERE user_id=$1 AND status='failed'
+  //    AND created_at > NOW() - INTERVAL '7 days'`,
+  //   [userId]
+  // );
+  // if (paymentFails.rows[0]?.n >= 3) {
+  //   alerts.push({ ...RULES.PAYMENT_ANOMALY, count: paymentFails.rows[0].n, detected_at: new Date() });
+  //   totalScore += RULES.PAYMENT_ANOMALY.score;
+  // }
 
   // Bypass plateforme (scan des messages)
   const suspiciousMessages = await db.query(
