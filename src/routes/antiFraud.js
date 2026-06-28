@@ -220,7 +220,7 @@ router.get('/dashboard', authenticate, requireRole('admin'), async (req, res) =>
     `),
     // Messages suspects (coordonnées directes)
     db.query(`
-      SELECT mm.id, mm.content, mm.created_at, mm.mission_id,
+      SELECT mm.id, mm.content, mm.created_at, mm.mission_id, mm.sender_id,
         u.first_name||' '||u.last_name AS sender_name
       FROM mission_messages mm JOIN users u ON u.id=mm.sender_id
       WHERE mm.content ~* '\\+212|whatsapp|telegram|06[0-9]{8}|07[0-9]{8}'
