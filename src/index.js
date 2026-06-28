@@ -11,6 +11,9 @@ const jwt = require('jsonwebtoken');
 
 const { initDb, getDb } = require('./db/schema');
 const cron = require('node-cron');
+const xss = require('xss-clean');
+const hpp = require('hpp');
+const mongoSanitize = require('express-mongo-sanitize');
 const authRoutes    = require('./routes/auth');
 const fraudRoutes   = require('./routes/antiFraud');
 const promoRoutes   = require('./routes/promo');
@@ -54,12 +57,45 @@ if (allowedOrigins.includes(origin)) {
 })
 
 
-app.use(rateLimit({ windowMs: 15*60*1000, max: 300, skip: (req) => req.path === '/health' }));
+// Trust proxy — fix rate limit sur Render
+app.set('trust proxy', 1);
+
+// Rate limit global
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  skip: (req) => req.path === '/health',
+  message: { error: 'Trop de requêtes, réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
+
+// Rate limit strict sur login — 10 tentatives / 15min par IP
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Trop de tentatives de connexion. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Rate limit sur upload — 20 uploads / 10min
+const uploadLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  message: { error: 'Trop d\'uploads. Réessayez dans 10 minutes.' },
+});
+
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json({ limit: '5mb' }));
+app.use(xss());
+app.use(hpp());
+app.use(mongoSanitize());
 app.use('/uploads', express.static(path.resolve(process.env.UPLOAD_DIR || './uploads')));
 
 // ── Routes ────────────────────────────────────────────────
+app.use('/api/auth/login', loginLimiter);
+app.use('/api/media',      uploadLimiter);
 app.use('/api/auth',     authRoutes);
 app.use('/api/missions', missionRoutes);
 app.use('/api/media',    mediaRoutes);
@@ -72,9 +108,12 @@ app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().to
 app.get('/api', (_, res) => res.json({ name: 'SHOOFLY API', version: '1.0.0' }));
 app.use((req, res) => res.status(404).json({ error: `Route introuvable: ${req.method} ${req.path}` }));
 app.use((err, req, res, next) => {
+  // Ne jamais exposer les détails en production
+  const isDev = process.env.NODE_ENV !== 'production';
   console.error('❌', err.message);
-  if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Fichier trop volumineux' });
-  res.status(500).json({ error: process.env.NODE_ENV === 'production' ? 'Erreur serveur' : err.message });
+  if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Fichier trop volumineux (max 10MB)' });
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Requête trop volumineuse' });
+  res.status(err.status || 500).json({ error: isDev ? err.message : 'Une erreur est survenue. Veuillez réessayer.' });
 });
 
 // ── WebSocket ─────────────────────────────────────────────

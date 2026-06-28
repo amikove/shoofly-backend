@@ -25,7 +25,8 @@ const storage = new CloudinaryStorage({
 const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
+fileFilter: (req, file, cb) => {
+    file.originalname = file.originalname.replace(/[&<>"'`%;()]/g, '')
     const allowed = /jpeg|jpg|png|webp|mp4|mov/;
     if (allowed.test(file.mimetype) || allowed.test(file.originalname)) cb(null, true);
     else cb(new Error('Type de fichier non supporté'));

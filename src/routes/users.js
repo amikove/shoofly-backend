@@ -26,10 +26,11 @@ const uploadIdentity = multer({
   storage: identityStorage,
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = /jpeg|jpg|png|webp/;
-    if (allowed.test(file.mimetype)) cb(null, true);
-    else cb(new Error('Format non supporté. Utilisez JPG ou PNG.'));
-  }
+      file.originalname = file.originalname.replace(/[&<>"'`%;()]/g, '')
+      const allowed = /jpeg|jpg|png|webp/;
+      if (allowed.test(file.mimetype)) cb(null, true);
+      else cb(new Error('Format non supporté. Utilisez JPG ou PNG.'));
+    }
 });
 
 function isWithinSchedule(disponibilites) {
