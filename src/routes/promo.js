@@ -46,6 +46,7 @@ router.post('/validate', authenticate, async (req, res) => {
     discount,
     original_price: originalPrice,
     final_price: finalPrice,
+    platform_amount: promo.platform_amount || null,
   });
 });
 
@@ -64,7 +65,7 @@ router.get('/admin', authenticate, requireRole('admin'), async (req, res) => {
 // ── POST /promo/admin — créer un code ─────────────────────
 router.post('/admin', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();
-  const { code, type, value, max_uses, max_uses_per_user, expires_at } = req.body;
+  const { code, type, value, max_uses, max_uses_per_user, expires_at, platform_amount } = req.body;
 
   if (!code || !type || value === undefined)
     return res.status(400).json({ error: 'Code, type et valeur requis' });
@@ -74,9 +75,9 @@ router.post('/admin', authenticate, requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: 'Pourcentage entre 1 et 100' });
 
   const { rows: [promo] } = await db.query(
-    `INSERT INTO promo_codes (code, type, value, max_uses, max_uses_per_user, expires_at, created_by)
-     VALUES (UPPER($1), $2, $3, $4, $5, $6, $7) RETURNING *`,
-    [code, type, value, max_uses || null, max_uses_per_user || 1, expires_at || null, req.user.id]
+    `INSERT INTO promo_codes (code, type, value, max_uses, max_uses_per_user, expires_at, platform_amount, created_by)
+     VALUES (UPPER($1), $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+    [code, type, value, max_uses || null, max_uses_per_user || 1, expires_at || null, platform_amount || null, req.user.id]
   );
 
   res.status(201).json({ promo });

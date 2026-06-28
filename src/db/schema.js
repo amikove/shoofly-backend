@@ -297,8 +297,9 @@ ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
       max_uses        INTEGER,
       max_uses_per_user INTEGER NOT NULL DEFAULT 1,
       used_count      INTEGER NOT NULL DEFAULT 0,
-      expires_at      TIMESTAMPTZ,
-      is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+      expires_at        TIMESTAMPTZ,
+      platform_amount   NUMERIC(10,2),
+      is_active         BOOLEAN NOT NULL DEFAULT TRUE,
       created_by      TEXT REFERENCES users(id),
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );

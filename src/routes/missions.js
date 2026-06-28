@@ -260,7 +260,7 @@ router.post('/', authenticate, requireRole('client'), [
   body('address').trim().notEmpty(),
   body('city').trim().notEmpty(),
   body('scheduled_at').isISO8601(),
-  body('price').isFloat({ min: 50 }),
+  body('price').isFloat({ min: 0 }),
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
@@ -275,10 +275,17 @@ router.post('/', authenticate, requireRole('client'), [
     property_type, visit_type, video_call,
     institution, purpose,
     company_name, audit_type, frequency, criteria, subcategory,
+    promo_code, discount, original_price, platform_amount,
   } = req.body;
 
-  const id = uuidv4();
- const { commission, oeil_earning } = await pricing(+price, db);
+const id = uuidv4();
+  let { commission, oeil_earning } = await pricing(+original_price || +price, db);
+
+  // Si code promo gratuit — Shoofly paie l'Œil
+  if (promo_code && +price === 0 && platform_amount) {
+    oeil_earning = parseFloat(platform_amount);
+    commission   = 0;
+  }
 
 const status = oeil_id ? 'assigned' : 'pending';
 
@@ -300,6 +307,23 @@ const { rows: [mission] } = await db.query(`
 ]);
 
 await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
+
+// Enregistrer l'utilisation du code promo
+
+  if (promo_code) {
+    const { rows: [promo] } = await db.query(
+      `SELECT id FROM promo_codes WHERE UPPER(code)=UPPER($1)`, [promo_code]
+    );
+    if (promo) {
+      await db.query(
+        `INSERT INTO promo_uses (promo_id, user_id, mission_id, discount) VALUES ($1,$2,$3,$4)`,
+        [promo.id, req.user.id, mission.id, discount || 0]
+      );
+      await db.query(
+        `UPDATE promo_codes SET used_count=used_count+1 WHERE id=$1`, [promo.id]
+      );
+    }
+  }
 
   // Notify verified available oeils
   const { rows: oeils } = await db.query(
