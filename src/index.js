@@ -228,6 +228,296 @@ initDb().then(() => {
 
   // Job toutes les heures — valider automatiquement les missions après 12h sans réclamation
 
+// ── Cron J-1 20h — Rappel mission demain ─────────────────
+  cron.schedule('0 20 * * *', async () => {
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const dateStr = tomorrow.toISOString().slice(0, 10);
+
+      const { rows: missions } = await db.query(`
+        SELECT m.*, u.first_name, u.last_name
+        FROM missions m
+        JOIN users u ON u.id = m.oeil_id
+        WHERE m.status IN ('assigned')
+        AND DATE(m.scheduled_at) = $1
+        AND m.oeil_id IS NOT NULL
+      `, [dateStr]);
+
+      for (const m of missions) {
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type, mission_id)
+           VALUES ($1, $2, $3, 'warning', $4)`,
+          [m.oeil_id,
+           '⏰ Rappel mission demain',
+           `Vous avez une mission demain : "${m.title}" à ${new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}. Confirmez votre présence en étant à l'heure.`,
+           m.id]
+        );
+        if (emitToUser) emitToUser(m.oeil_id, 'notification', {
+          title: '⏰ Rappel mission demain',
+          body: `Mission demain : "${m.title}"`,
+          missionId: m.id,
+          type: 'warning'
+        });
+        console.log(`⏰ Rappel J-1 envoyé pour mission ${m.id}`);
+      }
+    } catch (e) { console.error('❌ Cron J-1 rappel error:', e.message); }
+  });
+
+  // ── Cron J-1 22h — Email récap admin non-confirmations ───
+  cron.schedule('0 22 * * *', async () => {
+    try {
+      const db = getDb();
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const dateStr = tomorrow.toISOString().slice(0, 10);
+
+      const { rows: missions } = await db.query(`
+        SELECT m.*, 
+          u.first_name AS oeil_first, u.last_name AS oeil_last, u.phone AS oeil_phone,
+          c.first_name AS client_first, c.last_name AS client_last
+        FROM missions m
+        JOIN users u ON u.id = m.oeil_id
+        JOIN users c ON c.id = m.client_id
+        WHERE m.status IN ('assigned')
+        AND DATE(m.scheduled_at) = $1
+        AND m.oeil_id IS NOT NULL
+        ORDER BY m.city, m.quartier
+      `, [dateStr]);
+
+      if (missions.length === 0) return;
+
+      // Grouper par ville
+      const grouped = missions.reduce((acc, m) => {
+        const key = `${m.city} — ${m.quartier || 'Sans quartier'}`;
+        if (!acc[key]) acc[key] = [];
+        acc[key].push(m);
+        return acc;
+      }, {});
+
+      // Construire le corps de l'email
+      let body = `Récapitulatif missions du ${tomorrow.toLocaleDateString('fr-FR')} — ${missions.length} mission(s) en attente de confirmation\n\n`;
+      for (const [zone, ms] of Object.entries(grouped)) {
+        body += `📍 ${zone}\n`;
+        for (const m of ms) {
+          body += `  • ${m.title} — ${new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}\n`;
+          body += `    Œil : ${m.oeil_first} ${m.oeil_last} (${m.oeil_phone})\n`;
+          body += `    Client : ${m.client_first} ${m.client_last}\n\n`;
+        }
+      }
+
+      // Notification in-app admin
+      const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+      for (const admin of admins) {
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type)
+           VALUES ($1, $2, $3, 'warning')`,
+          [admin.id,
+           `📋 ${missions.length} mission(s) non confirmées demain`,
+           body]
+        );
+      }
+      console.log(`📋 Récap admin envoyé — ${missions.length} missions demain`);
+    } catch (e) { console.error('❌ Cron récap admin error:', e.message); }
+  });
+
+  // ── Cron toutes les heures — Alertes H et H+30 ───────────
+  cron.schedule('*/30 * * * *', async () => {
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+      const now = new Date();
+
+      // Missions qui auraient dû démarrer il y a 0-30 min (H)
+      const { rows: lateH } = await db.query(`
+        SELECT m.*, u.first_name, u.last_name
+        FROM missions m
+        JOIN users u ON u.id = m.oeil_id
+        WHERE m.status = 'assigned'
+        AND m.scheduled_at BETWEEN NOW() - INTERVAL '30 minutes' AND NOW()
+        AND m.oeil_id IS NOT NULL
+      `);
+
+      for (const m of lateH) {
+        // Alerte Œil
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type, mission_id)
+           VALUES ($1, '🚨 Votre mission a commencé !', $2, 'error', $3)
+           ON CONFLICT DO NOTHING`,
+          [m.oeil_id, `La mission "${m.title}" devait commencer maintenant. Mettez à jour votre statut immédiatement.`, m.id]
+        );
+        // Alerte admin
+        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+        for (const admin of admins) {
+          await db.query(
+            `INSERT INTO notifications (user_id, title, body, type, mission_id)
+             VALUES ($1, '🚨 Mission non démarrée', $2, 'error', $3)`,
+            [admin.id, `L'Œil ${m.first_name} ${m.last_name} n'a pas démarré "${m.title}" à l'heure prévue.`, m.id]
+          );
+        }
+        if (emitToUser) emitToUser(m.oeil_id, 'notification', {
+          title: '🚨 Mission non démarrée',
+          body: `"${m.title}" devait commencer maintenant !`,
+          missionId: m.id,
+          type: 'error'
+        });
+        console.log(`🚨 Alerte H pour mission ${m.id}`);
+      }
+
+      // Missions H+30min → transfert automatique
+      const { rows: lateH30 } = await db.query(`
+        SELECT m.*, u.first_name, u.last_name
+        FROM missions m
+        JOIN users u ON u.id = m.oeil_id
+        WHERE m.status = 'assigned'
+        AND m.scheduled_at BETWEEN NOW() - INTERVAL '60 minutes' AND NOW() - INTERVAL '30 minutes'
+        AND m.oeil_id IS NOT NULL
+        AND m.is_priority = false
+      `);
+
+      for (const m of lateH30) {
+        // Pénalité fiabilité
+        await db.query(
+          `UPDATE users SET
+            reliability_score = GREATEST(0, reliability_score - 20),
+            transfer_cooldown_until = NOW() + INTERVAL '4 hours',
+            transfer_count = transfer_count + 1
+           WHERE id = $1`,
+          [m.oeil_id]
+        );
+        await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',100,'Pénalité — mission non démarrée à l''heure',$2)`, [m.oeil_id, m.id]);
+        await db.query(`UPDATE users SET balance=GREATEST(0,balance-100) WHERE id=$1`, [m.oeil_id]);
+
+        // Transfert automatique
+        const graceMinutes = m.type === 'file_attente' ? 45 : 60;
+        const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+        await db.query(`
+          UPDATE missions SET
+            status='pending', is_priority=true,
+            transfer_type='before', transferred_from=$1,
+            transfer_reason='Mission non démarrée à l''heure — transfert automatique',
+            transfer_deadline=$2, oeil_id=NULL, updated_at=NOW()
+          WHERE id=$3
+        `, [m.oeil_id, deadline, m.id]);
+
+        // Remboursement client si pas de remplaçant (géré par cron deadline)
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type, mission_id)
+           VALUES ($1, '⚠️ Mission transférée automatiquement', $2, 'warning', $3)`,
+          [m.client_id, `Votre Œil n'a pas démarré "${m.title}" à l'heure. Nous recherchons un remplaçant en urgence.`, m.id]
+        );
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type, mission_id)
+           VALUES ($1, '⚠️ Pénalité appliquée', $2, 'error', $3)`,
+          [m.oeil_id, `Vous n'avez pas démarré "${m.title}" à l'heure. -100 MAD déduits et cooldown 4h appliqué.`, m.id]
+        );
+
+        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+        for (const admin of admins) {
+          await db.query(
+            `INSERT INTO notifications (user_id, title, body, type, mission_id)
+             VALUES ($1, '🔄 Transfert automatique H+30', $2, 'warning', $3)`,
+            [admin.id, `Mission "${m.title}" transférée automatiquement — Œil ${m.first_name} ${m.last_name} n'a pas démarré.`, m.id]
+          );
+        }
+        console.log(`🔄 Transfert auto H+30 pour mission ${m.id}`);
+      }
+
+    } catch (e) { console.error('❌ Cron H/H+30 error:', e.message); }
+  });
+
+  // ── Cron toutes les heures — Missions expirées (niveau 3) ─
+  cron.schedule('0 * * * *', async () => {
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+
+      // Missions active/en_route depuis plus de 24h après scheduled_at
+      const { rows: expired } = await db.query(`
+        SELECT m.*, u.first_name, u.last_name
+        FROM missions m
+        JOIN users u ON u.id = m.oeil_id
+        WHERE m.status IN ('active', 'en_route')
+        AND m.scheduled_at < NOW() - INTERVAL '24 hours'
+        AND m.oeil_id IS NOT NULL
+      `);
+
+      for (const m of expired) {
+        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+        for (const admin of admins) {
+          await db.query(
+            `INSERT INTO notifications (user_id, title, body, type, mission_id)
+             VALUES ($1, '🔍 Mission à vérifier', $2, 'warning', $3)
+             ON CONFLICT DO NOTHING`,
+            [admin.id, `La mission "${m.title}" de ${m.first_name} ${m.last_name} est en cours depuis plus de 24h. Vérification requise.`, m.id]
+          );
+        }
+        console.log(`🔍 Alerte mission expirée ${m.id}`);
+      }
+    } catch (e) { console.error('❌ Cron missions expirées error:', e.message); }
+  });
+
+  // ── Cron J H-2h et H-30min — Rappels avant mission ──────
+  cron.schedule('*/30 * * * *', async () => {
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+
+      // H-2h
+      const { rows: missions2h } = await db.query(`
+        SELECT m.* FROM missions m
+        WHERE m.status = 'assigned'
+        AND m.scheduled_at BETWEEN NOW() + INTERVAL '1h50m' AND NOW() + INTERVAL '2h10m'
+        AND m.oeil_id IS NOT NULL
+      `);
+      for (const m of missions2h) {
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type, mission_id)
+           VALUES ($1, '⏰ Mission dans 2 heures', $2, 'warning', $3)`,
+          [m.oeil_id, `Votre mission "${m.title}" commence dans 2 heures. Préparez-vous !`, m.id]
+        );
+        if (emitToUser) emitToUser(m.oeil_id, 'notification', {
+          title: '⏰ Mission dans 2 heures',
+          body: `"${m.title}" commence bientôt`,
+          missionId: m.id,
+          type: 'warning'
+        });
+      }
+
+      // H-30min
+      const { rows: missions30 } = await db.query(`
+        SELECT m.* FROM missions m
+        WHERE m.status = 'assigned'
+        AND m.scheduled_at BETWEEN NOW() + INTERVAL '20m' AND NOW() + INTERVAL '40m'
+        AND m.oeil_id IS NOT NULL
+      `);
+      for (const m of missions30) {
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type, mission_id)
+           VALUES ($1, '🚀 Mission dans 30 minutes !', $2, 'warning', $3)`,
+          [m.oeil_id, `Votre mission "${m.title}" commence dans 30 minutes. Êtes-vous en route ?`, m.id]
+        );
+        if (emitToUser) emitToUser(m.oeil_id, 'notification', {
+          title: '🚀 Mission dans 30 minutes !',
+          body: `"${m.title}" — Êtes-vous en route ?`,
+          missionId: m.id,
+          type: 'warning'
+        });
+        // Alerte admin si H-30min
+        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+        for (const admin of admins) {
+          await db.query(
+            `INSERT INTO notifications (user_id, title, body, type, mission_id)
+             VALUES ($1, '⚠️ Mission dans 30 min non confirmée', $2, 'warning', $3)`,
+            [admin.id, `Mission "${m.title}" dans 30 min — l'Œil n'a pas encore démarré.`, m.id]
+          );
+        }
+      }
+    } catch (e) { console.error('❌ Cron rappels error:', e.message); }
+  });
+
   // Vérifier deadlines transfert toutes les 5 minutes
   cron.schedule('*/5 * * * *', async () => {
     try {
