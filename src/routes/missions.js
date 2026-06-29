@@ -213,18 +213,25 @@ router.get('/', authenticate, async (req, res) => {
 // placer les missions ignorées dans une table à part
 
     if (mode === 'available') {
-  where.push(`m.status='pending' AND m.oeil_id IS NULL AND m.city=$${p++}`);
-  params.push(req.user.city);
+      where.push(`m.status='pending' AND m.oeil_id IS NULL AND m.city=$${p++}`);
+      params.push(req.user.city);
 
-  if (req.query.quartier) {
-    where.push(`m.quartier ILIKE $${p++}`);
-    params.push(`%${req.query.quartier}%`);
-  }
+      if (req.query.quartier) {
+        where.push(`m.quartier ILIKE $${p++}`);
+        params.push(`%${req.query.quartier}%`);
+      }
 
-  // Exclure les missions ignorées
-  where.push(`m.id NOT IN (SELECT mission_id FROM mission_ignored WHERE oeil_id=$${p++})`);
-  params.push(req.user.id);
-}
+      // Filtre is_priority
+      if (req.query.is_priority === 'true') {
+        where.push(`m.is_priority=true`);
+      } else {
+        where.push(`m.is_priority=false`);
+      }
+
+      // Exclure les missions ignorées
+      where.push(`m.id NOT IN (SELECT mission_id FROM mission_ignored WHERE oeil_id=$${p++})`);
+      params.push(req.user.id);
+    }
 
 
 
