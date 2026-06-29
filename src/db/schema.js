@@ -289,6 +289,16 @@ CREATE TABLE IF NOT EXISTS identity_documents (
 
     ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
    ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS platform_amount NUMERIC(10,2);
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS is_priority BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_type TEXT CHECK(transfer_type IN ('before','during'));
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS transferred_from TEXT REFERENCES users(id);
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_reason TEXT;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_deadline TIMESTAMPTZ;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS oeil2_id TEXT REFERENCES users(id);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_cooldown_until TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS reliability_score INTEGER NOT NULL DEFAULT 100;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_no_replacement_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_super_admin BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]';
 

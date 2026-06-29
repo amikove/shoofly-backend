@@ -19,6 +19,7 @@ const fraudRoutes      = require('./routes/antiFraud');
 const superAdminRoutes = require('./routes/superAdmin');
 const promoRoutes   = require('./routes/promo');
 const missionRoutes = require('./routes/missions');
+const { checkTransferDeadlines } = require('./routes/missions');
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
 const reportRoutes = require('./routes/reports');
@@ -225,6 +226,16 @@ const PORT = parseInt(process.env.PORT) || 3000;
 initDb().then(() => {
 
   // Job toutes les heures — valider automatiquement les missions après 12h sans réclamation
+
+  // Vérifier deadlines transfert toutes les 5 minutes
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+      await checkTransferDeadlines(db, emitToUser);
+    } catch (e) { console.error('❌ Transfer deadline cron error:', e.message); }
+  });
+  
   cron.schedule('0 * * * *', async () => {
     try {
       const db = getDb();

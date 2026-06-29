@@ -44,8 +44,19 @@ router.post('/:id/validate', authenticate, requireRole('client'), async (req, re
   if (mission.validated_at) return res.status(400).json({ error: 'Mission déjà validée' });
 
   await db.query(`UPDATE missions SET validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
-  await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
-  await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Validation client',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
+ 
+  if (mission.transfer_type === 'during' && mission.transferred_from && mission.oeil2_id) {
+    // Split 50/50
+    const half = Math.round(mission.oeil_earning * 0.5 * 100) / 100;
+    await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [half, mission.transferred_from]);
+    await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [half, mission.oeil_id]);
+    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Part mission — transfert (50%)',$3)`, [mission.transferred_from, half, mission.id]);
+    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Part mission — transfert (50%)',$3)`, [mission.oeil_id, half, mission.id]);
+    await notify(db, mission.transferred_from, '💰 Paiement partiel reçu', `${half} MAD crédités — votre part du transfert de "${mission.title}".`, 'info', mission.id, emitToUser);
+  } else {
+    await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
+    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Validation client',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
+  }
 
 await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser);
   await notify(db, mission.client_id, '✅ Mission validée', `Vous avez validé "${mission.title}".`, 'info', mission.id, emitToUser);
@@ -395,10 +406,19 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) =
   const { rows: [profile] } = await db.query('SELECT is_verified FROM oeil_profiles WHERE user_id=$1', [req.user.id]);
   if (!profile?.is_verified) return res.status(403).json({ error: 'Profil non vérifié' });
 
+  
   const { rows: [updated] } = await db.query(
-    `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), updated_at=NOW() WHERE id=$2 RETURNING *`,
+    `UPDATE missions SET
+      oeil_id=$1,
+      oeil2_id=CASE WHEN is_priority=true AND transferred_from IS NOT NULL THEN $1 ELSE oeil2_id END,
+      status='assigned',
+      assigned_at=NOW(),
+      is_priority=false,
+      updated_at=NOW()
+    WHERE id=$2 RETURNING *`,
     [req.user.id, req.params.id]
   );
+  
   await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil sélectionné par le client');
 
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [req.user.id]);
@@ -816,6 +836,195 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), async (req, res)
 
 
 
+
+// ── POST /missions/:id/transfer ── Œil signale empêchement ──
+router.post('/:id/transfer', authenticate, requireRole('oeil'), async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+  const { reason } = req.body;
+
+  if (!reason) return res.status(400).json({ error: 'La raison est obligatoire' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+  if (!['assigned','en_route','active'].includes(mission.status)) {
+    return res.status(400).json({ error: 'Transfert impossible pour ce statut' });
+  }
+
+  const transferType = mission.status === 'assigned' ? 'before' : 'during';
+
+  // Délai de grâce selon type de mission
+  const graceMinutes = mission.type === 'file_attente' ? 45 : 60;
+  const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+
+  // Cooldown 4h si transfert pendant mission
+  if (transferType === 'during') {
+    await db.query(
+      `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '4 hours', transfer_count=transfer_count+1 WHERE id=$1`,
+      [req.user.id]
+    );
+  } else {
+    await db.query(
+      `UPDATE users SET transfer_count=transfer_count+1 WHERE id=$1`,
+      [req.user.id]
+    );
+  }
+
+  // Remettre la mission en pending avec flag priorité
+  await db.query(`
+    UPDATE missions SET
+      status='pending',
+      is_priority=true,
+      transfer_type=$1,
+      transferred_from=$2,
+      transfer_reason=$3,
+      transfer_deadline=$4,
+      oeil_id=NULL,
+      updated_at=NOW()
+    WHERE id=$5
+  `, [transferType, req.user.id, reason, deadline, mission.id]);
+
+  // Pénalité fiabilité
+  await db.query(
+    `UPDATE users SET reliability_score=GREATEST(0, reliability_score-10) WHERE id=$1`,
+    [req.user.id]
+  );
+
+  // Notifications
+  await notify(db, mission.client_id,
+    '⚠️ Changement sur votre mission',
+    `Votre Œil a signalé un empêchement pour "${mission.title}". Nous recherchons un remplaçant en urgence.`,
+    'mission', mission.id, emitToUser
+  );
+
+  // Message système dans le chat
+  await db.query(
+    `INSERT INTO mission_messages (mission_id,sender_id,content,type) VALUES ($1,$2,$3,'system')`,
+    [mission.id, req.user.id, `L'Œil a signalé un empêchement. Mission remise en priorité.`]
+  );
+
+  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
+  io.to('room:admin').emit('mission_updated', { id: mission.id, is_priority: true });
+
+  res.json({ ok: true, transfer_type: transferType, deadline });
+});
+
+// ── POST /missions/:id/assign-admin ── Admin affecte manuellement ──
+router.post('/:id/assign-admin', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+  const { oeil_id } = req.body;
+
+  if (!oeil_id) return res.status(400).json({ error: 'oeil_id requis' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (!['pending'].includes(mission.status)) return res.status(400).json({ error: 'Mission non disponible pour affectation' });
+
+  // Vérifier que l'Œil est vérifié et disponible
+  const { rows: [profile] } = await db.query(
+    `SELECT is_verified, is_available FROM oeil_profiles WHERE user_id=$1`, [oeil_id]
+  );
+  if (!profile?.is_verified) return res.status(400).json({ error: 'Œil non vérifié' });
+
+  const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [oeil_id]);
+
+  await db.query(`
+    UPDATE missions SET
+      oeil_id=$1,
+      status='assigned',
+      assigned_at=NOW(),
+      is_priority=false,
+      updated_at=NOW()
+    WHERE id=$2
+  `, [oeil_id, mission.id]);
+
+  await logStatus(db, mission.id, 'assigned', req.user.id, 'Affectation manuelle par admin');
+
+  await notify(db, oeil_id,
+    '📋 Mission assignée par admin',
+    `L'admin vous a assigné la mission "${mission.title}". Vérifiez les détails.`,
+    'mission', mission.id, emitToUser
+  );
+  await notify(db, mission.client_id,
+    '✅ Œil trouvé',
+    `Un Œil a été assigné à votre mission "${mission.title}".`,
+    'mission', mission.id, emitToUser
+  );
+
+  await db.query(
+    `INSERT INTO mission_messages (mission_id,sender_id,content,type) VALUES ($1,$2,$3,'system')`,
+    [mission.id, req.user.id, `${oeil.first_name} a été assigné par l'admin.`]
+  );
+
+  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'assigned' });
+  io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'assigned' });
+
+  res.json({ ok: true });
+});
+
+// ── Cron : vérifier deadlines transfert expirées ──────────
+// (appelé depuis index.js via cron)
+async function checkTransferDeadlines(db, emitToUser) {
+  const { rows: expired } = await db.query(`
+    SELECT * FROM missions
+    WHERE status='pending' AND is_priority=true
+    AND transfer_deadline IS NOT NULL
+    AND transfer_deadline < NOW()
+  `);
+
+  for (const mission of expired) {
+    // Pénalité aggravée sur l'Œil 1 si pendant mission
+    if (mission.transfer_type === 'during' && mission.transferred_from) {
+      await db.query(`
+        UPDATE users SET
+          balance=GREATEST(0, balance-100),
+          reliability_score=GREATEST(0, reliability_score-20),
+          transfer_no_replacement_count=transfer_no_replacement_count+1
+        WHERE id=$1
+      `, [mission.transferred_from]);
+
+      await db.query(
+        `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',100,'Pénalité — aucun remplaçant trouvé',$2)`,
+        [mission.transferred_from, mission.id]
+      );
+
+      await emitToUser?.(mission.transferred_from, 'notification', {
+        title: '⚠️ Pénalité appliquée',
+        body: `Aucun remplaçant n'a été trouvé pour "${mission.title}". -100 MAD déduits.`,
+        type: 'warning'
+      });
+    }
+
+    // Remboursement client
+    await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
+    await db.query(
+      `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement — aucun Œil disponible',$3)`,
+      [mission.client_id, mission.price, mission.id]
+    );
+
+    // Annuler la mission
+    await db.query(`UPDATE missions SET status='cancelled', cancelled_at=NOW() WHERE id=$1`, [mission.id]);
+
+    await emitToUser?.(mission.client_id, 'notification', {
+      title: '❌ Mission annulée',
+      body: `Aucun Œil disponible pour "${mission.title}". Remboursement intégral effectué.`,
+      type: 'error'
+    });
+
+    await db.query(
+      `INSERT INTO notifications (user_id,title,body,type,mission_id) VALUES ($1,'❌ Mission annulée','Aucun Œil disponible. Remboursement intégral effectué.','error',$2)`,
+      [mission.client_id, mission.id]
+    );
+  }
+}
+
+module.exports.checkTransferDeadlines = checkTransferDeadlines;
+
+
 // ── POST /:id/hire/:oeilId ── Client choisit un Œil ───────
 router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req, res) => {
   const db = getDb();
@@ -827,7 +1036,16 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req
     [req.params.id, req.user.id]
   );
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
+ if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
+
+  // Vérifier cooldown transfert
+  const { rows: [oeilUser] } = await db.query(
+    'SELECT transfer_cooldown_until FROM users WHERE id=$1', [req.user.id]
+  );
+  if (oeilUser?.transfer_cooldown_until && new Date(oeilUser.transfer_cooldown_until) > new Date()) {
+    const remaining = Math.ceil((new Date(oeilUser.transfer_cooldown_until) - Date.now()) / 3600000);
+    return res.status(403).json({ error: `Vous ne pouvez pas postuler pendant encore ${remaining}h suite à un transfert de mission.` });
+  }
 
   const { rows: [interest] } = await db.query(
     'SELECT * FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2',
