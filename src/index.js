@@ -19,7 +19,8 @@ const fraudRoutes      = require('./routes/antiFraud');
 const superAdminRoutes = require('./routes/superAdmin');
 const promoRoutes   = require('./routes/promo');
 const missionRoutes = require('./routes/missions');
-const { checkTransferDeadlines } = require('./routes/missions');
+const missionRoutesModule = require('./routes/missions');
+const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
 const reportRoutes = require('./routes/reports');
@@ -235,7 +236,7 @@ initDb().then(() => {
       await checkTransferDeadlines(db, emitToUser);
     } catch (e) { console.error('❌ Transfer deadline cron error:', e.message); }
   });
-  
+
   cron.schedule('0 * * * *', async () => {
     try {
       const db = getDb();

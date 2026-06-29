@@ -418,7 +418,7 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) =
     WHERE id=$2 RETURNING *`,
     [req.user.id, req.params.id]
   );
-  
+
   await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil sélectionné par le client');
 
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [req.user.id]);
@@ -1022,7 +1022,7 @@ async function checkTransferDeadlines(db, emitToUser) {
   }
 }
 
-module.exports.checkTransferDeadlines = checkTransferDeadlines;
+
 
 
 // ── POST /:id/hire/:oeilId ── Client choisit un Œil ───────
@@ -1110,4 +1110,5 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req
   res.json({ mission: updated });
 });
 
+router.checkTransferDeadlines = checkTransferDeadlines;
 module.exports = router;
