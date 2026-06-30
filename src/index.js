@@ -17,6 +17,7 @@ const mongoSanitize = require('express-mongo-sanitize');
 const authRoutes    = require('./routes/auth');
 const fraudRoutes      = require('./routes/antiFraud');
 const superAdminRoutes = require('./routes/superAdmin');
+const reliabilityRoutes = require('./routes/reliability');
 const promoRoutes   = require('./routes/promo');
 const missionRoutes = require('./routes/missions');
 const missionRoutesModule = require('./routes/missions');
@@ -105,6 +106,7 @@ app.use('/api/media',    mediaRoutes);
 app.use('/api/users',    userRoutes);
 app.use('/api/anti-fraud', fraudRoutes);
 app.use('/api/super-admin', superAdminRoutes);
+app.use('/api/reliability', reliabilityRoutes);
 app.use('/api/promo', promoRoutes);
 app.use('/api/reports', reportRoutes);
 
