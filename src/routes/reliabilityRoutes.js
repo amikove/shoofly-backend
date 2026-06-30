@@ -17,6 +17,12 @@ router.get('/me', authenticate, requireRole('oeil'), async (req, res) => {
     [req.user.id]
   );
 
+  const { rows: reviewRequests } = await db.query(
+    `SELECT * FROM reliability_review_requests
+     WHERE oeil_id=$1 ORDER BY created_at DESC LIMIT 5`,
+    [req.user.id]
+  );
+
   const level = getReliabilityLevel(user.reliability_score);
 
   res.json({
@@ -26,6 +32,7 @@ router.get('/me', authenticate, requireRole('oeil'), async (req, res) => {
     suspended_at: user.suspended_at,
     suspended_reason: user.suspended_reason,
     events,
+    review_requests: reviewRequests,
   });
 });
 
@@ -81,8 +88,18 @@ router.get('/admin/requests', authenticate, requireRole('admin'), async (req, re
 router.get('/admin/:oeilId/history', authenticate, requireRole('admin'), async (req, res) => {
   const db = getDb();
   const { rows: events } = await db.query(
-    `SELECT e.*, m.title AS mission_title FROM reliability_events e
+    `SELECT e.*,
+      m.title AS mission_title,
+      m.status AS mission_status,
+      m.scheduled_at AS mission_scheduled_at,
+      m.city AS mission_city,
+      m.quartier AS mission_quartier,
+      c.first_name AS client_first_name,
+      c.last_name AS client_last_name,
+      (SELECT COUNT(*)::int FROM mission_media WHERE mission_id=m.id) AS media_count
+     FROM reliability_events e
      LEFT JOIN missions m ON m.id = e.mission_id
+     LEFT JOIN users c ON c.id = m.client_id
      WHERE e.oeil_id=$1 ORDER BY e.created_at DESC`,
     [req.params.oeilId]
   );
