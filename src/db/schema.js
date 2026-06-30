@@ -326,9 +326,35 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    ALTER TABLE missions ADD COLUMN IF NOT EXISTS promo_code TEXT;
+  ALTER TABLE missions ADD COLUMN IF NOT EXISTS promo_code TEXT;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS discount NUMERIC(10,2) NOT NULL DEFAULT 0;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS original_price NUMERIC(10,2);
+
+    -- Système de score de fiabilité Œil
+    CREATE TABLE IF NOT EXISTS reliability_events (
+      id          SERIAL PRIMARY KEY,
+      oeil_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      mission_id  TEXT REFERENCES missions(id),
+      points      INTEGER NOT NULL,
+      reason      TEXT NOT NULL,
+      is_grave    BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT;
+
+    CREATE TABLE IF NOT EXISTS reliability_review_requests (
+      id          SERIAL PRIMARY KEY,
+      oeil_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      message     TEXT NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+      admin_response TEXT,
+      reviewed_by TEXT REFERENCES users(id),
+      reviewed_at TIMESTAMPTZ,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 
   console.log('✅ PostgreSQL schema ready');
