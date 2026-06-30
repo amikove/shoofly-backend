@@ -84,4 +84,41 @@ router.get('/permissions', authenticate, requireSuperAdmin, (req, res) => {
 });
 
 
+// ── POST /super-admin/test-reliability/:oeilId — TEST UNIQUEMENT ──
+router.post('/test-reliability/:oeilId', authenticate, requireSuperAdmin, async (req, res) => {
+  const db = getDb();
+  const { logReliabilityEvent } = require('../utils/reliabilityScore');
+  const oeilId = req.params.oeilId;
+
+  const { rows: [oeil] } = await db.query('SELECT * FROM users WHERE id=$1 AND role=\'oeil\'', [oeilId]);
+  if (!oeil) return res.status(404).json({ error: 'Œil introuvable' });
+
+  // Nettoyer l'historique existant
+  await db.query('DELETE FROM reliability_events WHERE oeil_id=$1', [oeilId]);
+  await db.query('UPDATE users SET is_suspended=false, suspended_at=NULL, suspended_reason=NULL WHERE id=$1', [oeilId]);
+
+  const scenarios = [
+    ...Array(10).fill().map((_, i) => ({ points: 10, reason: `Mission honorée parfaitement #${i + 1}`, grave: false })),
+    ...Array(5).fill().map((_, i) => ({ points: 5, reason: `Mission avec souci mineur #${i + 1}`, grave: false })),
+    ...Array(3).fill().map((_, i) => ({ points: 0, reason: `Mission mal notée par le client #${i + 1}`, grave: true })),
+    ...Array(2).fill().map((_, i) => ({ points: 5, reason: `Transfert avant démarrage avec remplaçant #${i + 1}`, grave: false })),
+    ...Array(2).fill().map((_, i) => ({ points: -20, reason: `Transfert pendant mission sans remplaçant #${i + 1}`, grave: true })),
+    { points: -20, reason: 'Mission non démarrée à l\'heure (H+30)', grave: true },
+  ];
+
+  for (const s of scenarios) {
+    await logReliabilityEvent(db, oeilId, null, s.points, s.reason, s.grave);
+  }
+
+  const { rows: [updated] } = await db.query('SELECT reliability_score, is_suspended FROM users WHERE id=$1', [oeilId]);
+
+  res.json({
+    message: 'Simulation terminée',
+    oeil: `${oeil.first_name} ${oeil.last_name}`,
+    final_score: updated.reliability_score,
+    is_suspended: updated.is_suspended,
+    events_created: scenarios.length,
+  });
+});
+
 module.exports = router;
