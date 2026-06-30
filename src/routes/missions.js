@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const { logReliabilityEvent } = require('../utils/reliabilityScore');
 
 
 async function getCommissionRate(db) {
@@ -799,7 +800,15 @@ router.post('/:id/rate', authenticate, requireRole('client'), [
   const { rows: [avg] } = await db.query('SELECT AVG(score)::numeric(3,1) AS a, COUNT(*)::int AS c FROM ratings WHERE oeil_id=$1', [mission.oeil_id]);
   await db.query('UPDATE oeil_profiles SET rating_avg=$1, rating_count=$2 WHERE user_id=$3', [avg.a, avg.c, mission.oeil_id]);
 
-  await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${mission.title}" notée par un client.`, 'rating', mission.id, emitToUser);
+await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${mission.title}" notée par un client.`, 'rating', mission.id, emitToUser);
+
+  // Score de fiabilité selon la note
+  const score = req.body.score;
+  let points, reason;
+  if (score >= 4) { points = 10; reason = `Mission complétée, note ${score}/5`; }
+  else if (score === 3) { points = 5; reason = `Mission complétée, note 3/5`; }
+  else { points = 0; reason = `Mission complétée, note ${score}/5 — insatisfaisant`; }
+  await logReliabilityEvent(db, mission.oeil_id, mission.id, points, reason, score <= 2);
 
   res.status(201).json({ rating_avg: avg.a, rating_count: avg.c });
 });
@@ -893,11 +902,11 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), async (req, res)
     WHERE id=$5
   `, [transferType, req.user.id, reason, deadline, mission.id]);
 
-  // Pénalité fiabilité
-  await db.query(
-    `UPDATE users SET reliability_score=GREATEST(0, reliability_score-10) WHERE id=$1`,
-    [req.user.id]
-  );
+// Pénalité fiabilité — sera recalculée précisément si pas de remplaçant (cron)
+  if (transferType === 'before') {
+    await logReliabilityEvent(db, req.user.id, mission.id, 5, 'Transfert avant démarrage avec remplaçant', false);
+  }
+
 
   // Notifications
   await notify(db, mission.client_id,
@@ -985,14 +994,14 @@ async function checkTransferDeadlines(db, emitToUser) {
 
   for (const mission of expired) {
     // Pénalité aggravée sur l'Œil 1 si pendant mission
-    if (mission.transfer_type === 'during' && mission.transferred_from) {
+if (mission.transfer_type === 'during' && mission.transferred_from) {
       await db.query(`
         UPDATE users SET
           balance=GREATEST(0, balance-100),
-          reliability_score=GREATEST(0, reliability_score-20),
           transfer_no_replacement_count=transfer_no_replacement_count+1
         WHERE id=$1
       `, [mission.transferred_from]);
+      await logReliabilityEvent(db, mission.transferred_from, mission.id, -20, 'Transfert pendant mission sans remplaçant trouvé', true);
 
       await db.query(
         `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',100,'Pénalité — aucun remplaçant trouvé',$2)`,
@@ -1004,6 +1013,10 @@ async function checkTransferDeadlines(db, emitToUser) {
         body: `Aucun remplaçant n'a été trouvé pour "${mission.title}". -100 MAD déduits.`,
         type: 'warning'
       });
+      
+       } else if (mission.transfer_type === 'before' && mission.transferred_from) {
+      await logReliabilityEvent(db, mission.transferred_from, mission.id, -10, 'Transfert avant démarrage sans remplaçant trouvé', true);
+   
     }
 
     // Remboursement client
