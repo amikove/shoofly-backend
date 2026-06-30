@@ -53,8 +53,8 @@ router.post('/review-request', authenticate, requireRole('oeil'), async (req, re
   for (const admin of admins) {
     await db.query(
       `INSERT INTO notifications (user_id, title, body, type)
-       VALUES ($1, '📨 Demande d\'examen reçue', $2, 'warning')`,
-      [admin.id, `Un Œil a demandé un examen de son dossier suite à suspension.`]
+       VALUES ($1, $2, $3, 'warning')`,
+      [admin.id, '📨 Demande d\'examen reçue', `Un Œil a demandé un examen de son dossier suite à suspension.`]
     );
   }
 
