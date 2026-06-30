@@ -76,7 +76,7 @@ router.get('/oeils/:id', authenticate, async (req, res) => {
   res.setHeader('Cache-Control', 'no-store')
   const db = getDb();
   const { rows: [oeil] } = await db.query(`
-    SELECT u.id,u.first_name,u.last_name,u.city,u.avatar_url,u.created_at,p.*
+    SELECT u.id,u.first_name,u.last_name,u.city,u.avatar_url,u.created_at,u.reliability_score,p.*
     FROM users u JOIN oeil_profiles p ON p.user_id=u.id WHERE u.id=$1 AND u.role='oeil'
   `, [req.params.id]);
   if (!oeil) return res.status(404).json({ error: 'Introuvable' });
