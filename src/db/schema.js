@@ -362,8 +362,16 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
 
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS under_surveillance BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS reporter_id TEXT REFERENCES users(id);
+    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS reporter_role TEXT CHECK(reporter_role IN ('client','oeil'));
+    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS type TEXT;
+    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS description TEXT;
+    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open' CHECK(status IN ('open','in_progress','resolved','dismissed'));
+    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS resolved_by TEXT REFERENCES users(id);
+    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS admin_note TEXT;
 
-    
+
     CREATE TABLE IF NOT EXISTS reliability_review_requests (
       id          SERIAL PRIMARY KEY,
       oeil_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
