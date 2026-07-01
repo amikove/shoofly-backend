@@ -345,6 +345,25 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT;
 
+
+    -- Signalements de problèmes en cours de mission
+    CREATE TABLE IF NOT EXISTS mission_reports (
+      id          SERIAL PRIMARY KEY,
+      mission_id  TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      reporter_id TEXT NOT NULL REFERENCES users(id),
+      reporter_role TEXT NOT NULL CHECK(reporter_role IN ('client','oeil')),
+      type        TEXT NOT NULL,
+      description TEXT,
+      status      TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','in_progress','resolved','dismissed')),
+      resolved_by TEXT REFERENCES users(id),
+      resolved_at TIMESTAMPTZ,
+      admin_note  TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS under_surveillance BOOLEAN NOT NULL DEFAULT FALSE;
+
+    
     CREATE TABLE IF NOT EXISTS reliability_review_requests (
       id          SERIAL PRIMARY KEY,
       oeil_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

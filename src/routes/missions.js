@@ -1130,5 +1130,128 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req
   res.json({ mission: updated });
 });
 
+
+// ── POST /missions/:id/report-problem ── Signaler un problème ──
+router.post('/:id/report-problem', authenticate, async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+  const { type, description } = req.body;
+
+  if (!type) return res.status(400).json({ error: 'Type de problème requis' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  const canReport = mission.client_id === req.user.id || mission.oeil_id === req.user.id;
+  if (!canReport) return res.status(403).json({ error: 'Accès refusé' });
+
+  if (!['assigned','en_route','active'].includes(mission.status)) {
+    return res.status(400).json({ error: 'Mission non active' });
+  }
+
+  // Créer le ticket
+  const reporterRole = req.user.id === mission.client_id ? 'client' : 'oeil';
+  const { rows: [report] } = await db.query(
+    `INSERT INTO mission_reports (mission_id, reporter_id, reporter_role, type, description)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [mission.id, req.user.id, reporterRole, type, description || null]
+  );
+
+  // Passer la mission en sous_surveillance
+  await db.query(
+    `UPDATE missions SET under_surveillance=true, updated_at=NOW() WHERE id=$1`,
+    [mission.id]
+  );
+
+  // Notifier l'admin
+  const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+  for (const admin of admins) {
+    await db.query(
+      `INSERT INTO notifications (user_id, title, body, type, mission_id)
+       VALUES ($1, '🚨 Problème signalé en cours de mission', $2, 'error', $3)`,
+      [admin.id, `${reporterRole === 'client' ? 'Client' : 'Œil'} a signalé : "${type}" sur "${mission.title}"`, mission.id]
+    );
+    if (emitToUser) emitToUser(admin.id, 'notification', {
+      title: '🚨 Problème signalé en cours de mission',
+      body: `"${type}" sur "${mission.title}"`,
+      missionId: mission.id,
+      type: 'error'
+    });
+  }
+
+  // Notifier l'autre partie
+  const otherId = req.user.id === mission.client_id ? mission.oeil_id : mission.client_id;
+  if (otherId) {
+    await db.query(
+      `INSERT INTO notifications (user_id, title, body, type, mission_id)
+       VALUES ($1, '⚠️ Problème signalé sur votre mission', $2, 'warning', $3)`,
+      [otherId, `Un problème a été signalé : "${type}". L'équipe Shoofly a été alertée.`, mission.id]
+    );
+    if (emitToUser) emitToUser(otherId, 'notification', {
+      title: '⚠️ Problème signalé',
+      body: `"${type}" — Shoofly a été alerté`,
+      missionId: mission.id,
+      type: 'warning'
+    });
+  }
+
+  // Émettre aux deux parties connectées
+  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, under_surveillance: true });
+  io.to('room:admin').emit('mission_problem_reported', { missionId: mission.id, type, reporterRole });
+
+  res.status(201).json({ report });
+});
+
+// ── GET /missions/admin/problems — admin liste les tickets ──
+router.get('/admin/problems', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { status = 'open' } = req.query;
+
+  const { rows } = await db.query(`
+    SELECT r.*,
+      m.title AS mission_title, m.city, m.scheduled_at,
+      u.first_name AS reporter_first, u.last_name AS reporter_last,
+      c.first_name AS client_first, c.last_name AS client_last,
+      o.first_name AS oeil_first, o.last_name AS oeil_last
+    FROM mission_reports r
+    JOIN missions m ON m.id = r.mission_id
+    JOIN users u ON u.id = r.reporter_id
+    LEFT JOIN users c ON c.id = m.client_id
+    LEFT JOIN users o ON o.id = m.oeil_id
+    WHERE r.status=$1
+    ORDER BY r.created_at DESC
+  `, [status]);
+
+  res.json({ reports: rows });
+});
+
+// ── PUT /missions/admin/problems/:id — admin traite un ticket ──
+router.put('/admin/problems/:id', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { status, admin_note } = req.body;
+
+  const { rows: [report] } = await db.query(
+    `UPDATE mission_reports SET status=$1, admin_note=$2, resolved_by=$3, resolved_at=NOW()
+     WHERE id=$4 RETURNING *`,
+    [status, admin_note || null, req.user.id, req.params.id]
+  );
+  if (!report) return res.status(404).json({ error: 'Ticket introuvable' });
+
+  // Si résolu → retirer sous_surveillance si plus aucun ticket ouvert
+  if (['resolved','dismissed'].includes(status)) {
+    const { rows: [{ n }] } = await db.query(
+      `SELECT COUNT(*)::int AS n FROM mission_reports WHERE mission_id=$1 AND status='open'`,
+      [report.mission_id]
+    );
+    if (n === 0) {
+      await db.query(`UPDATE missions SET under_surveillance=false WHERE id=$1`, [report.mission_id]);
+    }
+  }
+
+  res.json({ report });
+});
+
+
 router.checkTransferDeadlines = checkTransferDeadlines;
 module.exports = router;
