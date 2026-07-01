@@ -362,6 +362,7 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
 
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS under_surveillance BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE mission_reports ALTER COLUMN created_by DROP NOT NULL;
     ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS reporter_id TEXT REFERENCES users(id);
     ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS reporter_role TEXT CHECK(reporter_role IN ('client','oeil'));
     ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS type TEXT;
