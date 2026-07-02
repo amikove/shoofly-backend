@@ -562,13 +562,14 @@ const { status, cancel_reason } = req.body;
   const { rows: [updated] } = await db.query(`
     UPDATE missions SET
       status=$1,
-      completed_at = CASE WHEN $1='completed' THEN NOW() ELSE completed_at END,
-      cancelled_at = CASE WHEN $1='cancelled' THEN NOW() ELSE cancelled_at END,
-      cancel_reason= CASE WHEN $1='cancelled' THEN $2 ELSE cancel_reason END,
-      started_at   = CASE WHEN $1='active'    THEN NOW() ELSE started_at END,
-      updated_at   = NOW()
-    WHERE id=$3 RETURNING *
-`, [status, cancel_reason||null, mission.id]);
+        completed_at = CASE WHEN $1='completed' THEN NOW() ELSE completed_at END,
+        cancelled_at = CASE WHEN $1='cancelled' THEN NOW() ELSE cancelled_at END,
+        cancel_reason= CASE WHEN $1='cancelled' THEN $2 ELSE cancel_reason END,
+        started_at   = CASE WHEN $1='active'    THEN NOW() ELSE started_at END,
+        is_priority  = CASE WHEN $1 IN ('cancelled','completed') THEN false ELSE is_priority END,
+        updated_at   = NOW()
+      WHERE id=$3 RETURNING *
+  `, [status, cancel_reason||null, mission.id]);
 
   // Logger le changement de statut (sauf completed géré plus bas)
   if (status !== 'completed') {
