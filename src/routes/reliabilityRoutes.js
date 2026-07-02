@@ -140,4 +140,53 @@ router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), as
   res.json({ request });
 });
 
+// ── GET /reliability/admin/suspended — Œils actuellement suspendus ──
+router.get('/admin/suspended', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT id, first_name, last_name, email, city, quartier,
+           reliability_score, suspended_at, suspended_reason
+    FROM users
+    WHERE role='oeil' AND is_suspended=true
+    ORDER BY suspended_at DESC
+  `);
+  res.json({ oeils: rows });
+});
+
+// ── GET /reliability/admin/all-scores — tous les Œils avec leur score, triable + paginé ──
+router.get('/admin/all-scores', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { city, quartier, page = 1, limit = 20, sort = 'score_asc' } = req.query;
+  const offset = (page - 1) * limit;
+
+  const SORT_MAP = {
+    score_asc:  'reliability_score ASC',
+    score_desc: 'reliability_score DESC',
+    city_asc:   'city ASC, quartier ASC',
+    quartier_asc: 'quartier ASC, city ASC',
+  };
+  const orderBy = SORT_MAP[sort] || 'reliability_score ASC';
+
+  let where = [`role='oeil'`], params = [];
+  let p = 1;
+  if (city)     { where.push(`city=$${p++}`);     params.push(city); }
+  if (quartier) { where.push(`quartier=$${p++}`); params.push(quartier); }
+  const wc = 'WHERE ' + where.join(' AND ');
+
+  const { rows: oeils } = await db.query(`
+    SELECT id, first_name, last_name, email, city, quartier,
+           reliability_score, is_suspended
+    FROM users
+    ${wc}
+    ORDER BY ${orderBy}
+    LIMIT $${p++} OFFSET $${p++}
+  `, [...params, limit, offset]);
+
+  const { rows: [{ n: total }] } = await db.query(
+    `SELECT COUNT(*)::int AS n FROM users ${wc}`, params
+  );
+
+  res.json({ oeils, total, page: +page, pages: Math.ceil(total / limit) });
+});
+
 module.exports = router;
