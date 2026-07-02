@@ -189,4 +189,26 @@ router.get('/admin/all-scores', authenticate, requireRole('admin'), async (req, 
   res.json({ oeils, total, page: +page, pages: Math.ceil(total / limit) });
 });
 
+// ── POST /reliability/admin/:oeilId/reactivate — réactivation directe (sans demande d'examen) ──
+router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { reset_score } = req.body;
+  const newScore = reset_score || 70;
+
+  const { rows: [oeil] } = await db.query(
+    `UPDATE users SET is_suspended=false, suspended_at=NULL, suspended_reason=NULL, reliability_score=$1
+     WHERE id=$2 AND role='oeil' RETURNING id, first_name, last_name`,
+    [newScore, req.params.oeilId]
+  );
+  if (!oeil) return res.status(404).json({ error: 'Œil introuvable' });
+
+  await db.query(
+    `INSERT INTO notifications (user_id, title, body, type)
+     VALUES ($1, '✅ Compte réactivé', $2, 'success')`,
+    [oeil.id, `Votre compte a été réactivé par un administrateur. Score de réintégration : ${newScore}%.`]
+  );
+
+  res.json({ ok: true, oeil });
+});
+
 module.exports = router;
