@@ -500,12 +500,16 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), async (req, res) =
       return res.json({ ok: true });
     }
     // Mission assignée — refuser
-    const { rows: [mission] } = await db.query(
-      `UPDATE missions SET status='pending', oeil_id=NULL, updated_at=NOW() WHERE id=$1 AND oeil_id=$2 RETURNING *`,
-      [req.params.id, req.user.id]
-    );
-    if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-    res.json({ mission });
+      const { rows: [mission] } = await db.query(
+        `UPDATE missions SET status='pending', oeil_id=NULL, updated_at=NOW() WHERE id=$1 AND oeil_id=$2 RETURNING *`,
+        [req.params.id, req.user.id]
+      );
+      if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+      // Pénalité de fiabilité : refuser une mission déjà assignée retarde le client et déstabilise le planning
+      await logReliabilityEvent(db, req.user.id, mission.id, -15, 'Mission assignée refusée par l\'Œil', false);
+
+      res.json({ mission });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
