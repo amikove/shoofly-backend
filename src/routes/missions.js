@@ -201,8 +201,17 @@ router.post('/:id/seen', authenticate, async (req, res) => {
 // ── GET /missions ──────────────────────────────────────────
 router.get('/', authenticate, async (req, res) => {
   const db = getDb();
-  const { status, type, mode, page = 1, limit = 20 } = req.query;
+  const { status, type, mode, page = 1, limit = 20, sort = 'created_desc' } = req.query;
   const offset = (page - 1) * limit;
+
+  const ORDER = {
+    created_desc:   'm.created_at DESC',
+    created_asc:    'm.created_at ASC',
+    scheduled_asc:  'm.scheduled_at ASC NULLS LAST',
+    scheduled_desc: 'm.scheduled_at DESC NULLS LAST',
+    deadline_asc:   'm.transfer_deadline ASC NULLS LAST',
+  }
+  const orderBy = ORDER[sort] || 'm.created_at DESC';
 
   let where = [], params = [];
   let p = 1;
@@ -260,7 +269,7 @@ router.get('/', authenticate, async (req, res) => {
     LEFT JOIN users c ON c.id=m.client_id
     LEFT JOIN users o ON o.id=m.oeil_id
     ${wc}
-    ORDER BY m.created_at DESC
+    ORDER BY ${orderBy}
     LIMIT $${p++} OFFSET $${p++}
   `, [...params, limit, offset]);
 
