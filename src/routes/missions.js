@@ -1215,26 +1215,32 @@ router.post('/:id/report-problem', authenticate, async (req, res) => {
 
 // ── GET /missions/admin/problems — admin liste les tickets ──
 router.get('/admin/problems', authenticate, requireRole('admin'), async (req, res) => {
-  const db = getDb();
-  const { status = 'open' } = req.query;
+    const db = getDb();
+    const { status = 'open', page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
 
-  const { rows } = await db.query(`
-    SELECT r.*,
-      m.title AS mission_title, m.city, m.scheduled_at,
-      u.first_name AS reporter_first, u.last_name AS reporter_last,
-      c.first_name AS client_first, c.last_name AS client_last,
-      o.first_name AS oeil_first, o.last_name AS oeil_last
-    FROM mission_reports r
-    JOIN missions m ON m.id = r.mission_id
-    JOIN users u ON u.id = r.reporter_id
-    LEFT JOIN users c ON c.id = m.client_id
-    LEFT JOIN users o ON o.id = m.oeil_id
-    WHERE r.status=$1
+    const { rows } = await db.query(`
+      SELECT r.*,
+        m.title AS mission_title, m.city, m.scheduled_at,
+        u.first_name AS reporter_first, u.last_name AS reporter_last,
+        c.first_name AS client_first, c.last_name AS client_last,
+        o.first_name AS oeil_first, o.last_name AS oeil_last
+      FROM mission_reports r
+      JOIN missions m ON m.id = r.mission_id
+      JOIN users u ON u.id = r.reporter_id
+      LEFT JOIN users c ON c.id = m.client_id
+      LEFT JOIN users o ON o.id = m.oeil_id
+      WHERE r.status=$1
       ORDER BY r.created_at ASC
-    `, [status]); // Signalement le plus ancien en premier, pour traiter les tickets par ordre d'arrivée
+      LIMIT $2 OFFSET $3
+    `, [status, limit, offset]); // Signalement le plus ancien en premier, pour traiter les tickets par ordre d'arrivée
 
-  res.json({ reports: rows });
-});
+    const { rows: [{ n: total }] } = await db.query(
+      `SELECT COUNT(*)::int AS n FROM mission_reports WHERE status=$1`, [status]
+    );
+
+    res.json({ reports: rows, total, page: +page, pages: Math.ceil(total / limit) });
+  });
 
 // ── PUT /missions/admin/problems/:id — admin traite un ticket ──
 router.put('/admin/problems/:id', authenticate, requireRole('admin'), async (req, res) => {
