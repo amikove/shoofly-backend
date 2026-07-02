@@ -1229,8 +1229,8 @@ router.get('/admin/problems', authenticate, requireRole('admin'), async (req, re
     LEFT JOIN users c ON c.id = m.client_id
     LEFT JOIN users o ON o.id = m.oeil_id
     WHERE r.status=$1
-    ORDER BY r.created_at DESC
-  `, [status]);
+      ORDER BY r.created_at ASC
+    `, [status]); // Signalement le plus ancien en premier, pour traiter les tickets par ordre d'arrivée
 
   res.json({ reports: rows });
 });
