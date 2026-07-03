@@ -392,7 +392,7 @@ initDb().then(() => {
           [m.oeil_id]
         );
       await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',100,'Pénalité — mission non démarrée à l''heure',$2)`, [m.oeil_id, m.id]);
-        await db.query(`UPDATE users SET balance=GREATEST(0,balance-100) WHERE id=$1`, [m.oeil_id]);
+        await db.query(`UPDATE oeil_profiles SET balance=GREATEST(0,balance-100) WHERE user_id=$1`, [m.oeil_id]);
         await logReliabilityEvent(db, m.oeil_id, m.id, -20, 'Mission non démarrée à l\'heure (H+30)', true);
 
         // Transfert automatique
