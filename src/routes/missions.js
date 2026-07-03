@@ -1255,26 +1255,39 @@ router.get('/admin/problems', authenticate, requireRole('admin'), async (req, re
 
 // ── PUT /missions/admin/problems/:id — admin traite un ticket ──
 router.put('/admin/problems/:id', authenticate, requireRole('admin'), async (req, res) => {
-  const db = getDb();
-  const { status, admin_note } = req.body;
-
-  const { rows: [report] } = await db.query(
-    `UPDATE mission_reports SET status=$1, admin_note=$2, resolved_by=$3, resolved_at=NOW()
-     WHERE id=$4 RETURNING *`,
-    [status, admin_note || null, req.user.id, req.params.id]
-  );
-  if (!report) return res.status(404).json({ error: 'Ticket introuvable' });
-
-  // Si résolu → retirer sous_surveillance si plus aucun ticket ouvert
-  if (['resolved','dismissed'].includes(status)) {
-    const { rows: [{ n }] } = await db.query(
-      `SELECT COUNT(*)::int AS n FROM mission_reports WHERE mission_id=$1 AND status='open'`,
-      [report.mission_id]
+    const db = getDb();
+    const { status, admin_note } = req.body;
+    const { rows: [report] } = await db.query(
+      `UPDATE mission_reports SET status=$1, admin_note=$2, resolved_by=$3, resolved_at=NOW()
+       WHERE id=$4 RETURNING *`,
+      [status, admin_note || null, req.user.id, req.params.id]
     );
-    if (n === 0) {
-      await db.query(`UPDATE missions SET under_surveillance=false WHERE id=$1`, [report.mission_id]);
+    if (!report) return res.status(404).json({ error: 'Ticket introuvable' });
+
+    // Notifier le rapporteur (client ou Œil) de la décision admin — persistant, consultable même si la notif est ratée
+    const emitToUser = req.app.get('emitToUser');
+    const statusLabel = { in_progress: 'pris en charge', resolved: 'résolu', dismissed: 'classé sans suite' }[status] || status;
+    await db.query(
+      `INSERT INTO notifications (user_id, title, body, type, mission_id)
+       VALUES ($1, $2, $3, 'info', $4)`,
+      [report.reporter_id, `📋 Votre signalement a été ${statusLabel}`, admin_note || 'Votre signalement a été traité par notre équipe.', report.mission_id]
+    );
+    if (emitToUser) emitToUser(report.reporter_id, 'notification', {
+      title: `📋 Votre signalement a été ${statusLabel}`,
+      body: admin_note || 'Votre signalement a été traité par notre équipe.',
+      missionId: report.mission_id
+    });
+
+    // Si résolu → retirer sous_surveillance si plus aucun ticket ouvert
+    if (['resolved','dismissed'].includes(status)) {
+      const { rows: [{ n }] } = await db.query(
+        `SELECT COUNT(*)::int AS n FROM mission_reports WHERE mission_id=$1 AND status='open'`,
+        [report.mission_id]
+      );
+      if (n === 0) {
+        await db.query(`UPDATE missions SET under_surveillance=false WHERE id=$1`, [report.mission_id]);
+      }
     }
-  }
 
   res.json({ report });
 });
