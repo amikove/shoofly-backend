@@ -1033,12 +1033,19 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
    
     }
 
-    // Remboursement client
-    await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
-    await db.query(
-      `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement — aucun Œil disponible',$3)`,
-      [mission.client_id, mission.price, mission.id]
-    );
+// Remboursement client
+      await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
+      await db.query(
+        `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement — aucun Œil disponible',$3)`,
+        [mission.client_id, mission.price, mission.id]
+      );
+
+      // CRITIQUE : clôturer la mission pour qu'elle sorte définitivement de la boucle du cron.
+      // Sans cette étape, la mission reste éligible indéfiniment et la pénalité/remboursement sont rejoués à chaque exécution.
+      await db.query(
+        `UPDATE missions SET status='cancelled', cancelled_at=NOW(), cancel_reason='Aucun remplaçant trouvé avant expiration du délai', is_priority=false, transfer_deadline=NULL, updated_at=NOW() WHERE id=$1`,
+        [mission.id]
+      );
 
     // Annuler la mission
     await db.query(`UPDATE missions SET status='cancelled', cancelled_at=NOW() WHERE id=$1`, [mission.id]);
