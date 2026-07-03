@@ -498,6 +498,106 @@ router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('ad
   res.json({ message: 'Identité rejetée', user_id: doc.user_id });
 });
 
+// ── GET /users/oeil/earnings — l'Œil consulte son historique de gains ──
+router.get('/oeil/earnings', authenticate, requireRole('oeil'), async (req, res) => {
+  const db = getDb();
+
+  // Missions terminées avec gain réel
+  const { rows: missions } = await db.query(`
+    SELECT
+      id, title, type, oeil_earning AS amount, status, scheduled_at,
+      completed_at AS event_date
+    FROM missions
+    WHERE oeil_id=$1 AND status='completed'
+    ORDER BY completed_at DESC
+  `, [req.user.id]);
+
+  // Virements enregistrés (wallet_transactions, reason = virement)
+  const { rows: transfers } = await db.query(`
+    SELECT id, amount, reason, created_at AS event_date
+    FROM wallet_transactions
+    WHERE user_id=$1 AND reason='Virement bancaire'
+    ORDER BY created_at DESC
+  `, [req.user.id]);
+
+  // Fusionner les deux sources, triées chronologiquement (plus récent en premier)
+  const lines = [
+    ...missions.map(m => ({
+      kind: 'mission',
+      id: m.id,
+      title: m.title,
+      type: m.type,
+      scheduled_at: m.scheduled_at,
+      status: m.status,
+      amount: parseFloat(m.amount),
+      event_date: m.event_date,
+    })),
+    ...transfers.map(t => ({
+      kind: 'transfer',
+      id: t.id,
+      title: 'Virement bancaire',
+      amount: -parseFloat(t.amount), // sortie d'argent, affichée en négatif dans l'historique
+      event_date: t.event_date,
+    })),
+  ].sort((a, b) => new Date(b.event_date) - new Date(a.event_date));
+
+  const { rows: [profile] } = await db.query(
+    `SELECT balance, total_earnings FROM oeil_profiles WHERE user_id=$1`, [req.user.id]
+  );
+
+  res.json({ lines, balance: profile?.balance || 0, total_earnings: profile?.total_earnings || 0 });
+});
+
+// ── GET /users/admin/finance/oeils — admin liste les Œils avec solde pour paiement ──
+router.get('/admin/finance/oeils', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT u.id, u.first_name, u.last_name, u.email, u.city,
+           p.balance, p.total_earnings, p.total_missions
+    FROM users u
+    JOIN oeil_profiles p ON p.user_id = u.id
+    WHERE u.role='oeil'
+    ORDER BY p.balance DESC
+  `);
+  res.json({ oeils: rows });
+});
+
+// ── POST /users/admin/finance/:oeilId/wire-transfer — admin enregistre un virement ──
+router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  const { amount } = req.body;
+
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ error: 'Montant invalide' });
+  }
+
+  const { rows: [profile] } = await db.query(
+    `SELECT balance FROM oeil_profiles WHERE user_id=$1`, [req.params.oeilId]
+  );
+  if (!profile) return res.status(404).json({ error: 'Œil introuvable' });
+  if (parseFloat(profile.balance) < amount) {
+    return res.status(400).json({ error: 'Solde insuffisant pour ce montant' });
+  }
+
+  await db.query(
+    `UPDATE oeil_profiles SET balance=balance-$1 WHERE user_id=$2`,
+    [amount, req.params.oeilId]
+  );
+
+  const { rows: [transaction] } = await db.query(
+    `INSERT INTO wallet_transactions (user_id, type, amount, reason)
+     VALUES ($1, 'debit', $2, 'Virement bancaire') RETURNING *`,
+    [req.params.oeilId, amount]
+  );
+
+  await db.query(
+    `INSERT INTO notifications (user_id, title, body, type)
+     VALUES ($1, '💰 Virement effectué', $2, 'success')`,
+    [req.params.oeilId, `Un virement de ${amount} MAD a été enregistré vers votre compte bancaire.`]
+  );
+
+  res.json({ ok: true, transaction });
+});
 
 // Admin joins its own WS room on connect (done client-side)
 module.exports = router;
