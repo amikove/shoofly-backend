@@ -498,7 +498,10 @@ router.get('/:id/interests', authenticate, async (req, res) => {
       [req.params.id]
     );
 
--
+    res.json({ interests: rows });
+  });
+
+
 
 // ── POST /missions/:id/refuse ──────────────────────────────
 router.post('/:id/refuse', authenticate, requireRole('oeil'), async (req, res) => {
