@@ -449,7 +449,7 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) =
         is_priority=false,
         transfer_deadline=NULL,
         updated_at=NOW()
-      WHERE id=$2 RETURNING *`,,
+      WHERE id=$2 RETURNING *`,
     [req.user.id, req.params.id]
   );
 
