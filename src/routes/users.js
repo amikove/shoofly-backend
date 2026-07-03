@@ -196,14 +196,14 @@ router.get('/admin/all', authenticate, requireRole('admin'), async (req, res) =>
   if (role)       { where.push(`u.role=$${p++}`); params.push(role); }
   if (is_active !== undefined) { where.push(`u.is_active=$${p++}`); params.push(is_active === '1'); }
   const { rows } = await db.query(`
-    SELECT u.id,u.email,u.role,u.first_name,u.last_name,u.phone,u.city,u.is_active,u.created_at,
-      pr.is_verified,pr.rating_avg,pr.total_missions,pr.balance
-    FROM users u LEFT JOIN oeil_profiles pr ON pr.user_id=u.id
-    ${where.length ? 'WHERE '+where.join(' AND ') : ''}
-    ORDER BY u.created_at DESC
-  `, params);
-  res.json({ users: rows });
-});
+      SELECT u.id,u.email,u.role,u.first_name,u.last_name,u.phone,u.city,u.avatar_url,u.is_active,u.created_at,
+        pr.is_verified,pr.rating_avg,pr.total_missions,pr.balance
+      FROM users u LEFT JOIN oeil_profiles pr ON pr.user_id=u.id
+      ${where.length ? 'WHERE '+where.join(' AND ') : ''}
+      ORDER BY u.created_at DESC
+    `, params);
+    res.json({ users: rows });
+  });
 
 // ── Client : stats dashboard ────────────────────────────────
 router.get('/client/stats', authenticate, requireRole('client'), async (req, res) => {
@@ -450,15 +450,14 @@ router.get('/admin/identity-requests', authenticate, requireRole('admin'), requi
   const { status = 'pending' } = req.query;
 
   const { rows } = await db.query(`
-    SELECT d.*, u.first_name, u.last_name, u.email, u.phone, u.city
-    FROM identity_documents d
-    JOIN users u ON u.id=d.user_id
-    WHERE d.status=$1
-    ORDER BY d.created_at ASC
-  `, [status]);
-
-  res.json({ requests: rows });
-});
+      SELECT d.*, u.first_name, u.last_name, u.email, u.phone, u.city, u.avatar_url
+      FROM identity_documents d
+      JOIN users u ON u.id=d.user_id
+      WHERE d.status=$1
+      ORDER BY d.created_at ASC
+    `, [status]);
+    res.json({ requests: rows });
+  });
 
 // ── POST /users/admin/identity-requests/:id/approve ──
 router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('admin'), async (req, res) => {
