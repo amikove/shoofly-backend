@@ -24,14 +24,35 @@ const identityStorage = new CloudinaryStorage({
 });
 
 const uploadIdentity = multer({
-  storage: identityStorage,
-  limits: { fileSize: 5 * 1024 * 1024 },
+    storage: identityStorage,
+    limits: { fileSize: 5 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        file.originalname = file.originalname.replace(/[&<>"'`%;()]/g, '')
+        const allowed = /jpeg|jpg|png|webp/;
+        if (allowed.test(file.mimetype)) cb(null, true);
+        else cb(new Error('Format non supporté. Utilisez JPG ou PNG.'));
+      }
+  });
+
+// ── Upload photo de profil (avatar) — Œils et clients ──
+const avatarStorage = new CloudinaryStorage({
+  cloudinary,
+  params: async (req, file) => ({
+    folder: `shoofly/avatars/${req.user?.id}`,
+    resource_type: 'image',
+    allowed_formats: ['jpg','jpeg','png','webp'],
+    transformation: [{ width: 400, height: 400, crop: 'fill', gravity: 'face' }],
+  }),
+});
+const uploadAvatar = multer({
+  storage: avatarStorage,
+  limits: { fileSize: 3 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-      file.originalname = file.originalname.replace(/[&<>"'`%;()]/g, '')
-      const allowed = /jpeg|jpg|png|webp/;
-      if (allowed.test(file.mimetype)) cb(null, true);
-      else cb(new Error('Format non supporté. Utilisez JPG ou PNG.'));
-    }
+    file.originalname = file.originalname.replace(/[&<>"'`%;()]/g, '')
+    const allowed = /jpeg|jpg|png|webp/;
+    if (allowed.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Format non supporté. Utilisez JPG ou PNG.'));
+  }
 });
 
 function isWithinSchedule(disponibilites) {
@@ -499,6 +520,22 @@ router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('ad
 });
 
 // ── GET /users/oeil/earnings — l'Œil consulte son historique de gains ──
+// ── POST /users/avatar — upload/changement de photo de profil (Œil et client) ──
+router.post('/avatar', authenticate, uploadAvatar.single('avatar'), async (req, res) => {
+  const db = getDb();
+  const avatarUrl = req.file?.path;
+  if (!avatarUrl) {
+    return res.status(400).json({ error: 'Aucune image reçue' });
+  }
+
+  const { rows: [updated] } = await db.query(
+    `UPDATE users SET avatar_url=$1, updated_at=NOW() WHERE id=$2 RETURNING id, avatar_url`,
+    [avatarUrl, req.user.id]
+  );
+
+  res.json({ ok: true, avatar_url: updated.avatar_url });
+});
+
 router.get('/oeil/earnings', authenticate, requireRole('oeil'), async (req, res) => {
   const db = getDb();
 
