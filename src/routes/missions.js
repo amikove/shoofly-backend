@@ -442,13 +442,14 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) =
   
   const { rows: [updated] } = await db.query(
     `UPDATE missions SET
-      oeil_id=$1,
-      oeil2_id=CASE WHEN is_priority=true AND transferred_from IS NOT NULL THEN $1 ELSE oeil2_id END,
-      status='assigned',
-      assigned_at=NOW(),
-      is_priority=false,
-      updated_at=NOW()
-    WHERE id=$2 RETURNING *`,
+        oeil_id=$1,
+        oeil2_id=CASE WHEN is_priority=true AND transferred_from IS NOT NULL THEN $1 ELSE oeil2_id END,
+        status='assigned',
+        assigned_at=NOW(),
+        is_priority=false,
+        transfer_deadline=NULL,
+        updated_at=NOW()
+      WHERE id=$2 RETURNING *`,,
     [req.user.id, req.params.id]
   );
 
@@ -979,14 +980,15 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), async (req,
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [oeil_id]);
 
   await db.query(`
-    UPDATE missions SET
-      oeil_id=$1,
-      status='assigned',
-      assigned_at=NOW(),
-      is_priority=false,
-      updated_at=NOW()
-    WHERE id=$2
-  `, [oeil_id, mission.id]);
+      UPDATE missions SET
+        oeil_id=$1,
+        status='assigned',
+        assigned_at=NOW(),
+        is_priority=false,
+        transfer_deadline=NULL,
+        updated_at=NOW()
+      WHERE id=$2
+    `, [oeil_id, mission.id]);
 
   await logStatus(db, mission.id, 'assigned', req.user.id, 'Affectation manuelle par admin');
 
