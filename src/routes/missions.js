@@ -257,21 +257,21 @@ router.get('/', authenticate, async (req, res) => {
 
 
   const { rows: missions } = await db.query(`
-    SELECT m.*,
-      c.first_name||' '||c.last_name AS client_name, c.phone AS client_phone,
-      o.first_name||' '||o.last_name AS oeil_name,   o.phone AS oeil_phone,
-      (SELECT COUNT(*) FROM mission_media WHERE mission_id=m.id)::int AS media_count,
-      (SELECT COUNT(*) FROM mission_messages WHERE mission_id=m.id)::int AS message_count,
-      (SELECT COUNT(*) FROM mission_interests WHERE mission_id=m.id AND oeil_id='${req.user.id}')::int > 0 AS has_interested,
-      (SELECT score FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_score,
-      (SELECT comment FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_comment
-    FROM missions m
-    LEFT JOIN users c ON c.id=m.client_id
-    LEFT JOIN users o ON o.id=m.oeil_id
-    ${wc}
-    ORDER BY ${orderBy}
-    LIMIT $${p++} OFFSET $${p++}
-  `, [...params, limit, offset]);
+      SELECT m.*,
+        c.first_name||' '||c.last_name AS client_name, c.phone AS client_phone, c.avatar_url AS client_avatar,
+        o.first_name||' '||o.last_name AS oeil_name,   o.phone AS oeil_phone,   o.avatar_url AS oeil_avatar,
+        (SELECT COUNT(*) FROM mission_media WHERE mission_id=m.id)::int AS media_count,
+        (SELECT COUNT(*) FROM mission_messages WHERE mission_id=m.id)::int AS message_count,
+        (SELECT COUNT(*) FROM mission_interests WHERE mission_id=m.id AND oeil_id='${req.user.id}')::int > 0 AS has_interested,
+        (SELECT score FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_score,
+        (SELECT comment FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_comment
+      FROM missions m
+      LEFT JOIN users c ON c.id=m.client_id
+      LEFT JOIN users o ON o.id=m.oeil_id
+      ${wc}
+      ORDER BY ${orderBy}
+      LIMIT $${p++} OFFSET $${p++}
+    `, [...params, limit, offset]);
 
 
 
@@ -487,19 +487,16 @@ router.get('/:id/interests', authenticate, async (req, res) => {
   }
 
   const { rows } = await db.query(
-    `SELECT u.id, u.first_name, u.last_name, u.city,
-            p.rating_avg, p.rating_count, p.total_missions, p.bio, p.coverage_zone,
-            mi.message, mi.created_at as interested_at
-     FROM mission_interests mi
-     JOIN users u ON u.id = mi.oeil_id
-     LEFT JOIN oeil_profiles p ON p.user_id = mi.oeil_id
-     WHERE mi.mission_id = $1
-     ORDER BY mi.created_at ASC`,
-    [req.params.id]
-  );
-
-  res.json({ interests: rows });
-});
+      `SELECT u.id, u.first_name, u.last_name, u.city, u.avatar_url,
+              p.rating_avg, p.rating_count, p.total_missions, p.bio, p.coverage_zone,
+              mi.message, mi.created_at as interested_at
+       FROM mission_interests mi
+       JOIN users u ON u.id = mi.oeil_id
+       LEFT JOIN oeil_profiles p ON p.user_id = mi.oeil_id
+       WHERE mi.mission_id = $1
+       ORDER BY mi.created_at ASC`,
+      [req.params.id]
+    );
 
 -
 
