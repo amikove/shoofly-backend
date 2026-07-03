@@ -373,7 +373,23 @@ await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
 
 
 
-// ── GET /missions/:id ──────────────────────────────────────
+// ── GET /missions/my-reports — le rapporteur consulte l'historique de ses signalements ──
+// IMPORTANT : cette route doit rester déclarée AVANT /:id, sinon Express interprète "my-reports" comme un id de mission
+router.get('/my-reports', authenticate, async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT r.*,
+      m.title AS mission_title, m.city, m.scheduled_at
+    FROM mission_reports r
+    JOIN missions m ON m.id = r.mission_id
+    WHERE r.reporter_id=$1
+    ORDER BY r.created_at DESC
+  `, [req.user.id]);
+
+  res.json({ reports: rows });
+});
+
+// ── GET /missions/:id ──────────────────────────────────
 router.get('/:id', authenticate, async (req, res) => {
   const db = getDb();
   const { rows: [mission] } = await db.query(`
@@ -1292,21 +1308,6 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), async (req
   res.json({ report });
 });
 
-
-// ── GET /missions/my-reports — le rapporteur consulte l'historique de ses signalements ──
-router.get('/my-reports', authenticate, async (req, res) => {
-  const db = getDb();
-  const { rows } = await db.query(`
-    SELECT r.*,
-      m.title AS mission_title, m.city, m.scheduled_at
-    FROM mission_reports r
-    JOIN missions m ON m.id = r.mission_id
-    WHERE r.reporter_id=$1
-    ORDER BY r.created_at DESC
-  `, [req.user.id]);
-
-  res.json({ reports: rows });
-});
 
 router.checkTransferDeadlines = checkTransferDeadlines;
 module.exports = router;
