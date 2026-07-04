@@ -480,6 +480,104 @@ router.get('/admin/dashboard/geo', authenticate, requireRole('admin'), requirePe
   res.json({ current, comparison });
 });
 
+// ── GET /users/admin/dashboard/oeils — KPIs, classement, alertes Œils ──
+router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  // ── KPIs globaux ──
+  const [totals, interests, avgAssignTime] = await Promise.all([
+    db.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE is_active=true)::int AS actifs,
+        COUNT(*) FILTER (WHERE is_active=false)::int AS inactifs
+      FROM users WHERE role='oeil'
+    `),
+    db.query(`
+      SELECT
+        COUNT(*)::int AS total_interests,
+        COUNT(*) FILTER (WHERE m.oeil_id IS NOT NULL AND m.oeil_id = mi.oeil_id)::int AS hired
+      FROM mission_interests mi
+      JOIN missions m ON m.id = mi.mission_id
+      WHERE mi.created_at BETWEEN $1 AND $2
+    `, [date_from, date_to]),
+    db.query(`
+      SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at))/3600),0)::numeric(6,1) AS avg_hours
+      FROM missions
+      WHERE oeil_id IS NOT NULL AND assigned_at IS NOT NULL AND created_at BETWEEN $1 AND $2
+    `, [date_from, date_to]),
+  ]);
+
+  const acceptanceRate = interests.rows[0].total_interests > 0
+    ? Math.round((interests.rows[0].hired / interests.rows[0].total_interests) * 1000) / 10
+    : 0;
+
+  const kpis = {
+    total_oeils: totals.rows[0].total,
+    actifs: totals.rows[0].actifs,
+    inactifs: totals.rows[0].inactifs,
+    acceptance_rate: acceptanceRate,
+    avg_assignment_hours: parseFloat(avgAssignTime.rows[0].avg_hours),
+  };
+
+  // ── Classement (missions complétées sur la période) ──
+  const { rows: ranking } = await db.query(`
+    SELECT
+      u.id, u.first_name, u.last_name, u.avatar_url,
+      COUNT(m.id)::int AS missions_completed,
+      COALESCE(SUM(m.oeil_earning),0)::numeric AS revenue,
+      p.rating_avg
+    FROM users u
+    JOIN missions m ON m.oeil_id = u.id AND m.status='completed' AND m.completed_at BETWEEN $1 AND $2
+    LEFT JOIN oeil_profiles p ON p.user_id = u.id
+    WHERE u.role='oeil'
+    GROUP BY u.id, u.first_name, u.last_name, u.avatar_url, p.rating_avg
+    ORDER BY missions_completed DESC
+    LIMIT 15
+  `, [date_from, date_to]);
+
+  // ── Alertes ──
+  const [tooManyCancellations, lowRating, frequentDelays] = await Promise.all([
+    db.query(`
+      SELECT u.id, u.first_name, u.last_name, COUNT(*)::int AS n
+      FROM missions m JOIN users u ON u.id = m.oeil_id
+      WHERE m.status='cancelled' AND m.oeil_id IS NOT NULL AND m.updated_at BETWEEN $1 AND $2
+      GROUP BY u.id, u.first_name, u.last_name
+      HAVING COUNT(*) >= 2
+      ORDER BY n DESC
+    `, [date_from, date_to]),
+    db.query(`
+      SELECT u.id, u.first_name, u.last_name, p.rating_avg
+      FROM users u JOIN oeil_profiles p ON p.user_id = u.id
+      WHERE u.role='oeil' AND p.rating_avg > 0 AND p.rating_avg < 3.5
+      ORDER BY p.rating_avg ASC
+    `),
+    db.query(`
+      SELECT u.id, u.first_name, u.last_name, COUNT(*)::int AS n
+      FROM reliability_events e JOIN users u ON u.id = e.oeil_id
+      WHERE e.reason ILIKE '%heure%' AND e.created_at BETWEEN $1 AND $2
+      GROUP BY u.id, u.first_name, u.last_name
+      HAVING COUNT(*) >= 2
+      ORDER BY n DESC
+    `, [date_from, date_to]),
+  ]);
+
+  res.json({
+    kpis,
+    ranking,
+    alerts: {
+      too_many_cancellations: tooManyCancellations.rows,
+      low_rating: lowRating.rows,
+      frequent_delays: frequentDelays.rows,
+    },
+  });
+});
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
