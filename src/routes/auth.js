@@ -21,21 +21,23 @@ router.post('/register', [
 
   const db = getDb();
   const { email, password, first_name, last_name, role, phone, city, quartier,
-        birth_date, profil, usage_reason, usage_frequency, villes_cibles,
-        situation, disponibilite, motivation } = req.body;
-  const { rows: existing } = await db.query('SELECT id FROM users WHERE email=$1', [email]);
-  if (existing.length) return res.status(409).json({ error: 'Email déjà utilisé' });
-
-  const id = uuidv4();
-  const { rows: [user] } = await db.query(
-  `INSERT INTO users (id,email,password,role,first_name,last_name,phone,city,quartier,
-    birth_date,profil,usage_reason,usage_frequency,villes_cibles,situation,disponibilite,motivation)
-   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
-  [id, email, bcrypt.hashSync(password, 10), role, first_name, last_name,
-   phone||null, city||null, quartier||null, birth_date||null,
-   profil||null, usage_reason||null, usage_frequency||null, villes_cibles||null,
-   situation||null, disponibilite||null, motivation||null]
-);
+          birth_date, profil, usage_reason, usage_frequency, villes_cibles,
+          situation, disponibilite, motivation,
+          acquisition_source, acquisition_medium, acquisition_campaign } = req.body;
+    const { rows: existing } = await db.query('SELECT id FROM users WHERE email=$1', [email]);
+    if (existing.length) return res.status(409).json({ error: 'Email déjà utilisé' });
+    const id = uuidv4();
+    const { rows: [user] } = await db.query(
+    `INSERT INTO users (id,email,password,role,first_name,last_name,phone,city,quartier,
+      birth_date,profil,usage_reason,usage_frequency,villes_cibles,situation,disponibilite,motivation,
+      acquisition_source,acquisition_medium,acquisition_campaign)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`,
+    [id, email, bcrypt.hashSync(password, 10), role, first_name, last_name,
+     phone||null, city||null, quartier||null, birth_date||null,
+     profil||null, usage_reason||null, usage_frequency||null, villes_cibles||null,
+     situation||null, disponibilite||null, motivation||null,
+     acquisition_source||null, acquisition_medium||null, acquisition_campaign||null]
+  );
   if (role === 'oeil') await db.query(`INSERT INTO oeil_profiles (user_id) VALUES ($1)`, [id]);
 
   await db.query(`INSERT INTO notifications (user_id,title,body,type) VALUES ($1,$2,$3,'info')`, [
