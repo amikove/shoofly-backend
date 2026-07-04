@@ -393,6 +393,10 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       created_by  TEXT REFERENCES users(id),
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_source TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_medium TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_campaign TEXT;
   `);
   console.log('✅ PostgreSQL schema ready');
 }
