@@ -303,12 +303,13 @@ router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requi
   const { date_from, date_to, compare_from, compare_to } = req.query;
 
   // ── Section instantanée (indépendante de la période) ──
-  const [suspended, surveillance, stuckPending, expiredDeadline, lowReliability] = await Promise.all([
+  const [suspended, surveillance, stuckPending, expiredDeadline, lowReliability, avgScore] = await Promise.all([
     db.query(`SELECT COUNT(*)::int AS n FROM users WHERE role='oeil' AND is_suspended=true`),
     db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE under_surveillance=true`),
     db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE status='pending' AND created_at < NOW() - INTERVAL '24 hours'`),
     db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE status='pending' AND transfer_deadline IS NOT NULL AND transfer_deadline < NOW()`),
     db.query(`SELECT COUNT(*)::int AS n FROM users WHERE role='oeil' AND reliability_score < 70`),
+    db.query(`SELECT COALESCE(AVG(reliability_score),0)::numeric(5,1) AS avg FROM users WHERE role='oeil'`),
   ]);
 
   const instant = {
@@ -317,6 +318,7 @@ router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requi
     missions_stuck_pending: stuckPending.rows[0].n,
     missions_expired_deadline: expiredDeadline.rows[0].n,
     low_reliability_oeils: lowReliability.rows[0].n,
+    avg_reliability_score: parseFloat(avgScore.rows[0].avg),
   };
 
   // ── Section période + comparaison ──
@@ -326,9 +328,6 @@ router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requi
       SELECT COUNT(*)::int AS n FROM reliability_events
       WHERE reason ILIKE '%sans remplaçant%' AND created_at BETWEEN $1 AND $2
     `, [from, to]);
-    const { rows: [avgScore] } = await db.query(`
-      SELECT COALESCE(AVG(reliability_score),0)::numeric(5,1) AS avg FROM users WHERE role='oeil'
-    `);
     const { rows: [cancelRate] } = await db.query(`
       SELECT
         COUNT(*)::int AS total,
@@ -337,7 +336,6 @@ router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requi
     `, [from, to]);
     return {
       transfer_failures: transferFails.n,
-      avg_reliability_score: parseFloat(avgScore.avg),
       cancellation_rate: cancelRate.total > 0 ? Math.round((cancelRate.cancelled / cancelRate.total) * 1000) / 10 : 0,
     };
   }
