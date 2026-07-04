@@ -446,6 +446,40 @@ router.get('/admin/dashboard/funnel', authenticate, requireRole('admin'), requir
   res.json({ steps });
 });
 
+// ── GET /users/admin/dashboard/geo — stats par ville ──
+router.get('/admin/dashboard/geo', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to, compare_from, compare_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  async function computeGeoStats(from, to) {
+    const { rows } = await db.query(`
+      SELECT
+        m.city,
+        COUNT(*)::int AS total_missions,
+        COUNT(*) FILTER (WHERE m.status='completed')::int AS completed_missions,
+        COALESCE(SUM(m.price) FILTER (WHERE m.status='completed'),0)::numeric AS revenue,
+        COUNT(DISTINCT m.oeil_id)::int AS active_oeils
+      FROM missions m
+      WHERE m.created_at BETWEEN $1 AND $2 AND m.city IS NOT NULL
+      GROUP BY m.city
+      ORDER BY total_missions DESC
+    `, [from, to]);
+    return rows;
+  }
+
+  const current = await computeGeoStats(date_from, date_to);
+  let comparison = null;
+  if (compare_from && compare_to) {
+    comparison = await computeGeoStats(compare_from, compare_to);
+  }
+
+  res.json({ current, comparison });
+});
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
