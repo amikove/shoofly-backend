@@ -586,6 +586,64 @@ router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), require
   });
 });
 
+// ── GET /users/admin/dashboard/clients — KPIs et top clients ──
+router.get('/admin/dashboard/clients', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to, compare_from, compare_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  async function computeKpis(from, to) {
+    const { rows: [stats] } = await db.query(`
+      SELECT
+        COUNT(DISTINCT m.client_id)::int AS active_clients,
+        COUNT(m.id)::int AS total_missions,
+        COALESCE(AVG(m.price),0)::numeric(10,2) AS avg_basket,
+        COUNT(*) FILTER (WHERE m.status='cancelled' AND m.status != 'pending')::int AS cancelled_before_assign
+      FROM missions m
+      WHERE m.created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    const { rows: [freq] } = await db.query(`
+      SELECT COALESCE(AVG(cnt),0)::numeric(4,1) AS avg_missions_per_client FROM (
+        SELECT client_id, COUNT(*)::int AS cnt FROM missions
+        WHERE created_at BETWEEN $1 AND $2
+        GROUP BY client_id
+      ) sub
+    `, [from, to]);
+
+    return {
+      active_clients: stats.active_clients,
+      total_missions: stats.total_missions,
+      avg_basket: parseFloat(stats.avg_basket),
+      avg_missions_per_client: parseFloat(freq.avg_missions_per_client),
+    };
+  }
+
+  const kpis = await computeKpis(date_from, date_to);
+  let kpisCompare = null;
+  if (compare_from && compare_to) {
+    kpisCompare = await computeKpis(compare_from, compare_to);
+  }
+
+  const { rows: topClients } = await db.query(`
+    SELECT
+      u.id, u.first_name, u.last_name, u.city,
+      COUNT(m.id)::int AS total_missions,
+      COALESCE(SUM(m.price),0)::numeric AS total_spent
+    FROM users u
+    JOIN missions m ON m.client_id = u.id
+    WHERE u.role='client' AND m.created_at BETWEEN $1 AND $2
+    GROUP BY u.id, u.first_name, u.last_name, u.city
+    ORDER BY total_spent DESC
+    LIMIT 15
+  `, [date_from, date_to]);
+
+  res.json({ kpis, kpisCompare, topClients });
+});
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
