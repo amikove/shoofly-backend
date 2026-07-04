@@ -297,6 +297,57 @@ router.get('/admin/dashboard/executif', authenticate, requireRole('admin'), requ
   res.json({ current, comparison, daily_series: dailySeries });
 });
 
+// ── GET /users/admin/dashboard/alertes — état instantané + comparaison période ──
+router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to, compare_from, compare_to } = req.query;
+
+  // ── Section instantanée (indépendante de la période) ──
+  const [suspended, surveillance, stuckPending, expiredDeadline, lowReliability] = await Promise.all([
+    db.query(`SELECT COUNT(*)::int AS n FROM users WHERE role='oeil' AND is_suspended=true`),
+    db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE under_surveillance=true`),
+    db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE status='pending' AND created_at < NOW() - INTERVAL '24 hours'`),
+    db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE status='pending' AND transfer_deadline IS NOT NULL AND transfer_deadline < NOW()`),
+    db.query(`SELECT COUNT(*)::int AS n FROM users WHERE role='oeil' AND reliability_score < 70`),
+  ]);
+
+  const instant = {
+    suspended_oeils: suspended.rows[0].n,
+    missions_under_surveillance: surveillance.rows[0].n,
+    missions_stuck_pending: stuckPending.rows[0].n,
+    missions_expired_deadline: expiredDeadline.rows[0].n,
+    low_reliability_oeils: lowReliability.rows[0].n,
+  };
+
+  // ── Section période + comparaison ──
+  async function computePeriodAlertStats(from, to) {
+    if (!from || !to) return null;
+    const { rows: [transferFails] } = await db.query(`
+      SELECT COUNT(*)::int AS n FROM reliability_events
+      WHERE reason ILIKE '%sans remplaçant%' AND created_at BETWEEN $1 AND $2
+    `, [from, to]);
+    const { rows: [avgScore] } = await db.query(`
+      SELECT COALESCE(AVG(reliability_score),0)::numeric(5,1) AS avg FROM users WHERE role='oeil'
+    `);
+    const { rows: [cancelRate] } = await db.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE status='cancelled')::int AS cancelled
+      FROM missions WHERE created_at BETWEEN $1 AND $2
+    `, [from, to]);
+    return {
+      transfer_failures: transferFails.n,
+      avg_reliability_score: parseFloat(avgScore.avg),
+      cancellation_rate: cancelRate.total > 0 ? Math.round((cancelRate.cancelled / cancelRate.total) * 1000) / 10 : 0,
+    };
+  }
+
+  const current = await computePeriodAlertStats(date_from, date_to);
+  const comparison = await computePeriodAlertStats(compare_from, compare_to);
+
+  res.json({ instant, current, comparison });
+});
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
