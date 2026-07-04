@@ -383,9 +383,17 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       reviewed_at TIMESTAMPTZ,
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-  `);
 
+    CREATE TABLE IF NOT EXISTS expenses (
+      id          SERIAL PRIMARY KEY,
+      amount      NUMERIC(10,2) NOT NULL,
+      category    TEXT NOT NULL,
+      description TEXT,
+      expense_date DATE NOT NULL,
+      created_by  TEXT REFERENCES users(id),
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
   console.log('✅ PostgreSQL schema ready');
 }
-
 module.exports = { getDb, initDb };
