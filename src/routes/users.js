@@ -346,6 +346,43 @@ router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requi
   res.json({ instant, current, comparison });
 });
 
+// ── GET /users/admin/dashboard/services — stats par type de mission ──
+router.get('/admin/dashboard/services', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to, compare_from, compare_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  async function computeServiceStats(from, to) {
+    const { rows } = await db.query(`
+      SELECT
+        m.type,
+        COUNT(*)::int AS total_missions,
+        COUNT(*) FILTER (WHERE m.status='completed')::int AS completed_missions,
+        COALESCE(SUM(m.price) FILTER (WHERE m.status='completed'),0)::numeric AS revenue,
+        COALESCE(SUM(m.commission) FILTER (WHERE m.status='completed'),0)::numeric AS commission,
+        (SELECT COALESCE(AVG(r.score),0)::numeric(3,1) FROM ratings r
+          JOIN missions mm ON mm.id=r.mission_id
+          WHERE mm.type=m.type AND mm.created_at BETWEEN $1 AND $2) AS avg_rating
+      FROM missions m
+      WHERE m.created_at BETWEEN $1 AND $2
+      GROUP BY m.type
+      ORDER BY total_missions DESC
+    `, [from, to]);
+    return rows;
+  }
+
+  const current = await computeServiceStats(date_from, date_to);
+  let comparison = null;
+  if (compare_from && compare_to) {
+    comparison = await computeServiceStats(compare_from, compare_to);
+  }
+
+  res.json({ current, comparison });
+});
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
