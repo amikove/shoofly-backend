@@ -825,8 +825,14 @@ router.post('/:id/rate', authenticate, requireRole('client'), [
   const existing = await db.query('SELECT id FROM ratings WHERE mission_id=$1', [req.params.id]);
   if (existing.rows.length) return res.status(409).json({ error: 'Déjà noté' });
 
-  await db.query(`INSERT INTO ratings (mission_id,client_id,oeil_id,score,comment) VALUES ($1,$2,$3,$4,$5)`,
-    [mission.id, req.user.id, mission.oeil_id, req.body.score, req.body.comment||null]);
+  const { nps_facilite, nps_reactivite, nps_utilite, nps_recommandation, platform_comment } = req.body;
+    await db.query(
+      `INSERT INTO ratings (mission_id,client_id,oeil_id,score,comment,
+        nps_facilite,nps_reactivite,nps_utilite,nps_recommandation,platform_comment)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [mission.id, req.user.id, mission.oeil_id, req.body.score, req.body.comment||null,
+       nps_facilite||null, nps_reactivite||null, nps_utilite||null, nps_recommandation||null, platform_comment||null]
+    );
 
   const { rows: [avg] } = await db.query('SELECT AVG(score)::numeric(3,1) AS a, COUNT(*)::int AS c FROM ratings WHERE oeil_id=$1', [mission.oeil_id]);
   await db.query('UPDATE oeil_profiles SET rating_avg=$1, rating_count=$2 WHERE user_id=$3', [avg.a, avg.c, mission.oeil_id]);
