@@ -383,6 +383,69 @@ router.get('/admin/dashboard/services', authenticate, requireRole('admin'), requ
   res.json({ current, comparison });
 });
 
+// ── GET /users/admin/dashboard/funnel — entonnoir de conversion client ──
+router.get('/admin/dashboard/funnel', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  // Base : clients inscrits sur la période
+  const { rows: [inscrits] } = await db.query(`
+    SELECT COUNT(*)::int AS n FROM users WHERE role='client' AND created_at BETWEEN $1 AND $2
+  `, [date_from, date_to]);
+
+  // Parmi eux, combien ont créé au moins 1 mission
+  const { rows: [aCommande] } = await db.query(`
+    SELECT COUNT(DISTINCT u.id)::int AS n
+    FROM users u
+    JOIN missions m ON m.client_id = u.id
+    WHERE u.role='client' AND u.created_at BETWEEN $1 AND $2
+  `, [date_from, date_to]);
+
+  // Parmi eux, combien ont eu au moins 1 mission assignée
+  const { rows: [assignee] } = await db.query(`
+    SELECT COUNT(DISTINCT u.id)::int AS n
+    FROM users u
+    JOIN missions m ON m.client_id = u.id
+    WHERE u.role='client' AND u.created_at BETWEEN $1 AND $2
+      AND m.status NOT IN ('pending','cancelled')
+  `, [date_from, date_to]);
+
+  // Parmi eux, combien ont eu au moins 1 mission complétée
+  const { rows: [completee] } = await db.query(`
+    SELECT COUNT(DISTINCT u.id)::int AS n
+    FROM users u
+    JOIN missions m ON m.client_id = u.id
+    WHERE u.role='client' AND u.created_at BETWEEN $1 AND $2
+      AND m.status = 'completed'
+  `, [date_from, date_to]);
+
+  // Parmi eux, combien ont créé une 2ème mission (réachat)
+  const { rows: [revient] } = await db.query(`
+    SELECT COUNT(*)::int AS n FROM (
+      SELECT u.id
+      FROM users u
+      JOIN missions m ON m.client_id = u.id
+      WHERE u.role='client' AND u.created_at BETWEEN $1 AND $2
+      GROUP BY u.id
+      HAVING COUNT(m.id) >= 2
+    ) sub
+  `, [date_from, date_to]);
+
+  const steps = [
+    { key: 'inscrits',  label: 'Inscrits',            value: inscrits.n },
+    { key: 'commande',  label: 'A créé une mission',  value: aCommande.n },
+    { key: 'assignee',  label: 'Mission assignée',    value: assignee.n },
+    { key: 'completee', label: 'Mission complétée',   value: completee.n },
+    { key: 'revient',   label: 'Client revenu (2e mission)', value: revient.n },
+  ];
+
+  res.json({ steps });
+});
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
