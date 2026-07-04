@@ -574,14 +574,27 @@ router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), require
     `, [date_from, date_to]),
   ]);
 
+  // Segmentation par situation et motivation
+  const { rows: segByStatus } = await db.query(`
+    SELECT COALESCE(situation, 'Non renseigné') AS label, COUNT(*)::int AS n
+    FROM users WHERE role='oeil' GROUP BY situation ORDER BY n DESC
+  `);
+  const { rows: segByMotivation } = await db.query(`
+    SELECT COALESCE(motivation, 'Non renseigné') AS label, COUNT(*)::int AS n
+    FROM users WHERE role='oeil' GROUP BY motivation ORDER BY n DESC
+  `);
+
   res.json({
     kpis,
-    kpisCompare,
     ranking,
     alerts: {
       too_many_cancellations: tooManyCancellations.rows,
       low_rating: lowRating.rows,
       frequent_delays: frequentDelays.rows,
+    },
+    segmentation: {
+      situation: segByStatus,
+      motivation: segByMotivation,
     },
   });
 });
@@ -641,7 +654,21 @@ router.get('/admin/dashboard/clients', authenticate, requireRole('admin'), requi
     LIMIT 15
   `, [date_from, date_to]);
 
-  res.json({ kpis, kpisCompare, topClients });
+  // Segmentation par profil client
+  const { rows: segmentation } = await db.query(`
+    SELECT
+      COALESCE(u.profil, 'Non renseigné') AS profil,
+      COUNT(DISTINCT u.id)::int AS clients,
+      COUNT(m.id)::int AS total_missions,
+      COALESCE(SUM(m.price),0)::numeric AS revenue
+    FROM users u
+    JOIN missions m ON m.client_id = u.id
+    WHERE u.role='client' AND m.created_at BETWEEN $1 AND $2
+    GROUP BY u.profil
+    ORDER BY clients DESC
+  `, [date_from, date_to]);
+
+  res.json({ kpis, kpisCompare, topClients, segmentation });
 });
 
 // ── GET /users/admin/dashboard/fileattente — stats file d'attente ──
