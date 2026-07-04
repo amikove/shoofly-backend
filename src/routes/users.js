@@ -483,47 +483,54 @@ router.get('/admin/dashboard/geo', authenticate, requireRole('admin'), requirePe
 // ── GET /users/admin/dashboard/oeils — KPIs, classement, alertes Œils ──
 router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
-  const { date_from, date_to } = req.query;
+  const { date_from, date_to, compare_from, compare_to } = req.query;
 
   if (!date_from || !date_to) {
     return res.status(400).json({ error: 'date_from et date_to requis' });
   }
 
-  // ── KPIs globaux ──
-  const [totals, interests, avgAssignTime] = await Promise.all([
-    db.query(`
-      SELECT
-        COUNT(*)::int AS total,
-        COUNT(*) FILTER (WHERE is_active=true)::int AS actifs,
-        COUNT(*) FILTER (WHERE is_active=false)::int AS inactifs
-      FROM users WHERE role='oeil'
-    `),
-    db.query(`
-      SELECT
-        COUNT(*)::int AS total_interests,
-        COUNT(*) FILTER (WHERE m.oeil_id IS NOT NULL AND m.oeil_id = mi.oeil_id)::int AS hired
-      FROM mission_interests mi
-      JOIN missions m ON m.id = mi.mission_id
-      WHERE mi.created_at BETWEEN $1 AND $2
-    `, [date_from, date_to]),
-    db.query(`
-      SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at))/3600),0)::numeric(6,1) AS avg_hours
-      FROM missions
-      WHERE oeil_id IS NOT NULL AND assigned_at IS NOT NULL AND created_at BETWEEN $1 AND $2
-    `, [date_from, date_to]),
-  ]);
+  async function computeKpis(from, to) {
+    const [totals, interests, avgAssignTime] = await Promise.all([
+      db.query(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE is_active=true)::int AS actifs,
+          COUNT(*) FILTER (WHERE is_active=false)::int AS inactifs
+        FROM users WHERE role='oeil'
+      `),
+      db.query(`
+        SELECT
+          COUNT(*)::int AS total_interests,
+          COUNT(*) FILTER (WHERE m.oeil_id IS NOT NULL AND m.oeil_id = mi.oeil_id)::int AS hired
+        FROM mission_interests mi
+        JOIN missions m ON m.id = mi.mission_id
+        WHERE mi.created_at BETWEEN $1 AND $2
+      `, [from, to]),
+      db.query(`
+        SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at))/3600),0)::numeric(6,1) AS avg_hours
+        FROM missions
+        WHERE oeil_id IS NOT NULL AND assigned_at IS NOT NULL AND created_at BETWEEN $1 AND $2
+      `, [from, to]),
+    ]);
 
-  const acceptanceRate = interests.rows[0].total_interests > 0
-    ? Math.round((interests.rows[0].hired / interests.rows[0].total_interests) * 1000) / 10
-    : 0;
+    const acceptanceRate = interests.rows[0].total_interests > 0
+      ? Math.round((interests.rows[0].hired / interests.rows[0].total_interests) * 1000) / 10
+      : 0;
 
-  const kpis = {
-    total_oeils: totals.rows[0].total,
-    actifs: totals.rows[0].actifs,
-    inactifs: totals.rows[0].inactifs,
-    acceptance_rate: acceptanceRate,
-    avg_assignment_hours: parseFloat(avgAssignTime.rows[0].avg_hours),
-  };
+    return {
+      total_oeils: totals.rows[0].total,
+      actifs: totals.rows[0].actifs,
+      inactifs: totals.rows[0].inactifs,
+      acceptance_rate: acceptanceRate,
+      avg_assignment_hours: parseFloat(avgAssignTime.rows[0].avg_hours),
+    };
+  }
+
+  const kpis = await computeKpis(date_from, date_to);
+  let kpisCompare = null;
+  if (compare_from && compare_to) {
+    kpisCompare = await computeKpis(compare_from, compare_to);
+  }
 
   // ── Classement (missions complétées sur la période) ──
   const { rows: ranking } = await db.query(`
@@ -569,6 +576,7 @@ router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), require
 
   res.json({
     kpis,
+    kpisCompare,
     ranking,
     alerts: {
       too_many_cancellations: tooManyCancellations.rows,
