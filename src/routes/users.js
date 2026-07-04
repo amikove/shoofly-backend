@@ -644,6 +644,63 @@ router.get('/admin/dashboard/clients', authenticate, requireRole('admin'), requi
   res.json({ kpis, kpisCompare, topClients });
 });
 
+// ── GET /users/admin/dashboard/fileattente — stats file d'attente ──
+router.get('/admin/dashboard/fileattente', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to, compare_from, compare_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  async function computeKpis(from, to) {
+    const { rows: [stats] } = await db.query(`
+      SELECT
+        COUNT(*)::int AS total_missions,
+        COUNT(*) FILTER (WHERE status='completed')::int AS completed_missions,
+        COALESCE(AVG(EXTRACT(EPOCH FROM (completed_at - started_at))/60) FILTER (WHERE status='completed' AND started_at IS NOT NULL),0)::numeric(6,1) AS avg_wait_minutes,
+        COALESCE(SUM(
+          EXTRACT(EPOCH FROM (completed_at - started_at))/3600 + 1
+        ) FILTER (WHERE status='completed' AND started_at IS NOT NULL),0)::numeric(10,1) AS hours_saved
+      FROM missions
+      WHERE type='file_attente' AND created_at BETWEEN $1 AND $2
+    `, [from, to]);
+    return {
+      total_missions: stats.total_missions,
+      completed_missions: stats.completed_missions,
+      avg_wait_minutes: parseFloat(stats.avg_wait_minutes),
+      hours_saved: parseFloat(stats.hours_saved),
+    };
+  }
+
+  const kpis = await computeKpis(date_from, date_to);
+  let kpisCompare = null;
+  if (compare_from && compare_to) {
+    kpisCompare = await computeKpis(compare_from, compare_to);
+  }
+
+  // Organismes les plus demandés — extrait la partie après le "—" de subcategory
+  const { rows: rawOrgs } = await db.query(`
+    SELECT subcategory, COUNT(*)::int AS n
+    FROM missions
+    WHERE type='file_attente' AND created_at BETWEEN $1 AND $2 AND subcategory IS NOT NULL
+    GROUP BY subcategory
+  `, [date_from, date_to]);
+
+  const orgCounts = {};
+  for (const row of rawOrgs) {
+    const parts = row.subcategory.split('—').map(s => s.trim());
+    const org = parts.length > 1 ? parts[1] : row.subcategory;
+    orgCounts[org] = (orgCounts[org] || 0) + row.n;
+  }
+  const topOrganismes = Object.entries(orgCounts)
+    .map(([organisme, missions]) => ({ organisme, missions }))
+    .sort((a, b) => b.missions - a.missions)
+    .slice(0, 10);
+
+  res.json({ kpis, kpisCompare, topOrganismes });
+});
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
