@@ -397,6 +397,12 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_source TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_medium TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_campaign TEXT;
+
+    ALTER TABLE ratings ADD COLUMN IF NOT EXISTS nps_facilite INTEGER CHECK(nps_facilite BETWEEN 1 AND 5);
+    ALTER TABLE ratings ADD COLUMN IF NOT EXISTS nps_reactivite INTEGER CHECK(nps_reactivite BETWEEN 1 AND 5);
+    ALTER TABLE ratings ADD COLUMN IF NOT EXISTS nps_utilite INTEGER CHECK(nps_utilite BETWEEN 1 AND 5);
+    ALTER TABLE ratings ADD COLUMN IF NOT EXISTS nps_recommandation INTEGER CHECK(nps_recommandation BETWEEN 1 AND 5);
+    ALTER TABLE ratings ADD COLUMN IF NOT EXISTS platform_comment TEXT;
   `);
   console.log('✅ PostgreSQL schema ready');
 }
