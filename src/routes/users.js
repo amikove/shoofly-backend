@@ -701,6 +701,129 @@ router.get('/admin/dashboard/fileattente', authenticate, requireRole('admin'), r
   res.json({ kpis, kpisCompare, topOrganismes });
 });
 
+// ── POST /users/admin/expenses — ajouter une dépense manuelle ──
+router.post('/admin/expenses', authenticate, requireRole('admin'), requirePermission('finance'), async (req, res) => {
+  const db = getDb();
+  const { amount, category, description, expense_date } = req.body;
+
+  if (!amount || amount <= 0 || !category || !expense_date) {
+    return res.status(400).json({ error: 'Montant, catégorie et date requis' });
+  }
+
+  const { rows: [expense] } = await db.query(
+    `INSERT INTO expenses (amount, category, description, expense_date, created_by)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [amount, category, description || null, expense_date, req.user.id]
+  );
+
+  res.status(201).json({ expense });
+});
+
+// ── GET /users/admin/expenses — lister les dépenses sur une période ──
+router.get('/admin/expenses', authenticate, requireRole('admin'), requirePermission('finance'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to } = req.query;
+
+  const { rows } = await db.query(`
+    SELECT e.*, u.first_name, u.last_name
+    FROM expenses e
+    LEFT JOIN users u ON u.id = e.created_by
+    WHERE e.expense_date BETWEEN $1 AND $2
+    ORDER BY e.expense_date DESC
+  `, [date_from, date_to]);
+
+  res.json({ expenses: rows });
+});
+
+// ── DELETE /users/admin/expenses/:id — supprimer une dépense ──
+router.delete('/admin/expenses/:id', authenticate, requireRole('admin'), requirePermission('finance'), async (req, res) => {
+  const db = getDb();
+  await db.query(`DELETE FROM expenses WHERE id=$1`, [req.params.id]);
+  res.json({ ok: true });
+});
+
+// ── GET /users/admin/dashboard/financier — vue financière globale ──
+router.get('/admin/dashboard/financier', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to, compare_from, compare_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  async function computeFinance(from, to) {
+    const { rows: [main] } = await db.query(`
+      SELECT
+        COALESCE(SUM(price) FILTER (WHERE status='completed'),0)::numeric AS revenue,
+        COALESCE(SUM(commission) FILTER (WHERE status='completed'),0)::numeric AS commission,
+        COALESCE(SUM(oeil_earning) FILTER (WHERE status='completed'),0)::numeric AS paid_to_oeils
+      FROM missions
+      WHERE created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    const { rows: [refunds] } = await db.query(`
+      SELECT COALESCE(SUM(amount),0)::numeric AS n
+      FROM wallet_transactions
+      WHERE type='credit' AND reason ILIKE '%emboursement%' AND created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    const { rows: [fileAttenteRate] } = await db.query(`
+      SELECT
+        COALESCE(SUM(oeil_earning),0)::numeric AS total_earning,
+        COALESCE(SUM(EXTRACT(EPOCH FROM (completed_at - started_at))/3600) FILTER (WHERE started_at IS NOT NULL),0)::numeric AS total_hours
+      FROM missions
+      WHERE type='file_attente' AND status='completed' AND created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    const hourlyRate = fileAttenteRate.total_hours > 0
+      ? parseFloat(fileAttenteRate.total_earning) / parseFloat(fileAttenteRate.total_hours)
+      : 0;
+
+    const { rows: [hoursSaved] } = await db.query(`
+      SELECT COALESCE(SUM(
+        EXTRACT(EPOCH FROM (completed_at - started_at))/3600 + 1
+      ) FILTER (WHERE started_at IS NOT NULL),0)::numeric AS n
+      FROM missions
+      WHERE type='file_attente' AND status='completed' AND created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    const timeSavedValue = parseFloat(hoursSaved.n) * hourlyRate;
+
+    return {
+      revenue: parseFloat(main.revenue),
+      commission: parseFloat(main.commission),
+      paid_to_oeils: parseFloat(main.paid_to_oeils),
+      refunds: parseFloat(refunds.n),
+      hourly_rate_file_attente: Math.round(hourlyRate * 100) / 100,
+      time_saved_value: Math.round(timeSavedValue),
+    };
+  }
+
+  const current = await computeFinance(date_from, date_to);
+  let comparison = null;
+  if (compare_from && compare_to) {
+    comparison = await computeFinance(compare_from, compare_to);
+  }
+
+  const { rows: [expensesRow] } = await db.query(
+    `SELECT COALESCE(SUM(amount),0)::numeric AS n FROM expenses WHERE expense_date BETWEEN $1 AND $2`,
+    [date_from, date_to]
+  );
+  current.expenses = parseFloat(expensesRow.n);
+  current.net_profit = current.commission - current.expenses;
+
+  if (comparison) {
+    const { rows: [expensesCompareRow] } = await db.query(
+      `SELECT COALESCE(SUM(amount),0)::numeric AS n FROM expenses WHERE expense_date BETWEEN $1 AND $2`,
+      [compare_from, compare_to]
+    );
+    comparison.expenses = parseFloat(expensesCompareRow.n);
+    comparison.net_profit = comparison.commission - comparison.expenses;
+  }
+
+  res.json({ current, comparison });
+});
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
