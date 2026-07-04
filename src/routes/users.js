@@ -229,6 +229,74 @@ router.get('/client/stats', authenticate, requireRole('client'), async (req, res
 });
 
 
+// ── GET /users/admin/dashboard/executif — KPIs exécutifs avec période + comparaison optionnelle ──
+router.get('/admin/dashboard/executif', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to, compare_from, compare_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  async function computePeriodStats(from, to) {
+    const { rows: [m] } = await db.query(`
+      SELECT
+        COUNT(*)::int AS total_missions,
+        COUNT(*) FILTER (WHERE status='completed')::int AS completed_missions,
+        COUNT(*) FILTER (WHERE status='cancelled')::int AS cancelled_missions,
+        COALESCE(SUM(price) FILTER (WHERE status='completed'),0)::numeric AS revenue,
+        COALESCE(SUM(commission) FILTER (WHERE status='completed'),0)::numeric AS commission
+      FROM missions
+      WHERE created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    const { rows: [nc] } = await db.query(`
+      SELECT COUNT(*)::int AS n FROM users WHERE role='client' AND created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    const { rows: [no] } = await db.query(`
+      SELECT COUNT(*)::int AS n FROM users WHERE role='oeil' AND created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    // Œils/clients actifs = ayant eu au moins une mission sur la période
+    const { rows: [activeOeils] } = await db.query(`
+      SELECT COUNT(DISTINCT oeil_id)::int AS n FROM missions WHERE oeil_id IS NOT NULL AND created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    const { rows: [activeClients] } = await db.query(`
+      SELECT COUNT(DISTINCT client_id)::int AS n FROM missions WHERE created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    return {
+      ...m,
+      new_clients: nc.n,
+      new_oeils: no.n,
+      active_oeils: activeOeils.n,
+      active_clients: activeClients.n,
+    };
+  }
+
+  // Séries temporelles jour par jour (pour graphique), sur la période principale uniquement
+  const { rows: dailySeries } = await db.query(`
+    SELECT
+      DATE(created_at) AS day,
+      COUNT(*)::int AS missions,
+      COALESCE(SUM(price) FILTER (WHERE status='completed'),0)::numeric AS revenue
+    FROM missions
+    WHERE created_at BETWEEN $1 AND $2
+    GROUP BY DATE(created_at)
+    ORDER BY day ASC
+  `, [date_from, date_to]);
+
+  const current = await computePeriodStats(date_from, date_to);
+  let comparison = null;
+  if (compare_from && compare_to) {
+    comparison = await computePeriodStats(compare_from, compare_to);
+  }
+
+  res.json({ current, comparison, daily_series: dailySeries });
+});
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
