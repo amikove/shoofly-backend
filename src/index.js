@@ -185,7 +185,7 @@ io.on('connection', (socket) => {
       const recipientId = uid === m.client_id ? m.oeil_id : m.client_id;
       if (recipientId && !userSockets.get(recipientId)?.size) {
         await db.query(
-          `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,$2,$3,'message',$4,'none')`,
+          `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,$2,$3,'message',$4,'chat')`,
           [recipientId, `Message de ${sender.rows[0].first_name}`, content.trim().slice(0, 80), missionId]
         );
       }
