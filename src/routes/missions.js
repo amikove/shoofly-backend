@@ -1195,6 +1195,14 @@ router.post('/:id/report-problem', authenticate, async (req, res) => {
     return res.status(400).json({ error: 'Mission non active' });
   }
 
+  // Vérifier qu'un signalement n'existe pas déjà pour cette mission (contrainte UNIQUE en base)
+  const { rows: [existingReport] } = await db.query(
+    `SELECT id FROM mission_reports WHERE mission_id=$1`, [mission.id]
+  );
+  if (existingReport) {
+    return res.status(409).json({ error: 'Un problème a déjà été signalé pour cette mission' });
+  }
+
   // Créer le ticket
   const reporterRole = req.user.id === mission.client_id ? 'client' : 'oeil';
   const { rows: [report] } = await db.query(
