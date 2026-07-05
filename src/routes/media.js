@@ -73,7 +73,7 @@ router.post('/:missionId', authenticate, upload.array('files', 10), asyncHandler
     const emitToUser = req.app.get('emitToUser');
     const notifBody = `Votre Œil a envoyé ${inserted.length} ${inserted[0]?.type === 'video' ? 'vidéo(s)' : 'photo(s)'} pour "${mission.title}"`
     await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id) VALUES ($1,$2,$3,'media',$4)`,
+      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,$2,$3,'media',$4,'mission_view')`,
       [mission.client_id, '📸 Médias reçus', notifBody, mission.id]
     );
 

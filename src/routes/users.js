@@ -916,7 +916,7 @@ router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), asyncHa
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   await db.query(`UPDATE oeil_profiles SET is_verified=true, id_verified_at=NOW() WHERE user_id=$1`, [req.params.id]);
-  const notif = await db.query(`INSERT INTO notifications (user_id,title,body,type) VALUES ($1,'✅ Profil vérifié !','Vous pouvez maintenant accepter des missions.','info') RETURNING *`, [req.params.id]);
+  const notif = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type) VALUES ($1,'✅ Profil vérifié !','Vous pouvez maintenant accepter des missions.','info','none') RETURNING *`, [req.params.id]);
   if (emitToUser) emitToUser(req.params.id, 'notification', notif.rows[0]);
   res.json({ message: 'Œil vérifié' });
 }));
@@ -999,7 +999,7 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   const emitToUser = req.app.get('emitToUser');
   const notify = async (userId, title, body) => {
     await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id) VALUES ($1,$2,$3,'info',$4)`,
+      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,$2,$3,'info',$4,'mission_view')`,
       [userId, title, body, mission.id]
     );
     if (emitToUser) emitToUser(userId, 'notification', { title, body });
@@ -1044,11 +1044,11 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), asyncHa
   await db.query(`UPDATE withdrawals SET status=$1,processed_by=$2,processed_at=NOW() WHERE id=$3`, [status, req.user.id, req.params.id]);
   if (status === 'rejected') {
     await db.query('UPDATE oeil_profiles SET balance=balance+$1 WHERE user_id=$2', [w.amount, w.oeil_id]);
-    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type) VALUES ($1,'Virement refusé','Votre demande a été refusée. Solde recrédité.','info') RETURNING *`, [w.oeil_id]);
+    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type) VALUES ($1,'Virement refusé','Votre demande a été refusée. Solde recrédité.','info','gains_page') RETURNING *`, [w.oeil_id]);
     if (emitToUser) emitToUser(w.oeil_id, 'notification', n.rows[0]);
   }
   if (status === 'paid') {
-    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type) VALUES ($1,'💸 Virement effectué',$2,'info') RETURNING *`, [w.oeil_id, `${w.amount} MAD virés sur votre compte.`]);
+    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type) VALUES ($1,'💸 Virement effectué',$2,'info','gains_page') RETURNING *`, [w.oeil_id, `${w.amount} MAD virés sur votre compte.`]);
     if (emitToUser) emitToUser(w.oeil_id, 'notification', n.rows[0]);
   }
   res.json({ message: `Virement ${status}` });
@@ -1132,8 +1132,8 @@ router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('a
 
   // Notification in-app
   await db.query(
-    `INSERT INTO notifications (user_id, title, body, type)
-     VALUES ($1, '✅ Identité vérifiée', 'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.', 'success')`,
+    `INSERT INTO notifications (user_id, title, body, type, action_type)
+     VALUES ($1, '✅ Identité vérifiée', 'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.', 'success', 'none')`,
     [doc.user_id]
   );
 
@@ -1160,8 +1160,8 @@ router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('ad
 
   // Notification in-app
   await db.query(
-    `INSERT INTO notifications (user_id, title, body, type)
-     VALUES ($1, '❌ Vérification refusée', $2, 'error')`,
+    `INSERT INTO notifications (user_id, title, body, type, action_type)
+     VALUES ($1, '❌ Vérification refusée', $2, 'error', 'verification_page')`,
     [doc.user_id, `Votre demande de vérification a été refusée. Raison : ${reason || 'Documents non conformes'}. Vous pouvez soumettre de nouveaux documents.`]
   );
 
@@ -1277,8 +1277,8 @@ router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('a
   );
 
   await db.query(
-    `INSERT INTO notifications (user_id, title, body, type)
-     VALUES ($1, '💰 Virement effectué', $2, 'success')`,
+    `INSERT INTO notifications (user_id, title, body, type, action_type)
+     VALUES ($1, '💰 Virement effectué', $2, 'success', 'gains_page')`,
     [req.params.oeilId, `Un virement de ${amount} MAD a été enregistré vers votre compte bancaire.`]
   );
 

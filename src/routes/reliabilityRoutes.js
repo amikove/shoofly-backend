@@ -60,8 +60,8 @@ router.post('/review-request', authenticate, requireRole('oeil'), asyncHandler(a
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
   for (const admin of admins) {
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type)
-       VALUES ($1, $2, $3, 'warning')`,
+      `INSERT INTO notifications (user_id, title, body, type, action_type)
+       VALUES ($1, $2, $3, 'warning', 'admin_fiabilite')`,
       [admin.id, '📨 Demande d\'examen reçue', `Un Œil a demandé un examen de son dossier suite à suspension.`]
     );
   }
@@ -126,14 +126,14 @@ router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), as
       [newScore, request.oeil_id]
     );
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type)
-       VALUES ($1, '✅ Compte réactivé', $2, 'success')`,
+      `INSERT INTO notifications (user_id, title, body, type, action_type)
+       VALUES ($1, '✅ Compte réactivé', $2, 'success', 'none')`,
       [request.oeil_id, `Votre dossier a été examiné et votre compte est réactivé. ${response || ''}`]
     );
   } else {
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type)
-       VALUES ($1, '❌ Demande refusée', $2, 'error')`,
+      `INSERT INTO notifications (user_id, title, body, type, action_type)
+       VALUES ($1, '❌ Demande refusée', $2, 'error', 'none')`,
       [request.oeil_id, `Votre demande d'examen a été refusée. ${response || ''}`]
     );
   }
@@ -204,8 +204,8 @@ router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), asy
   if (!oeil) return res.status(404).json({ error: 'Œil introuvable' });
 
   await db.query(
-    `INSERT INTO notifications (user_id, title, body, type)
-     VALUES ($1, '✅ Compte réactivé', $2, 'success')`,
+    `INSERT INTO notifications (user_id, title, body, type, action_type)
+     VALUES ($1, '✅ Compte réactivé', $2, 'success', 'none')`,
     [oeil.id, `Votre compte a été réactivé par un administrateur. Score de réintégration : ${newScore}%.`]
   );
 

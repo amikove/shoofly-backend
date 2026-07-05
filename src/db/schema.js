@@ -403,6 +403,8 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE ratings ADD COLUMN IF NOT EXISTS nps_utilite INTEGER CHECK(nps_utilite BETWEEN 1 AND 5);
     ALTER TABLE ratings ADD COLUMN IF NOT EXISTS nps_recommandation INTEGER CHECK(nps_recommandation BETWEEN 1 AND 5);
     ALTER TABLE ratings ADD COLUMN IF NOT EXISTS platform_comment TEXT;
+
+    ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action_type TEXT;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

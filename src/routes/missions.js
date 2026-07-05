@@ -18,10 +18,10 @@ async function pricing(price, db) {
   return { commission, oeil_earning: price - commission };
 }
 
-async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null) {
+async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null) {
   const r = await db.query(
-    `INSERT INTO notifications (user_id,title,body,type,mission_id) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [userId, title, body, type, missionId]
+    `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [userId, title, body, type, missionId, actionType]
   );
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 }
@@ -763,8 +763,8 @@ if (isFlagged) {
   const senderName = `${sender.rows[0]?.first_name} ${sender.rows[0]?.last_name}`
   for (const admin of admins) {
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id)
-       VALUES ($1, $2, $3, 'warning', $4)`,
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+       VALUES ($1, $2, $3, 'warning', $4, 'admin_messages_suspects')`,
       [admin.id, '⚠️ Message suspect détecté',
        `${senderName} a peut-être partagé un contact externe dans la mission "${mission.title}"`,
        req.params.id]
@@ -794,8 +794,8 @@ if (isFlagged) {
   if (recipientId) {
     const notifBody = `${mission.title} : ${content.trim().slice(0, 60)}`
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id)
-      VALUES ($1, 'Nouveau message', $2, 'message', $3)`,
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+      VALUES ($1, 'Nouveau message', $2, 'message', $3, 'chat')`,
       [recipientId, notifBody, req.params.id]
     );
     const emitToUser = req.app.get('emitToUser');
@@ -883,7 +883,7 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
 
   const emitToUser = req.app.get('emitToUser');
   const notifBody = `Un Œil est intéressé par votre mission : ${mission.title}`
-  await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser);
+  await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser, 'interests_modal');
 
   res.status(201).json({ ok: true });
 }));
@@ -1082,7 +1082,7 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
     });
 
     await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id) VALUES ($1,'❌ Mission annulée','Aucun Œil disponible. Remboursement intégral effectué.','error',$2)`,
+      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,'❌ Mission annulée','Aucun Œil disponible. Remboursement intégral effectué.','error',$2,'mission_view')`,
       [mission.client_id, mission.id]
     );
   }
@@ -1222,8 +1222,8 @@ router.post('/:id/report-problem', authenticate, asyncHandler(async (req, res) =
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
   for (const admin of admins) {
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id)
-       VALUES ($1, '🚨 Problème signalé en cours de mission', $2, 'error', $3)`,
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+       VALUES ($1, '🚨 Problème signalé en cours de mission', $2, 'error', $3, 'admin_problems')`,
       [admin.id, `${reporterRole === 'client' ? 'Client' : 'Œil'} a signalé : "${type}" sur "${mission.title}"`, mission.id]
     );
     if (emitToUser) emitToUser(admin.id, 'notification', {
@@ -1238,8 +1238,8 @@ router.post('/:id/report-problem', authenticate, asyncHandler(async (req, res) =
   const otherId = req.user.id === mission.client_id ? mission.oeil_id : mission.client_id;
   if (otherId) {
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id)
-       VALUES ($1, '⚠️ Problème signalé sur votre mission', $2, 'warning', $3)`,
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+       VALUES ($1, '⚠️ Problème signalé sur votre mission', $2, 'warning', $3, 'mission_view')`,
       [otherId, `Un problème a été signalé : "${type}". L'équipe Shoofly a été alertée.`, mission.id]
     );
     if (emitToUser) emitToUser(otherId, 'notification', {
@@ -1318,8 +1318,8 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandl
     const emitToUser = req.app.get('emitToUser');
     const statusLabel = { in_progress: 'pris en charge', resolved: 'résolu', dismissed: 'classé sans suite' }[status] || status;
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id)
-       VALUES ($1, $2, $3, 'info', $4)`,
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+       VALUES ($1, $2, $3, 'info', $4, 'mes_signalements')`,
       [report.reporter_id, `📋 Votre signalement a été ${statusLabel}`, admin_note || 'Votre signalement a été traité par notre équipe.', report.mission_id]
     );
     if (emitToUser) emitToUser(report.reporter_id, 'notification', {

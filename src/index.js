@@ -185,7 +185,7 @@ io.on('connection', (socket) => {
       const recipientId = uid === m.client_id ? m.oeil_id : m.client_id;
       if (recipientId && !userSockets.get(recipientId)?.size) {
         await db.query(
-          `INSERT INTO notifications (user_id,title,body,type,mission_id) VALUES ($1,$2,$3,'message',$4)`,
+          `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,$2,$3,'message',$4,'none')`,
           [recipientId, `Message de ${sender.rows[0].first_name}`, content.trim().slice(0, 80), missionId]
         );
       }
@@ -252,8 +252,8 @@ initDb().then(() => {
 
       for (const m of missions) {
         await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id)
-           VALUES ($1, $2, $3, 'warning', $4)`,
+          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+           VALUES ($1, $2, $3, 'warning', $4, 'mission_view')`,
           [m.oeil_id,
            '⏰ Rappel mission demain',
            `Vous avez une mission demain : "${m.title}" à ${new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}. Confirmez votre présence en étant à l'heure.`,
@@ -316,8 +316,8 @@ initDb().then(() => {
       const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
       for (const admin of admins) {
         await db.query(
-          `INSERT INTO notifications (user_id, title, body, type)
-           VALUES ($1, $2, $3, 'warning')`,
+          `INSERT INTO notifications (user_id, title, body, type, action_type)
+           VALUES ($1, $2, $3, 'warning', 'admin_missions')`,
           [admin.id,
            `📋 ${missions.length} mission(s) non confirmées demain`,
            body]
@@ -347,8 +347,8 @@ initDb().then(() => {
       for (const m of lateH) {
         // Alerte Œil
         await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id)
-           VALUES ($1, '🚨 Votre mission a commencé !', $2, 'error', $3)
+          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+           VALUES ($1, '🚨 Votre mission a commencé !', $2, 'error', $3, 'mission_view')
            ON CONFLICT DO NOTHING`,
           [m.oeil_id, `La mission "${m.title}" devait commencer maintenant. Mettez à jour votre statut immédiatement.`, m.id]
         );
@@ -356,8 +356,8 @@ initDb().then(() => {
         const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
         for (const admin of admins) {
           await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id)
-             VALUES ($1, '🚨 Mission non démarrée', $2, 'error', $3)`,
+            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+             VALUES ($1, '🚨 Mission non démarrée', $2, 'error', $3, 'admin_missions')`,
             [admin.id, `L'Œil ${m.first_name} ${m.last_name} n'a pas démarré "${m.title}" à l'heure prévue.`, m.id]
           );
         }
@@ -409,21 +409,21 @@ initDb().then(() => {
 
         // Remboursement client si pas de remplaçant (géré par cron deadline)
         await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id)
-           VALUES ($1, '⚠️ Mission transférée automatiquement', $2, 'warning', $3)`,
+          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+           VALUES ($1, '⚠️ Mission transférée automatiquement', $2, 'warning', $3, 'mission_view')`,
           [m.client_id, `Votre Œil n'a pas démarré "${m.title}" à l'heure. Nous recherchons un remplaçant en urgence.`, m.id]
         );
         await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id)
-           VALUES ($1, '⚠️ Pénalité appliquée', $2, 'error', $3)`,
+          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+           VALUES ($1, '⚠️ Pénalité appliquée', $2, 'error', $3, 'reliability_page')`,
           [m.oeil_id, `Vous n'avez pas démarré "${m.title}" à l'heure. -100 MAD déduits et cooldown 4h appliqué.`, m.id]
         );
 
         const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
         for (const admin of admins) {
           await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id)
-             VALUES ($1, '🔄 Transfert automatique H+30', $2, 'warning', $3)`,
+            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+             VALUES ($1, '🔄 Transfert automatique H+30', $2, 'warning', $3, 'admin_missions')`,
             [admin.id, `Mission "${m.title}" transférée automatiquement — Œil ${m.first_name} ${m.last_name} n'a pas démarré.`, m.id]
           );
         }
@@ -453,8 +453,8 @@ initDb().then(() => {
         const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
         for (const admin of admins) {
           await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id)
-             VALUES ($1, '🔍 Mission à vérifier', $2, 'warning', $3)
+            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+             VALUES ($1, '🔍 Mission à vérifier', $2, 'warning', $3, 'admin_missions')
              ON CONFLICT DO NOTHING`,
             [admin.id, `La mission "${m.title}" de ${m.first_name} ${m.last_name} est en cours depuis plus de 24h. Vérification requise.`, m.id]
           );
@@ -479,8 +479,8 @@ initDb().then(() => {
       `);
       for (const m of missions2h) {
         await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id)
-           VALUES ($1, '⏰ Mission dans 2 heures', $2, 'warning', $3)`,
+          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+           VALUES ($1, '⏰ Mission dans 2 heures', $2, 'warning', $3, 'mission_view')`,
           [m.oeil_id, `Votre mission "${m.title}" commence dans 2 heures. Préparez-vous !`, m.id]
         );
         if (emitToUser) emitToUser(m.oeil_id, 'notification', {
@@ -500,8 +500,8 @@ initDb().then(() => {
       `);
       for (const m of missions30) {
         await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id)
-           VALUES ($1, '🚀 Mission dans 30 minutes !', $2, 'warning', $3)`,
+          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+           VALUES ($1, '🚀 Mission dans 30 minutes !', $2, 'warning', $3, 'mission_view')`,
           [m.oeil_id, `Votre mission "${m.title}" commence dans 30 minutes. Êtes-vous en route ?`, m.id]
         );
         if (emitToUser) emitToUser(m.oeil_id, 'notification', {
@@ -514,8 +514,8 @@ initDb().then(() => {
         const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
         for (const admin of admins) {
           await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id)
-             VALUES ($1, '⚠️ Mission dans 30 min non confirmée', $2, 'warning', $3)`,
+            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
+             VALUES ($1, '⚠️ Mission dans 30 min non confirmée', $2, 'warning', $3, 'admin_missions')`,
             [admin.id, `Mission "${m.title}" dans 30 min — l'Œil n'a pas encore démarré.`, m.id]
           );
         }
