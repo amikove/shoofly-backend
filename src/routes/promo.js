@@ -1,9 +1,10 @@
 const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const asyncHandler = require('../middleware/asyncHandler');
 
 // ── POST /promo/validate — vérifier un code ───────────────
-router.post('/validate', authenticate, async (req, res) => {
+router.post('/validate', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { code, price } = req.body;
 
@@ -48,10 +49,10 @@ router.post('/validate', authenticate, async (req, res) => {
     final_price: finalPrice,
     platform_amount: promo.platform_amount || null,
   });
-});
+}));
 
 // ── GET /promo/admin — lister tous les codes ──────────────
-router.get('/admin', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(
     `SELECT p.*, u.first_name||' '||u.last_name AS created_by_name
@@ -60,10 +61,10 @@ router.get('/admin', authenticate, requireRole('admin'), async (req, res) => {
      ORDER BY p.created_at DESC`
   );
   res.json({ promos: rows });
-});
+}));
 
 // ── POST /promo/admin — créer un code ─────────────────────
-router.post('/admin', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/admin', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { code, type, value, max_uses, max_uses_per_user, expires_at, platform_amount } = req.body;
 
@@ -81,10 +82,10 @@ router.post('/admin', authenticate, requireRole('admin'), async (req, res) => {
   );
 
   res.status(201).json({ promo });
-});
+}));
 
 // ── PUT /promo/admin/:id/toggle — activer/désactiver ─────
-router.put('/admin/:id/toggle', authenticate, requireRole('admin'), async (req, res) => {
+router.put('/admin/:id/toggle', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: [promo] } = await db.query(
     `UPDATE promo_codes SET is_active=NOT is_active WHERE id=$1 RETURNING *`,
@@ -92,13 +93,13 @@ router.put('/admin/:id/toggle', authenticate, requireRole('admin'), async (req, 
   );
   if (!promo) return res.status(404).json({ error: 'Code introuvable' });
   res.json({ promo });
-});
+}));
 
 // ── DELETE /promo/admin/:id ───────────────────────────────
-router.delete('/admin/:id', authenticate, requireRole('admin'), async (req, res) => {
+router.delete('/admin/:id', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   await db.query(`DELETE FROM promo_codes WHERE id=$1`, [req.params.id]);
   res.json({ message: 'Code supprimé' });
-});
+}));
 
 module.exports = router;

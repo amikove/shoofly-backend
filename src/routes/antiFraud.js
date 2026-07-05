@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const asyncHandler = require('../middleware/asyncHandler');
 
 // ══ RÈGLES ANTI-FRAUDE ════════════════════════════════════════
 // Score de risque : 0-100. Au-delà de 70 → alerte. Au-delà de 90 → blocage auto.
@@ -257,7 +258,7 @@ const refunds = await db.query(
 }
 
 // ── GET /anti-fraud/dashboard ─────────────────────────────
-router.get('/dashboard', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/dashboard', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
 
   const [flaggedMissions, suspiciousWithdrawals, recentAlerts, stats] = await Promise.all([
@@ -309,18 +310,18 @@ router.get('/dashboard', authenticate, requireRole('admin'), async (req, res) =>
     stats: stats.rows[0],
     rules: Object.values(RULES),
   });
-});
+}));
 
 // ── POST /anti-fraud/analyze/:userId ─────────────────────
-router.post('/analyze/:userId', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/analyze/:userId', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const result = await analyzeUser(db, req.params.userId);
   res.json(result);
-});
+}));
 
 // ── POST /anti-fraud/scan-all ─────────────────────────────
 // Scan tous les utilisateurs actifs et retourne les profils à risque
-router.post('/scan-all', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/scan-all', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: users } = await db.query(`SELECT id FROM users WHERE is_active=true AND role IN ('client','oeil')`);
 
@@ -332,10 +333,10 @@ router.post('/scan-all', authenticate, requireRole('admin'), async (req, res) =>
 
   results.sort((a, b) => b.score - a.score);
   res.json({ scanned: users.length, flagged: results.filter(r => r.score >= 25).length, results });
-});
+}));
 
 // ── POST /anti-fraud/warn/:userId ────────────────────────
-router.post('/warn/:userId', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/warn/:userId', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { userId } = req.params;
   const { reason, rule_code, rule_label, mission_id } = req.body;
@@ -386,10 +387,10 @@ router.post('/warn/:userId', authenticate, requireRole('admin'), async (req, res
   }
 
   res.json({ message: 'Avertissement envoyé', user_id: userId });
-});
+}));
 
 // ── POST /anti-fraud/block/:userId ───────────────────────
-router.post('/block/:userId', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/block/:userId', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { reason } = req.body;
   await db.query('UPDATE users SET is_active=false WHERE id=$1', [req.params.userId]);
@@ -398,14 +399,14 @@ router.post('/block/:userId', authenticate, requireRole('admin'), async (req, re
     [req.params.userId, reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.']
   );
   res.json({ message: 'Compte bloqué', user_id: req.params.userId });
-});
+}));
 
 // ── POST /anti-fraud/hold-withdrawal/:id ─────────────────
-router.post('/hold-withdrawal/:id', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/hold-withdrawal/:id', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   await db.query(`UPDATE withdrawals SET status='pending', processed_by=NULL WHERE id=$1`, [req.params.id]);
   res.json({ message: 'Virement mis en attente de vérification' });
-});
+}));
 
 // ── GET /anti-fraud/rules ─────────────────────────────────
 router.get('/rules', authenticate, requireRole('admin'), (req, res) => {

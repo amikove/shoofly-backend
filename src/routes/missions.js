@@ -4,6 +4,7 @@ const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { logReliabilityEvent } = require('../utils/reliabilityScore');
+const asyncHandler = require('../middleware/asyncHandler');
 
 
 async function getCommissionRate(db) {
@@ -34,7 +35,7 @@ async function logStatus(db, missionId, status, userId, note = null) {
 
 
 // ── POST /missions/:id/validate ────────────────────────────
-router.post('/:id/validate', authenticate, requireRole('client'), async (req, res) => {
+router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
 
@@ -64,11 +65,11 @@ await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé 
   await logStatus(db, mission.id, 'validated', req.user.id, 'Validée par le client');
 
   res.json({ ok: true });
-});
+}));
 
 
 // ── POST /missions/:id/claim ────────────────────────────────
-router.post('/:id/claim', authenticate, async (req, res) => {
+router.post('/:id/claim', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { comment } = req.body;
   if (!comment?.trim()) return res.status(400).json({ error: 'Commentaire obligatoire' });
@@ -96,10 +97,10 @@ router.post('/:id/claim', authenticate, async (req, res) => {
   }
 
   res.json({ ok: true });
-});
+}));
 
 // ── PUT /missions/:id/resolve-claim ────────────────────────
-router.put('/:id/resolve-claim', authenticate, async (req, res) => {
+router.put('/:id/resolve-claim', authenticate, asyncHandler(async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Accès refusé' });
   const db = getDb();
   const { decision } = req.body; // 'oeil' ou 'client'
@@ -129,10 +130,10 @@ router.put('/:id/resolve-claim', authenticate, async (req, res) => {
   }
 
   res.json({ ok: true });
-});
+}));
 
 // ── GET /missions/:id/history ──────────────────────────────
-router.get('/:id/history', authenticate, async (req, res) => {
+router.get('/:id/history', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
@@ -146,10 +147,10 @@ router.get('/:id/history', authenticate, async (req, res) => {
     ORDER BY h.created_at ASC
   `, [req.params.id]);
   res.json({ history: rows });
-});
+}));
 
 // ── GET /missions/inbox ─────────────────────────────────────
-router.get('/inbox', authenticate, async (req, res) => {
+router.get('/inbox', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const userId = req.user.id;
 
@@ -183,11 +184,11 @@ router.get('/inbox', authenticate, async (req, res) => {
   `, [userId]);
 
   res.json({ inbox: rows });
-});
+}));
 
 
 // ── POST /missions/:id/seen ─────────────────────────────────
-router.post('/:id/seen', authenticate, async (req, res) => {
+router.post('/:id/seen', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   await db.query(`
     INSERT INTO mission_chat_seen (user_id, mission_id, seen_at)
@@ -195,11 +196,11 @@ router.post('/:id/seen', authenticate, async (req, res) => {
     ON CONFLICT (user_id, mission_id) DO UPDATE SET seen_at = NOW()
   `, [req.user.id, req.params.id]);
   res.json({ ok: true });
-});
+}));
 
 
 // ── GET /missions ──────────────────────────────────────────
-router.get('/', authenticate, async (req, res) => {
+router.get('/', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { status, type, mode, page = 1, limit = 20, sort = 'created_desc' } = req.query;
   const offset = (page - 1) * limit;
@@ -279,7 +280,7 @@ router.get('/', authenticate, async (req, res) => {
   const { rows: [{ n: total }] } = await db.query(`SELECT COUNT(*)::int AS n FROM missions m ${wc}`, params);
 
   res.json({ missions, total, page: +page, pages: Math.ceil(total / limit) });
-});
+}));
 
 // ── POST /missions ─────────────────────────────────────────
 router.post('/', authenticate, requireRole('client'), [
@@ -289,7 +290,7 @@ router.post('/', authenticate, requireRole('client'), [
   body('city').trim().notEmpty(),
   body('scheduled_at').isISO8601(),
   body('price').isFloat({ min: 0 }),
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -367,7 +368,7 @@ await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
   io.to('room:admin').emit('new_mission', mission);
 
   res.status(201).json({ mission });
-});
+}));
 
 
 
@@ -375,7 +376,7 @@ await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
 
 // ── GET /missions/my-reports — le rapporteur consulte l'historique de ses signalements ──
 // IMPORTANT : cette route doit rester déclarée AVANT /:id, sinon Express interprète "my-reports" comme un id de mission
-router.get('/my-reports', authenticate, async (req, res) => {
+router.get('/my-reports', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT r.*,
@@ -387,10 +388,10 @@ router.get('/my-reports', authenticate, async (req, res) => {
   `, [req.user.id]);
 
   res.json({ reports: rows });
-});
+}));
 
 // ── GET /missions/:id ──────────────────────────────────
-router.get('/:id', authenticate, async (req, res) => {
+router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: [mission] } = await db.query(`
     SELECT m.*,
@@ -421,13 +422,13 @@ router.get('/:id', authenticate, async (req, res) => {
   await db.query(`UPDATE mission_messages SET is_read=true WHERE mission_id=$1 AND sender_id!=$2`, [req.params.id, req.user.id]);
 
   res.json({ mission, media, messages, report: report||null, rating: rating||null });
-});
+}));
 
 // ── POST /missions/:id/accept ──────────────────────────────
 
 
 
-router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) => {
+router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
@@ -468,12 +469,12 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), async (req, res) =
   io.to('room:admin').emit('mission_updated', updated);
 
   res.json({ mission: updated });
-});
+}));
 
 
 
 // ── GET /:id/interests ── Liste des Œils intéressés ────────
-router.get('/:id/interests', authenticate, async (req, res) => {
+router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
 
   const { rows: [mission] } = await db.query(
@@ -499,12 +500,12 @@ router.get('/:id/interests', authenticate, async (req, res) => {
     );
 
     res.json({ interests: rows });
-  });
+  }));
 
 
 
 // ── POST /missions/:id/refuse ──────────────────────────────
-router.post('/:id/refuse', authenticate, requireRole('oeil'), async (req, res) => {
+router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { ignore } = req.body;
   try {
@@ -531,7 +532,7 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), async (req, res) =
     console.error(err);
     res.status(500).json({ error: err.message });
   }
-});
+}));
 
 
 
@@ -539,7 +540,7 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), async (req, res) =
 // ── POST /missions/:id/status ──────────────────────────────
 router.post('/:id/status', authenticate, [
   body('status').isIn(['en_route','active','completed','cancelled']),
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -652,13 +653,13 @@ const { status, cancel_reason } = req.body;
   io.to('room:admin').emit('mission_updated', updated);
 
   res.json({ mission: updated });
-});
+}));
 
 // ── POST /missions/:id/location ────────────────────────────
 router.post('/:id/location', authenticate, requireRole('oeil'), [
   body('lat').isFloat({ min: -90, max: 90 }),
   body('lng').isFloat({ min: -180, max: 180 }),
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -671,13 +672,13 @@ router.post('/:id/location', authenticate, requireRole('oeil'), [
   // Also broadcast via socket
   req.app.get('io').to(`mission:${req.params.id}`).emit('location_update', { lat, lng, timestamp: new Date() });
   res.json({ lat, lng });
-});
+}));
 
 // ── POST /missions/:id/report ──────────────────────────────
 router.post('/:id/report', authenticate, requireRole('oeil','admin'), [
   body('summary').trim().isLength({ min: 10 }),
   body('score').isInt({ min: 0, max: 100 }),
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -699,11 +700,11 @@ router.post('/:id/report', authenticate, requireRole('oeil','admin'), [
   await notify(db, mission.client_id, '📄 Rapport disponible', `Le rapport de "${mission.title}" est prêt.`, 'report', mission.id, emitToUser);
 
   res.status(201).json({ report });
-});
+}));
 
 
 // ── POST /:id/messages ─────────────────────────────────
-router.post('/:id/messages', authenticate, async (req, res) => {
+router.post('/:id/messages', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { content } = req.body;
   if (!content?.trim()) return res.status(400).json({ error: 'Message vide' });
@@ -807,11 +808,11 @@ if (isFlagged) {
     }
   }
   res.status(201).json({ message: msg });
-});
+}));
 
 router.post('/:id/rate', authenticate, requireRole('client'), [
   body('score').isInt({ min: 1, max: 5 }),
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -848,11 +849,11 @@ await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${
   await logReliabilityEvent(db, mission.oeil_id, mission.id, points, reason, score <= 2);
 
   res.status(201).json({ rating_avg: avg.a, rating_count: avg.c });
-});
+}));
 
 // ── POST /:id/interest ── Œil exprime son intérêt ─────────
 
-router.post('/:id/interest', authenticate, requireRole('oeil'), async (req, res) => {
+router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { message } = req.body;
 
@@ -885,13 +886,13 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), async (req, res)
   await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser);
 
   res.status(201).json({ ok: true });
-});
+}));
 
 
 
 
 // ── POST /missions/:id/transfer ── Œil signale empêchement ──
-router.post('/:id/transfer', authenticate, requireRole('oeil'), async (req, res) => {
+router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
@@ -962,10 +963,10 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), async (req, res)
   io.to('room:admin').emit('mission_updated', { id: mission.id, is_priority: true });
 
   res.json({ ok: true, transfer_type: transferType, deadline });
-});
+}));
 
 // ── POST /missions/:id/assign-admin ── Admin affecte manuellement ──
-router.post('/:id/assign-admin', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
@@ -1018,7 +1019,7 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), async (req,
   io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'assigned' });
 
   res.json({ ok: true });
-});
+}));
 
 // ── Cron : vérifier deadlines transfert expirées ──────────
 // (appelé depuis index.js via cron)
@@ -1091,7 +1092,7 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
 
 
 // ── POST /:id/hire/:oeilId ── Client choisit un Œil ───────
-router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req, res) => {
+router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
@@ -1173,11 +1174,11 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), async (req
   if (io) io.to('room:admin').emit('mission_assigned', updated);
 
   res.json({ mission: updated });
-});
+}));
 
 
 // ── POST /missions/:id/report-problem ── Signaler un problème ──
-router.post('/:id/report-problem', authenticate, async (req, res) => {
+router.post('/:id/report-problem', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
@@ -1254,10 +1255,10 @@ router.post('/:id/report-problem', authenticate, async (req, res) => {
   io.to('room:admin').emit('mission_problem_reported', { missionId: mission.id, type, reporterRole });
 
   res.status(201).json({ report });
-});
+}));
 
 // ── GET /missions/admin/problems — admin liste les tickets ──
-router.get('/admin/problems', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/problems', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
       const db = getDb();
       const { status = 'open', page = 1, limit = 20, type, city, reporter_role, sort } = req.query;
       const offset = (page - 1) * limit;
@@ -1300,10 +1301,10 @@ router.get('/admin/problems', authenticate, requireRole('admin'), async (req, re
       `, [status]);
 
       res.json({ reports: rows, total, page: +page, pages: Math.ceil(total / limit), availableCities: cities.map(c => c.city) });
-  });
+  }));
 
 // ── PUT /missions/admin/problems/:id — admin traite un ticket ──
-router.put('/admin/problems/:id', authenticate, requireRole('admin'), async (req, res) => {
+router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
     const db = getDb();
     const { status, admin_note } = req.body;
     const { rows: [report] } = await db.query(
@@ -1339,7 +1340,7 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), async (req
     }
 
   res.json({ report });
-});
+}));
 
 
 router.checkTransferDeadlines = checkTransferDeadlines;

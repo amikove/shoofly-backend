@@ -5,6 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate } = require('../middleware/auth');
+const asyncHandler = require('../middleware/asyncHandler');
 
 const makeToken = (user) => jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
 const safe = ({ password, ...u }) => u;
@@ -15,7 +16,7 @@ router.post('/register', [
   body('first_name').trim().notEmpty(),
   body('last_name').trim().notEmpty(),
   body('role').isIn(['client','oeil']),
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -46,12 +47,12 @@ router.post('/register', [
   ]);
 
   res.status(201).json({ token: makeToken(user), user: safe(user) });
-});
+}));
 
 router.post('/login', [
       body('email').isEmail().normalizeEmail(),
       body('password').notEmpty(),
-    ], async (req, res) => {
+    ], asyncHandler(async (req, res) => {
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -78,9 +79,9 @@ router.post('/login', [
         })
       }
       res.json({ token: makeToken(user), user: safe(user), profile });
-    });
+    }));
 
-router.get('/me', authenticate, async (req, res) => {
+router.get('/me', authenticate, asyncHandler(async (req, res) => {
       const db = getDb();
       const { rows: [user] } = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
       if (!user) return res.status(404).json({ error: 'Introuvable' });
@@ -107,9 +108,9 @@ router.get('/me', authenticate, async (req, res) => {
         res.json({ user: safe(user), profile });
 
 
-    });
+    }));
 
-router.put('/me', authenticate, async (req, res) => {
+router.put('/me', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { first_name, last_name, phone, city, bio, coverage_zone, disponibilites } = req.body;
   const { rows: [user] } = await db.query(
@@ -138,15 +139,15 @@ router.put('/me', authenticate, async (req, res) => {
   res.json({ user: safe(user) });
 
 
-  });
+  }));
 
-router.put('/password', authenticate, async (req, res) => {
+router.put('/password', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: [user] } = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
   if (!bcrypt.compareSync(req.body.current_password, user.password))
     return res.status(400).json({ error: 'Mot de passe actuel incorrect' });
   await db.query('UPDATE users SET password=$1 WHERE id=$2', [bcrypt.hashSync(req.body.new_password, 10), req.user.id]);
   res.json({ message: 'Mot de passe modifié' });
-});
+}));
 
 module.exports = router;

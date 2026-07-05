@@ -2,9 +2,10 @@ const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { getReliabilityLevel } = require('../utils/reliabilityScore');
+const asyncHandler = require('../middleware/asyncHandler');
 
 // ── GET /reliability/me — Œil consulte son propre score ───
-router.get('/me', authenticate, requireRole('oeil'), async (req, res) => {
+router.get('/me', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: [user] } = await db.query(
     `SELECT reliability_score, is_suspended, suspended_at, suspended_reason FROM users WHERE id=$1`,
@@ -34,10 +35,10 @@ router.get('/me', authenticate, requireRole('oeil'), async (req, res) => {
     events,
     review_requests: reviewRequests,
   });
-});
+}));
 
 // ── POST /reliability/review-request — demander un examen ─
-router.post('/review-request', authenticate, requireRole('oeil'), async (req, res) => {
+router.post('/review-request', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { message } = req.body;
 
@@ -66,10 +67,10 @@ router.post('/review-request', authenticate, requireRole('oeil'), async (req, re
   }
 
   res.status(201).json({ request });
-});
+}));
 
 // ── GET /reliability/admin/requests — liste admin ─────────
-router.get('/admin/requests', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/requests', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { status = 'pending' } = req.query;
 
@@ -82,10 +83,10 @@ router.get('/admin/requests', authenticate, requireRole('admin'), async (req, re
   `, [status]);
 
   res.json({ requests: rows });
-});
+}));
 
 // ── GET /reliability/admin/:oeilId/history — historique complet ──
-router.get('/admin/:oeilId/history', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/:oeilId/history', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: events } = await db.query(
     `SELECT e.*,
@@ -104,10 +105,10 @@ router.get('/admin/:oeilId/history', authenticate, requireRole('admin'), async (
     [req.params.oeilId]
   );
   res.json({ events });
-});
+}));
 
 // ── POST /reliability/admin/requests/:id/decide ───────────
-router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { decision, response, reset_score } = req.body; // decision: 'approved' | 'rejected'
 
@@ -138,10 +139,10 @@ router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), as
   }
 
   res.json({ request });
-});
+}));
 
 // ── GET /reliability/admin/suspended — Œils actuellement suspendus ──
-router.get('/admin/suspended', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/suspended', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT id, first_name, last_name, email, city, quartier,
@@ -151,10 +152,10 @@ router.get('/admin/suspended', authenticate, requireRole('admin'), async (req, r
     ORDER BY suspended_at DESC
   `);
   res.json({ oeils: rows });
-});
+}));
 
 // ── GET /reliability/admin/all-scores — tous les Œils avec leur score, triable + paginé ──
-router.get('/admin/all-scores', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/all-scores', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { city, quartier, page = 1, limit = 20, sort = 'score_asc' } = req.query;
   const offset = (page - 1) * limit;
@@ -187,10 +188,10 @@ router.get('/admin/all-scores', authenticate, requireRole('admin'), async (req, 
   );
 
   res.json({ oeils, total, page: +page, pages: Math.ceil(total / limit) });
-});
+}));
 
 // ── POST /reliability/admin/:oeilId/reactivate — réactivation directe (sans demande d'examen) ──
-router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { reset_score } = req.body;
   const newScore = reset_score || 70;
@@ -209,6 +210,6 @@ router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), asy
   );
 
   res.json({ ok: true, oeil });
-});
+}));
 
 module.exports = router;

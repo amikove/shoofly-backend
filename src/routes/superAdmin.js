@@ -3,19 +3,20 @@ const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/schema');
 const { authenticate } = require('../middleware/auth');
 const { requireSuperAdmin, ALL_PERMISSIONS, PROFILES } = require('../middleware/permissions');
+const asyncHandler = require('../middleware/asyncHandler');
 
 // ── GET /super-admin/admins — liste des admins ────────────
-router.get('/admins', authenticate, requireSuperAdmin, async (req, res) => {
+router.get('/admins', authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(
     `SELECT id, first_name, last_name, email, phone, is_active, is_super_admin, permissions, created_at
      FROM users WHERE role='admin' ORDER BY created_at DESC`
   );
   res.json({ admins: rows });
-});
+}));
 
 // ── POST /super-admin/admins — créer un admin ─────────────
-router.post('/admins', authenticate, requireSuperAdmin, async (req, res) => {
+router.post('/admins', authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
   const db = getDb();
   const { first_name, last_name, email, password, phone, profile, permissions } = req.body;
 
@@ -44,10 +45,10 @@ router.post('/admins', authenticate, requireSuperAdmin, async (req, res) => {
   );
 
   res.status(201).json({ admin });
-});
+}));
 
 // ── PUT /super-admin/admins/:id — modifier permissions ────
-router.put('/admins/:id', authenticate, requireSuperAdmin, async (req, res) => {
+router.put('/admins/:id', authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
   const db = getDb();
   const { profile, permissions, is_active } = req.body;
 
@@ -69,14 +70,14 @@ router.put('/admins/:id', authenticate, requireSuperAdmin, async (req, res) => {
 
   if (!admin) return res.status(404).json({ error: 'Admin introuvable' });
   res.json({ admin });
-});
+}));
 
 // ── DELETE /super-admin/admins/:id — supprimer un admin ───
-router.delete('/admins/:id', authenticate, requireSuperAdmin, async (req, res) => {
+router.delete('/admins/:id', authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
   const db = getDb();
   await db.query(`DELETE FROM users WHERE id=$1 AND role='admin' AND is_super_admin=false`, [req.params.id]);
   res.json({ message: 'Admin supprimé' });
-});
+}));
 
 // ── GET /super-admin/permissions — liste des permissions ──
 router.get('/permissions', authenticate, requireSuperAdmin, (req, res) => {
@@ -85,7 +86,7 @@ router.get('/permissions', authenticate, requireSuperAdmin, (req, res) => {
 
 
 // ── POST /super-admin/test-reliability/:oeilId — TEST UNIQUEMENT ──
-router.post('/test-reliability/:oeilId', authenticate, requireSuperAdmin, async (req, res) => {
+router.post('/test-reliability/:oeilId', authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
   const db = getDb();
   const { logReliabilityEvent } = require('../utils/reliabilityScore');
   const oeilId = req.params.oeilId;
@@ -119,6 +120,6 @@ router.post('/test-reliability/:oeilId', authenticate, requireSuperAdmin, async 
     is_suspended: updated.is_suspended,
     events_created: scenarios.length,
   });
-});
+}));
 
 module.exports = router;

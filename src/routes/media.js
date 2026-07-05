@@ -4,6 +4,7 @@ const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const asyncHandler = require('../middleware/asyncHandler');
 
 // ── Config Cloudinary ─────────────────────────────────────
 cloudinary.config({
@@ -34,7 +35,7 @@ fileFilter: (req, file, cb) => {
 });
 
 // ── POST /api/media/:missionId ────────────────────────────
-router.post('/:missionId', authenticate, upload.array('files', 10), async (req, res) => {
+router.post('/:missionId', authenticate, upload.array('files', 10), asyncHandler(async (req, res) => {
   const db = getDb();
 
   const { rows: [mission] } = await db.query(
@@ -87,10 +88,10 @@ router.post('/:missionId', authenticate, upload.array('files', 10), async (req, 
   }
 
   res.status(201).json({ media: inserted, count: inserted.length });
-});
+}));
 
 // ── GET /api/media/:missionId ─────────────────────────────
-router.get('/:missionId', authenticate, async (req, res) => {
+router.get('/:missionId', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
 
   const { rows: [mission] } = await db.query(
@@ -111,6 +112,6 @@ router.get('/:missionId', authenticate, async (req, res) => {
   );
 
   res.json({ media: rows });
-});
+}));
 
 module.exports = router;

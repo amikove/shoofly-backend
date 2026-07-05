@@ -1,9 +1,10 @@
 const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const asyncHandler = require('../middleware/asyncHandler');
 
 // ── GET /api/reports/:missionId ───────────────────────────
-router.get('/:missionId', authenticate, async (req, res) => {
+router.get('/:missionId', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
 
   const { rows: [mission] } = await db.query(
@@ -21,10 +22,10 @@ router.get('/:missionId', authenticate, async (req, res) => {
   );
 
   res.json({ report: report || null });
-});
+}));
 
 // ── POST /api/reports/:missionId ──────────────────────────
-router.post('/:missionId', authenticate, requireRole('oeil'), async (req, res) => {
+router.post('/:missionId', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { data, submitted } = req.body;
 
@@ -62,7 +63,7 @@ router.post('/:missionId', authenticate, requireRole('oeil'), async (req, res) =
   }
 
   res.json({ report });
-});
+}));
 
 // ── Calcul du score ───────────────────────────────────────
 function calculateScore(data) {

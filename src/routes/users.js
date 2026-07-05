@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
+const asyncHandler = require('../middleware/asyncHandler');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
@@ -72,7 +73,7 @@ function isWithinSchedule(disponibilites) {
 
 
 // ── Oeils publics ──────────────────────────────────────────
-router.get('/oeils', authenticate, async (req, res) => {
+router.get('/oeils', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { city, available, search } = req.query;
   let where = ["u.role='oeil'", "p.is_verified=true"], params = [], p = 1;
@@ -91,9 +92,9 @@ FROM users u JOIN oeil_profiles p ON p.user_id=u.id
   is_available: o.is_available && isWithinSchedule(o.disponibilites)
 }))
 res.json({ oeils });
-});
+}));
 
-router.get('/oeils/:id', authenticate, async (req, res) => {
+router.get('/oeils/:id', authenticate, asyncHandler(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store')
   const db = getDb();
   const { rows: [oeil] } = await db.query(`
@@ -106,17 +107,17 @@ router.get('/oeils/:id', authenticate, async (req, res) => {
     FROM ratings r JOIN users c ON c.id=r.client_id WHERE r.oeil_id=$1 ORDER BY r.created_at DESC LIMIT 10
   `, [req.params.id]);
   res.json({ oeil, reviews });
-});
+}));
 
 // ── Notifications ──────────────────────────────────────────
-router.get('/notifications', authenticate, async (req, res) => {
+router.get('/notifications', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50`, [req.user.id]);
   const { rows: [{ n }] } = await db.query(`SELECT COUNT(*)::int AS n FROM notifications WHERE user_id=$1 AND is_read=false`, [req.user.id]);
   res.json({ notifications: rows, unread: n });
-});
+}));
 
-router.put('/notifications/read', authenticate, async (req, res) => {
+router.put('/notifications/read', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { ids } = req.body;
   if (ids?.length) {
@@ -125,16 +126,16 @@ router.put('/notifications/read', authenticate, async (req, res) => {
     await db.query(`UPDATE notifications SET is_read=true WHERE user_id=$1`, [req.user.id]);
   }
   res.json({ message: 'Lu' });
-});
+}));
 
 // ── Oeil: disponibilités ───────────────────────────────────
-router.get('/oeil/availability', authenticate, requireRole('oeil'), async (req, res) => {
+router.get('/oeil/availability', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query('SELECT * FROM oeil_availability WHERE user_id=$1 ORDER BY day_of_week', [req.user.id]);
   res.json({ availability: rows });
-});
+}));
 
-router.put('/oeil/availability', authenticate, requireRole('oeil'), async (req, res) => {
+router.put('/oeil/availability', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { slots } = req.body;
   if (!Array.isArray(slots)) return res.status(400).json({ error: 'slots requis' });
@@ -144,17 +145,17 @@ router.put('/oeil/availability', authenticate, requireRole('oeil'), async (req, 
       [req.user.id, s.day_of_week, s.start_time, s.end_time, s.is_active !== false]);
   }
   res.json({ message: 'Disponibilités mises à jour' });
-});
+}));
 
-router.put('/oeil/toggle-available', authenticate, requireRole('oeil'), async (req, res) => {
+router.put('/oeil/toggle-available', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: [p] } = await db.query('SELECT is_available FROM oeil_profiles WHERE user_id=$1', [req.user.id]);
   const { rows: [u] } = await db.query('UPDATE oeil_profiles SET is_available=$1 WHERE user_id=$2 RETURNING is_available', [!p.is_available, req.user.id]);
   res.json({ is_available: u.is_available });
-});
+}));
 
 // ── Favoris ────────────────────────────────────────────────
-router.get('/favorites', authenticate, requireRole('client'), async (req, res) => {
+router.get('/favorites', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT u.id,u.first_name,u.last_name,u.city,p.rating_avg,p.total_missions,p.is_available
@@ -162,22 +163,22 @@ router.get('/favorites', authenticate, requireRole('client'), async (req, res) =
     WHERE f.client_id=$1 ORDER BY f.created_at DESC
   `, [req.user.id]);
   res.json({ favorites: rows });
-});
+}));
 
-router.post('/favorites/:oeilId', authenticate, requireRole('client'), async (req, res) => {
+router.post('/favorites/:oeilId', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
   await db.query('INSERT INTO favorites (client_id,oeil_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, req.params.oeilId]);
   res.status(201).json({ message: 'Ajouté aux favoris' });
-});
+}));
 
-router.delete('/favorites/:oeilId', authenticate, requireRole('client'), async (req, res) => {
+router.delete('/favorites/:oeilId', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
   await db.query('DELETE FROM favorites WHERE client_id=$1 AND oeil_id=$2', [req.user.id, req.params.oeilId]);
   res.json({ message: 'Retiré des favoris' });
-});
+}));
 
 // ── Oeil: virement ─────────────────────────────────────────
-router.post('/oeil/withdraw', authenticate, requireRole('oeil'), async (req, res) => {
+router.post('/oeil/withdraw', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { amount, bank_info } = req.body;
   if (!amount || amount < 100) return res.status(400).json({ error: 'Minimum 100 MAD' });
@@ -186,10 +187,10 @@ router.post('/oeil/withdraw', authenticate, requireRole('oeil'), async (req, res
   await db.query('UPDATE oeil_profiles SET balance=balance-$1 WHERE user_id=$2', [amount, req.user.id]);
   await db.query('INSERT INTO withdrawals (oeil_id,amount,bank_info) VALUES ($1,$2,$3)', [req.user.id, amount, JSON.stringify(bank_info)]);
   res.status(201).json({ message: `Virement de ${amount} MAD soumis. Traitement sous 48h.` });
-});
+}));
 
 // ══ ADMIN ══════════════════════════════════════════════════
-router.get('/admin/all', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/all', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { role, is_active } = req.query;
   let where = [], params = [], p = 1;
@@ -203,10 +204,10 @@ router.get('/admin/all', authenticate, requireRole('admin'), async (req, res) =>
       ORDER BY u.created_at DESC
     `, params);
     res.json({ users: rows });
-  });
+  }));
 
 // ── Client : stats dashboard ────────────────────────────────
-router.get('/client/stats', authenticate, requireRole('client'), async (req, res) => {
+router.get('/client/stats', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
   const userId = req.user.id;
   const { rows: [stats] } = await db.query(`
@@ -226,11 +227,11 @@ router.get('/client/stats', authenticate, requireRole('client'), async (req, res
   );
 
   res.json({ ...stats, wallet_balance: wallet?.balance || 0 });
-});
+}));
 
 
 // ── GET /users/admin/dashboard/executif — KPIs exécutifs avec période + comparaison optionnelle ──
-router.get('/admin/dashboard/executif', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/executif', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
 
@@ -295,10 +296,10 @@ router.get('/admin/dashboard/executif', authenticate, requireRole('admin'), requ
   }
 
   res.json({ current, comparison, daily_series: dailySeries });
-});
+}));
 
 // ── GET /users/admin/dashboard/alertes — état instantané + comparaison période ──
-router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
 
@@ -344,10 +345,10 @@ router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requi
   const comparison = await computePeriodAlertStats(compare_from, compare_to);
 
   res.json({ instant, current, comparison });
-});
+}));
 
 // ── GET /users/admin/dashboard/services — stats par type de mission ──
-router.get('/admin/dashboard/services', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/services', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
 
@@ -381,10 +382,10 @@ router.get('/admin/dashboard/services', authenticate, requireRole('admin'), requ
   }
 
   res.json({ current, comparison });
-});
+}));
 
 // ── GET /users/admin/dashboard/funnel — entonnoir de conversion client ──
-router.get('/admin/dashboard/funnel', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/funnel', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to } = req.query;
 
@@ -444,10 +445,10 @@ router.get('/admin/dashboard/funnel', authenticate, requireRole('admin'), requir
   ];
 
   res.json({ steps });
-});
+}));
 
 // ── GET /users/admin/dashboard/geo — stats par ville ──
-router.get('/admin/dashboard/geo', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/geo', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
 
@@ -478,10 +479,10 @@ router.get('/admin/dashboard/geo', authenticate, requireRole('admin'), requirePe
   }
 
   res.json({ current, comparison });
-});
+}));
 
 // ── GET /users/admin/dashboard/oeils — KPIs, classement, alertes Œils ──
-router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
 
@@ -597,10 +598,10 @@ router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), require
       motivation: segByMotivation,
     },
   });
-});
+}));
 
 // ── GET /users/admin/dashboard/clients — KPIs et top clients ──
-router.get('/admin/dashboard/clients', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/clients', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
 
@@ -669,10 +670,10 @@ router.get('/admin/dashboard/clients', authenticate, requireRole('admin'), requi
   `, [date_from, date_to]);
 
   res.json({ kpis, kpisCompare, topClients, segmentation });
-});
+}));
 
 // ── GET /users/admin/dashboard/fileattente — stats file d'attente ──
-router.get('/admin/dashboard/fileattente', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/fileattente', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
 
@@ -726,10 +727,10 @@ router.get('/admin/dashboard/fileattente', authenticate, requireRole('admin'), r
     .slice(0, 10);
 
   res.json({ kpis, kpisCompare, topOrganismes });
-});
+}));
 
 // ── POST /users/admin/expenses — ajouter une dépense manuelle ──
-router.post('/admin/expenses', authenticate, requireRole('admin'), requirePermission('finance'), async (req, res) => {
+router.post('/admin/expenses', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { amount, category, description, expense_date } = req.body;
 
@@ -744,10 +745,10 @@ router.post('/admin/expenses', authenticate, requireRole('admin'), requirePermis
   );
 
   res.status(201).json({ expense });
-});
+}));
 
 // ── GET /users/admin/expenses — lister les dépenses sur une période ──
-router.get('/admin/expenses', authenticate, requireRole('admin'), requirePermission('finance'), async (req, res) => {
+router.get('/admin/expenses', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to } = req.query;
 
@@ -760,18 +761,18 @@ router.get('/admin/expenses', authenticate, requireRole('admin'), requirePermiss
   `, [date_from, date_to]);
 
   res.json({ expenses: rows });
-});
+}));
 
 // ── DELETE /users/admin/expenses/:id — supprimer une dépense ──
-router.delete('/admin/expenses/:id', authenticate, requireRole('admin'), requirePermission('finance'), async (req, res) => {
+router.delete('/admin/expenses/:id', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   await db.query(`DELETE FROM expenses WHERE id=$1`, [req.params.id]);
   res.json({ ok: true });
-});
+}));
 
 // ── GET /users/admin/dashboard/financier — vue financière globale ──
 // ── GET /users/admin/dashboard/campagnes — performance par campagne d'acquisition ──
-router.get('/admin/dashboard/campagnes', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/campagnes', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to } = req.query;
 
@@ -795,9 +796,9 @@ router.get('/admin/dashboard/campagnes', authenticate, requireRole('admin'), req
   `, [date_from, date_to]);
 
   res.json({ campaigns: rows });
-});
+}));
 
-router.get('/admin/dashboard/financier', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/dashboard/financier', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
 
@@ -876,9 +877,9 @@ router.get('/admin/dashboard/financier', authenticate, requireRole('admin'), req
   }
 
   res.json({ current, comparison });
-});
+}));
 
-router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
     db.query(`SELECT
@@ -909,34 +910,34 @@ router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission
     missions_by_status: byStatus.rows,
     top_oeils: topOeils.rows,
   });
-});
+}));
 
-router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), async (req, res) => {
+router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   await db.query(`UPDATE oeil_profiles SET is_verified=true, id_verified_at=NOW() WHERE user_id=$1`, [req.params.id]);
   const notif = await db.query(`INSERT INTO notifications (user_id,title,body,type) VALUES ($1,'✅ Profil vérifié !','Vous pouvez maintenant accepter des missions.','info') RETURNING *`, [req.params.id]);
   if (emitToUser) emitToUser(req.params.id, 'notification', notif.rows[0]);
   res.json({ message: 'Œil vérifié' });
-});
+}));
 
-router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), async (req, res) => {
+router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: [u] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 RETURNING is_active`, [req.params.id]);
   if (!u) return res.status(404).json({ error: 'Introuvable' });
   res.json({ is_active: u.is_active });
-});
+}));
 
 // ── Admin : paramètres ─────────────────────────────────────
-router.get('/admin/settings', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/settings', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query('SELECT * FROM settings');
   const settings = {}
   rows.forEach(r => settings[r.key] = r.value)
   res.json({ settings })
-})
+}))
 
-router.put('/admin/settings', authenticate, requireRole('admin'), async (req, res) => {
+router.put('/admin/settings', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { commission, min_price, urgency_fee, accept_delay } = req.body
   const updates = { commission, min_price, urgency_fee, accept_delay }
@@ -949,10 +950,10 @@ router.put('/admin/settings', authenticate, requireRole('admin'), async (req, re
     }
   }
   res.json({ ok: true })
-})
+}))
 
 // ── Admin : messages suspects ───────────────────────────────
-router.get('/admin/flagged-messages', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/flagged-messages', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT mm.id, mm.content, mm.created_at, mm.mission_id,
@@ -966,10 +967,10 @@ router.get('/admin/flagged-messages', authenticate, requireRole('admin'), async 
     LIMIT 50
   `);
   res.json({ messages: rows });
-});
+}));
 
 // ── Admin : réclamations ────────────────────────────────────
-router.get('/admin/claims', authenticate, requireRole('admin'), requirePermission('claims'), async (req, res) => {
+router.get('/admin/claims', authenticate, requireRole('admin'), requirePermission('claims'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT cl.*, 
@@ -984,10 +985,10 @@ router.get('/admin/claims', authenticate, requireRole('admin'), requirePermissio
     ORDER BY cl.created_at ASC
   `);
   res.json({ claims: rows });
-});
+}));
 
 // ── Admin : résoudre une réclamation ───────────────────────
-router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'), async (req, res) => {
+router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { decision } = req.body;
   if (!['oeil','client'].includes(decision)) return res.status(400).json({ error: 'Décision invalide' });
@@ -1021,19 +1022,19 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   }
 
   res.json({ ok: true });
-});
+}));
 
 
-router.get('/admin/withdrawals', authenticate, requireRole('admin'), requirePermission('finance'), async (req, res) => {
+router.get('/admin/withdrawals', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT w.*, u.first_name||' '||u.last_name AS oeil_name, u.phone AS oeil_phone
     FROM withdrawals w JOIN users u ON u.id=w.oeil_id ORDER BY w.created_at DESC
   `);
   res.json({ withdrawals: rows });
-});
+}));
 
-router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), async (req, res) => {
+router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   const { status } = req.body;
@@ -1051,7 +1052,7 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), async (
     if (emitToUser) emitToUser(w.oeil_id, 'notification', n.rows[0]);
   }
   res.json({ message: `Virement ${status}` });
-});
+}));
 
 
 // ── POST /users/oeil/identity — upload documents identité ──
@@ -1059,7 +1060,7 @@ router.post('/oeil/identity', authenticate, requireRole('oeil'), uploadIdentity.
   { name: 'cin_recto', maxCount: 1 },
   { name: 'cin_verso', maxCount: 1 },
   { name: 'selfie',    maxCount: 1 },
-]), async (req, res) => {
+]), asyncHandler(async (req, res) => {
   const db = getDb();
   const cin_recto = req.files?.cin_recto?.[0]?.path;
   const cin_verso = req.files?.cin_verso?.[0]?.path;
@@ -1091,10 +1092,10 @@ router.post('/oeil/identity', authenticate, requireRole('oeil'), uploadIdentity.
   );
 
   res.json({ message: 'Documents soumis avec succès', document: doc });
-});
+}));
 
 // ── GET /users/admin/identity-requests — liste demandes en attente ──
-router.get('/admin/identity-requests', authenticate, requireRole('admin'), requirePermission('identity'), async (req, res) => {
+router.get('/admin/identity-requests', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { status = 'pending' } = req.query;
 
@@ -1106,10 +1107,10 @@ router.get('/admin/identity-requests', authenticate, requireRole('admin'), requi
       ORDER BY d.created_at ASC
     `, [status]);
     res.json({ requests: rows });
-  });
+  }));
 
 // ── POST /users/admin/identity-requests/:id/approve ──
-router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
 
   const { rows: [doc] } = await db.query(
@@ -1137,10 +1138,10 @@ router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('a
   );
 
   res.json({ message: 'Identité approuvée', user_id: doc.user_id });
-});
+}));
 
 // ── POST /users/admin/identity-requests/:id/reject ──
-router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { reason } = req.body;
 
@@ -1165,11 +1166,11 @@ router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('ad
   );
 
   res.json({ message: 'Identité rejetée', user_id: doc.user_id });
-});
+}));
 
 // ── GET /users/oeil/earnings — l'Œil consulte son historique de gains ──
 // ── POST /users/avatar — upload/changement de photo de profil (Œil et client) ──
-router.post('/avatar', authenticate, uploadAvatar.single('avatar'), async (req, res) => {
+router.post('/avatar', authenticate, uploadAvatar.single('avatar'), asyncHandler(async (req, res) => {
   const db = getDb();
   const avatarUrl = req.file?.path;
   if (!avatarUrl) {
@@ -1182,9 +1183,9 @@ router.post('/avatar', authenticate, uploadAvatar.single('avatar'), async (req, 
   );
 
   res.json({ ok: true, avatar_url: updated.avatar_url });
-});
+}));
 
-router.get('/oeil/earnings', authenticate, requireRole('oeil'), async (req, res) => {
+router.get('/oeil/earnings', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
 
   // Missions terminées avec gain réel
@@ -1231,10 +1232,10 @@ router.get('/oeil/earnings', authenticate, requireRole('oeil'), async (req, res)
   );
 
   res.json({ lines, balance: profile?.balance || 0, total_earnings: profile?.total_earnings || 0 });
-});
+}));
 
 // ── GET /users/admin/finance/oeils — admin liste les Œils avec solde pour paiement ──
-router.get('/admin/finance/oeils', authenticate, requireRole('admin'), async (req, res) => {
+router.get('/admin/finance/oeils', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT u.id, u.first_name, u.last_name, u.email, u.city,
@@ -1245,10 +1246,10 @@ router.get('/admin/finance/oeils', authenticate, requireRole('admin'), async (re
     ORDER BY p.balance DESC
   `);
   res.json({ oeils: rows });
-});
+}));
 
 // ── POST /users/admin/finance/:oeilId/wire-transfer — admin enregistre un virement ──
-router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('admin'), async (req, res) => {
+router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { amount } = req.body;
 
@@ -1282,7 +1283,7 @@ router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('a
   );
 
   res.json({ ok: true, transaction });
-});
+}));
 
 // Admin joins its own WS room on connect (done client-side)
 module.exports = router;
