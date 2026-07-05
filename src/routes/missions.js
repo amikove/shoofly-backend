@@ -1250,31 +1250,48 @@ router.post('/:id/report-problem', authenticate, async (req, res) => {
 
 // ── GET /missions/admin/problems — admin liste les tickets ──
 router.get('/admin/problems', authenticate, requireRole('admin'), async (req, res) => {
-    const db = getDb();
-    const { status = 'open', page = 1, limit = 20 } = req.query;
-    const offset = (page - 1) * limit;
+      const db = getDb();
+      const { status = 'open', page = 1, limit = 20, type, city, reporter_role, sort } = req.query;
+      const offset = (page - 1) * limit;
 
-    const { rows } = await db.query(`
-      SELECT r.*,
-        m.title AS mission_title, m.city, m.scheduled_at,
-        u.first_name AS reporter_first, u.last_name AS reporter_last,
-        c.first_name AS client_first, c.last_name AS client_last,
-        o.first_name AS oeil_first, o.last_name AS oeil_last
-      FROM mission_reports r
-      JOIN missions m ON m.id = r.mission_id
-      JOIN users u ON u.id = r.reporter_id
-      LEFT JOIN users c ON c.id = m.client_id
-      LEFT JOIN users o ON o.id = m.oeil_id
-      WHERE r.status=$1
-      ORDER BY r.created_at ASC
-      LIMIT $2 OFFSET $3
-    `, [status, limit, offset]); // Signalement le plus ancien en premier, pour traiter les tickets par ordre d'arrivée
+      let where = ['r.status=$1'], params = [status];
+      let p = 2;
+      if (type) { where.push(`r.type=$${p++}`); params.push(type); }
+      if (city) { where.push(`m.city=$${p++}`); params.push(city); }
+      if (reporter_role) { where.push(`r.reporter_role=$${p++}`); params.push(reporter_role); }
+      const wc = 'WHERE ' + where.join(' AND ');
 
-    const { rows: [{ n: total }] } = await db.query(
-      `SELECT COUNT(*)::int AS n FROM mission_reports WHERE status=$1`, [status]
-    );
+      const orderBy = sort === 'execution_asc' ? 'm.scheduled_at ASC NULLS LAST'
+        : sort === 'execution_desc' ? 'm.scheduled_at DESC NULLS LAST'
+        : 'r.created_at ASC'; // Signalement le plus ancien en premier, par défaut
 
-    res.json({ reports: rows, total, page: +page, pages: Math.ceil(total / limit) });
+      const { rows } = await db.query(`
+        SELECT r.*,
+          m.title AS mission_title, m.city, m.scheduled_at,
+          u.first_name AS reporter_first, u.last_name AS reporter_last,
+          c.first_name AS client_first, c.last_name AS client_last,
+          o.first_name AS oeil_first, o.last_name AS oeil_last
+        FROM mission_reports r
+        JOIN missions m ON m.id = r.mission_id
+        JOIN users u ON u.id = r.reporter_id
+        LEFT JOIN users c ON c.id = m.client_id
+        LEFT JOIN users o ON o.id = m.oeil_id
+        ${wc}
+        ORDER BY ${orderBy}
+        LIMIT $${p++} OFFSET $${p++}
+      `, [...params, limit, offset]);
+
+      const { rows: [{ n: total }] } = await db.query(
+        `SELECT COUNT(*)::int AS n FROM mission_reports r JOIN missions m ON m.id = r.mission_id ${wc}`, params
+      );
+
+      // Villes distinctes disponibles pour peupler le filtre (sur le statut actif, indépendamment des autres filtres)
+      const { rows: cities } = await db.query(`
+        SELECT DISTINCT m.city FROM mission_reports r JOIN missions m ON m.id = r.mission_id
+        WHERE r.status=$1 ORDER BY m.city ASC
+      `, [status]);
+
+      res.json({ reports: rows, total, page: +page, pages: Math.ceil(total / limit), availableCities: cities.map(c => c.city) });
   });
 
 // ── PUT /missions/admin/problems/:id — admin traite un ticket ──
