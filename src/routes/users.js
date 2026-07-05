@@ -770,6 +770,33 @@ router.delete('/admin/expenses/:id', authenticate, requireRole('admin'), require
 });
 
 // ── GET /users/admin/dashboard/financier — vue financière globale ──
+// ── GET /users/admin/dashboard/campagnes — performance par campagne d'acquisition ──
+router.get('/admin/dashboard/campagnes', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  const { rows } = await db.query(`
+    SELECT
+      COALESCE(u.acquisition_source, 'Direct / inconnu') AS source,
+      COALESCE(u.acquisition_medium, '—') AS medium,
+      COALESCE(u.acquisition_campaign, '—') AS campaign,
+      COUNT(DISTINCT u.id)::int AS inscriptions,
+      COUNT(m.id)::int AS missions,
+      COALESCE(SUM(m.price),0)::numeric AS revenue
+    FROM users u
+    LEFT JOIN missions m ON m.client_id = u.id
+    WHERE u.role='client' AND u.created_at BETWEEN $1 AND $2
+    GROUP BY u.acquisition_source, u.acquisition_medium, u.acquisition_campaign
+    ORDER BY inscriptions DESC
+  `, [date_from, date_to]);
+
+  res.json({ campaigns: rows });
+});
+
 router.get('/admin/dashboard/financier', authenticate, requireRole('admin'), requirePermission('stats'), async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
