@@ -463,8 +463,8 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
   await notify(db, mission.client_id, 'Œil assigné 👁️', `${oeilName} a accepté "${mission.title}"`, 'mission', mission.id, emitToUser, null, 'oeilAssignedTitle', 'oeilAssignedBody', {oeilName, missionTitle: mission.title});
   await notify(db, req.user.id, 'Mission acceptée', `Vous avez accepté "${mission.title}"`, 'mission', mission.id, emitToUser, null, 'missionAcceptedOeilTitle', 'missionAcceptedOeilBody', {missionTitle: mission.title});
 
-  await db.query(`INSERT INTO mission_messages (mission_id,sender_id,content,type) VALUES ($1,$2,$3,'system')`,
-    [mission.id, req.user.id, `${oeil.first_name} a accepté la mission.`]);
+  await db.query(`INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key,params) VALUES ($1,$2,$3,'system',$4,$5)`,
+    [mission.id, req.user.id, `${oeil.first_name} a accepté la mission.`, 'oeilAccepted', JSON.stringify({ oeilName: oeil.first_name })]);
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'assigned', oeil_name: oeilName });
   io.to('room:admin').emit('mission_updated', updated);
@@ -646,9 +646,10 @@ const { status, cancel_reason } = req.body;
 
   const labels = { en_route:'en route', active:'démarrée', cancelled:'annulée', completed:'complétée' };
   const sysMsg = { en_route:"L'Œil est en route.", active:"Mission démarrée.", completed:"Mission terminée avec succès.", cancelled:"Mission annulée." };
+  const sysMsgKey = { en_route:'missionEnRoute', active:'missionStarted', completed:'missionCompleted', cancelled:'missionCancelled' };
 
-  await db.query(`INSERT INTO mission_messages (mission_id,sender_id,content,type) VALUES ($1,$2,$3,'system')`,
-    [mission.id, req.user.id, sysMsg[status]]);
+  await db.query(`INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,$3,'system',$4)`,
+    [mission.id, req.user.id, sysMsg[status], sysMsgKey[status]]);
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status });
   io.to('room:admin').emit('mission_updated', updated);
@@ -957,8 +958,8 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
 
   // Message système dans le chat
   await db.query(
-    `INSERT INTO mission_messages (mission_id,sender_id,content,type) VALUES ($1,$2,$3,'system')`,
-    [mission.id, req.user.id, `L'Œil a signalé un empêchement. Mission remise en priorité.`]
+    `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,$3,'system',$4)`,
+    [mission.id, req.user.id, `L'Œil a signalé un empêchement. Mission remise en priorité.`, 'missionImpediment']
   );
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
@@ -1013,8 +1014,8 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
   );
 
   await db.query(
-    `INSERT INTO mission_messages (mission_id,sender_id,content,type) VALUES ($1,$2,$3,'system')`,
-    [mission.id, req.user.id, `${oeil.first_name} a été assigné par l'admin.`]
+    `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key,params) VALUES ($1,$2,$3,'system',$4,$5)`,
+    [mission.id, req.user.id, `${oeil.first_name} a été assigné par l'admin.`, 'assignedByAdmin', JSON.stringify({ oeilName: oeil.first_name })]
   );
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'assigned' });

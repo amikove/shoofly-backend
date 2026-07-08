@@ -408,6 +408,9 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS title_key TEXT;
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS body_key TEXT;
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS params JSONB;
+
+    ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS content_key TEXT;
+    ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS params JSONB;
   `);
   console.log('✅ PostgreSQL schema ready');
 }
