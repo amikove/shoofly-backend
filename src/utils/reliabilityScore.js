@@ -61,9 +61,9 @@ async function checkAndUpdateSuspension(db, oeilId) {
       [oeilId]
     );
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, action_type)
-       VALUES ($1, '🔴 Compte suspendu', 'Votre score de fiabilité est tombé en dessous de 50%. Vous pouvez demander un examen de votre dossier.', 'error', 'none')`,
-      [oeilId]
+      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
+       VALUES ($1, '🔴 Compte suspendu', 'Votre score de fiabilité est tombé en dessous de 50%. Vous pouvez demander un examen de votre dossier.', 'error', 'none', $2, $3, $4)`,
+      [oeilId, 'accountAutoSuspendedTitle', 'accountAutoSuspendedBody', null]
     );
   } else if (score >= 50 && user.is_suspended) {
     // Le score est remonté naturellement au-dessus de 50 — ne pas réactiver automatiquement,

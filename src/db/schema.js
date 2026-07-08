@@ -405,6 +405,9 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE ratings ADD COLUMN IF NOT EXISTS platform_comment TEXT;
 
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action_type TEXT;
+    ALTER TABLE notifications ADD COLUMN IF NOT EXISTS title_key TEXT;
+    ALTER TABLE notifications ADD COLUMN IF NOT EXISTS body_key TEXT;
+    ALTER TABLE notifications ADD COLUMN IF NOT EXISTS params JSONB;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

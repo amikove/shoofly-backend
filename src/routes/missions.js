@@ -18,10 +18,10 @@ async function pricing(price, db) {
   return { commission, oeil_earning: price - commission };
 }
 
-async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null) {
+async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null) {
   const r = await db.query(
-    `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [userId, title, body, type, missionId, actionType]
+    `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [userId, title, body, type, missionId, actionType, titleKey, bodyKey, params ? JSON.stringify(params) : null]
   );
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 }
@@ -54,14 +54,14 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
     await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [half, mission.oeil_id]);
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Part mission — transfert (50%)',$3)`, [mission.transferred_from, half, mission.id]);
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Part mission — transfert (50%)',$3)`, [mission.oeil_id, half, mission.id]);
-    await notify(db, mission.transferred_from, '💰 Paiement partiel reçu', `${half} MAD crédités — votre part du transfert de "${mission.title}".`, 'info', mission.id, emitToUser);
+    await notify(db, mission.transferred_from, '💰 Paiement partiel reçu', `${half} MAD crédités — votre part du transfert de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'partialPaymentReceivedTitle', 'partialPaymentReceivedBody', {amount: half, missionTitle: mission.title});
   } else {
     await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Validation client',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
   }
 
-await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser);
-  await notify(db, mission.client_id, '✅ Mission validée', `Vous avez validé "${mission.title}".`, 'info', mission.id, emitToUser);
+await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'paymentReceivedOeilTitle', 'paymentReceivedOeilBody', {missionTitle: mission.title, amount: mission.oeil_earning});
+  await notify(db, mission.client_id, '✅ Mission validée', `Vous avez validé "${mission.title}".`, 'info', mission.id, emitToUser, null, 'missionValidatedClientTitle', 'missionValidatedClientBody', {missionTitle: mission.title});
   await logStatus(db, mission.id, 'validated', req.user.id, 'Validée par le client');
 
   res.json({ ok: true });
@@ -93,7 +93,7 @@ router.post('/:id/claim', authenticate, asyncHandler(async (req, res) => {
   // Notifier les admins
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`);
   for (const admin of admins) {
-    await notify(db, admin.id, '🚨 Nouvelle réclamation', `Mission "${mission.title}" contestée par le client.`, 'claim', req.params.id, emitToUser);
+    await notify(db, admin.id, '🚨 Nouvelle réclamation', `Mission "${mission.title}" contestée par le client.`, 'claim', req.params.id, emitToUser, null, 'newClaimAdminTitle', 'newClaimAdminBody', {missionTitle: mission.title});
   }
 
   res.json({ ok: true });
@@ -117,16 +117,16 @@ router.put('/:id/resolve-claim', authenticate, asyncHandler(async (req, res) => 
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Mission validée après réclamation',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
     await db.query(`UPDATE missions SET status='completed', validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
     await db.query(`UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
-    await notify(db, mission.oeil_id, '✅ Réclamation résolue', 'La réclamation a été résolue en votre faveur. Votre paiement a été crédité.', 'info', mission.id, emitToUser);
-    await notify(db, mission.client_id, 'Réclamation résolue', 'La réclamation a été examinée et résolue en faveur de l\'Œil.', 'info', mission.id, emitToUser);
+    await notify(db, mission.oeil_id, '✅ Réclamation résolue', 'La réclamation a été résolue en votre faveur. Votre paiement a été crédité.', 'info', mission.id, emitToUser, null, 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
+    await notify(db, mission.client_id, 'Réclamation résolue', 'La réclamation a été examinée et résolue en faveur de l\'Œil.', 'info', mission.id, emitToUser, null, 'claimResolvedClientLoseTitle', 'claimResolvedClientLoseBody', null);
   } else {
     // Rembourser le client
     await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement suite à réclamation',$3)`, [mission.client_id, mission.price, mission.id]);
     await db.query(`UPDATE missions SET status='cancelled', updated_at=NOW() WHERE id=$1`, [mission.id]);
     await db.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
-    await notify(db, mission.client_id, '✅ Réclamation résolue', `${mission.price} MAD ont été crédités sur votre portefeuille.`, 'info', mission.id, emitToUser);
-    await notify(db, mission.oeil_id, 'Réclamation résolue', 'La réclamation a été résolue en faveur du client.', 'info', mission.id, emitToUser);
+    await notify(db, mission.client_id, '✅ Réclamation résolue', `${mission.price} MAD ont été crédités sur votre portefeuille.`, 'info', mission.id, emitToUser, null, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', {amount: mission.price});
+    await notify(db, mission.oeil_id, 'Réclamation résolue', 'La réclamation a été résolue en faveur du client.', 'info', mission.id, emitToUser, null, 'claimResolvedClientLoseTitle', 'claimResolvedOeilLoseBody', null);
   }
 
   res.json({ ok: true });
@@ -361,7 +361,8 @@ await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
   );
   for (const o of oeils) {
     await notify(db, o.id, `Nouvelle mission${is_urgent?' 🚨 URGENTE':''}`,
-      `${title} — ${city} · ${price} MAD`, 'mission', id, emitToUser);
+      `${title} — ${city} · ${price} MAD`, 'mission', id, emitToUser, null,
+      is_urgent ? 'newMissionUrgentTitle' : 'newMissionAvailableTitle', 'newMissionBody', {missionTitle: title, city, price});
   }
 
   // Broadcast to admin room
@@ -459,8 +460,8 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [req.user.id]);
   const oeilName = `${oeil.first_name} ${oeil.last_name}`;
 
-  await notify(db, mission.client_id, 'Œil assigné 👁️', `${oeilName} a accepté "${mission.title}"`, 'mission', mission.id, emitToUser);
-  await notify(db, req.user.id, 'Mission acceptée', `Vous avez accepté "${mission.title}"`, 'mission', mission.id, emitToUser);
+  await notify(db, mission.client_id, 'Œil assigné 👁️', `${oeilName} a accepté "${mission.title}"`, 'mission', mission.id, emitToUser, null, 'oeilAssignedTitle', 'oeilAssignedBody', {oeilName, missionTitle: mission.title});
+  await notify(db, req.user.id, 'Mission acceptée', `Vous avez accepté "${mission.title}"`, 'mission', mission.id, emitToUser, null, 'missionAcceptedOeilTitle', 'missionAcceptedOeilBody', {missionTitle: mission.title});
 
   await db.query(`INSERT INTO mission_messages (mission_id,sender_id,content,type) VALUES ($1,$2,$3,'system')`,
     [mission.id, req.user.id, `${oeil.first_name} a accepté la mission.`]);
@@ -606,12 +607,12 @@ const { status, cancel_reason } = req.body;
       const refund = Math.round(mission.price * 0.5 * 100) / 100
       await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [refund, mission.client_id])
       await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement annulation (50%)',$3)`, [mission.client_id, refund, mission.id])
-      await notify(db, mission.client_id, '💰 Remboursement partiel', `${refund} MAD crédités sur votre portefeuille suite à l'annulation.`, 'info', mission.id, emitToUser)
-      await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser)
+      await notify(db, mission.client_id, '💰 Remboursement partiel', `${refund} MAD crédités sur votre portefeuille suite à l'annulation.`, 'info', mission.id, emitToUser, null, 'partialRefundTitle', 'partialRefundBody', {amount: refund})
+      await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title})
     } else {
       // Aucun remboursement
-      await notify(db, mission.client_id, 'Mission annulée', `Annulation dans les 2h — aucun remboursement conformément aux CGV.`, 'info', mission.id, emitToUser)
-      await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser)
+      await notify(db, mission.client_id, 'Mission annulée', `Annulation dans les 2h — aucun remboursement conformément aux CGV.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledNoRefundBody', null)
+      await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title})
     }
   }
 
@@ -619,7 +620,7 @@ const { status, cancel_reason } = req.body;
   if (status === 'cancelled' && req.user.role === 'client' && mission.status === 'pending') {
     await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id])
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement annulation avant assignation',$3)`, [mission.client_id, mission.price, mission.id])
-    await notify(db, mission.client_id, '💰 Remboursement intégral', `${mission.price} MAD crédités sur votre portefeuille.`, 'info', mission.id, emitToUser)
+    await notify(db, mission.client_id, '💰 Remboursement intégral', `${mission.price} MAD crédités sur votre portefeuille.`, 'info', mission.id, emitToUser, null, 'fullRefundTitle', 'fullRefundBody', {amount: mission.price})
   }
 
 
@@ -636,8 +637,8 @@ const { status, cancel_reason } = req.body;
       `UPDATE oeil_profiles SET total_missions=total_missions+1 WHERE user_id=$1`,
       [mission.oeil_id]
     );
-    await notify(db, mission.client_id, 'Mission terminée ✅', `"${mission.title}" est terminée. Vous avez 12h pour réclamer si nécessaire.`, 'mission', mission.id, emitToUser);
-    await notify(db, mission.oeil_id, 'Mission terminée', `"${mission.title}" marquée comme terminée. Paiement en attente de validation.`, 'mission', mission.id, emitToUser);
+    await notify(db, mission.client_id, 'Mission terminée ✅', `"${mission.title}" est terminée. Vous avez 12h pour réclamer si nécessaire.`, 'mission', mission.id, emitToUser, null, 'missionCompletedClientTitle', 'missionCompletedClientBody', {missionTitle: mission.title});
+    await notify(db, mission.oeil_id, 'Mission terminée', `"${mission.title}" marquée comme terminée. Paiement en attente de validation.`, 'mission', mission.id, emitToUser, null, 'missionCompletedOeilTitle', 'missionCompletedOeilBody', {missionTitle: mission.title});
   }
   
 
@@ -697,7 +698,7 @@ router.post('/:id/report', authenticate, requireRole('oeil','admin'), [
     RETURNING *
   `, [mission.id, summary, JSON.stringify(risk_points), score, notes||null, req.user.id]);
 
-  await notify(db, mission.client_id, '📄 Rapport disponible', `Le rapport de "${mission.title}" est prêt.`, 'report', mission.id, emitToUser);
+  await notify(db, mission.client_id, '📄 Rapport disponible', `Le rapport de "${mission.title}" est prêt.`, 'report', mission.id, emitToUser, null, 'reportAvailableTitle', 'reportAvailableBody', {missionTitle: mission.title});
 
   res.status(201).json({ report });
 }));
@@ -763,11 +764,12 @@ if (isFlagged) {
   const senderName = `${sender.rows[0]?.first_name} ${sender.rows[0]?.last_name}`
   for (const admin of admins) {
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
-       VALUES ($1, $2, $3, 'warning', $4, 'admin_messages_suspects')`,
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+       VALUES ($1, $2, $3, 'warning', $4, 'admin_messages_suspects', $5, $6, $7)`,
       [admin.id, '⚠️ Message suspect détecté',
        `${senderName} a peut-être partagé un contact externe dans la mission "${mission.title}"`,
-       req.params.id]
+       req.params.id,
+       'suspiciousMessageAdminTitle', 'suspiciousMessageAdminBody', JSON.stringify({senderName, missionTitle: mission.title})]
     )
     const emitToUser = req.app.get('emitToUser')
     if (emitToUser) emitToUser(admin.id, 'notification', {
@@ -794,9 +796,9 @@ if (isFlagged) {
   if (recipientId) {
     const notifBody = `${mission.title} : ${content.trim().slice(0, 60)}`
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
-      VALUES ($1, 'Nouveau message', $2, 'message', $3, 'chat')`,
-      [recipientId, notifBody, req.params.id]
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+      VALUES ($1, 'Nouveau message', $2, 'message', $3, 'chat', $4, $5, $6)`,
+      [recipientId, notifBody, req.params.id, 'newMessageMissionTitle', null, null]
     );
     const emitToUser = req.app.get('emitToUser');
     if (emitToUser) {
@@ -838,7 +840,7 @@ router.post('/:id/rate', authenticate, requireRole('client'), [
   const { rows: [avg] } = await db.query('SELECT AVG(score)::numeric(3,1) AS a, COUNT(*)::int AS c FROM ratings WHERE oeil_id=$1', [mission.oeil_id]);
   await db.query('UPDATE oeil_profiles SET rating_avg=$1, rating_count=$2 WHERE user_id=$3', [avg.a, avg.c, mission.oeil_id]);
 
-await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${mission.title}" notée par un client.`, 'rating', mission.id, emitToUser);
+await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${mission.title}" notée par un client.`, 'rating', mission.id, emitToUser, null, 'newRatingTitle', 'newRatingBody', {score: req.body.score, missionTitle: mission.title});
 
   // Score de fiabilité selon la note
   const score = req.body.score;
@@ -883,7 +885,7 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
 
   const emitToUser = req.app.get('emitToUser');
   const notifBody = `Un Œil est intéressé par votre mission : ${mission.title}`
-  await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser, 'interests_modal');
+  await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser, 'interests_modal', 'newOeilInterestTitle', 'newOeilInterestBody', {missionTitle: mission.title});
 
   res.status(201).json({ ok: true });
 }));
@@ -950,7 +952,7 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   await notify(db, mission.client_id,
     '⚠️ Changement sur votre mission',
     `Votre Œil a signalé un empêchement pour "${mission.title}". Nous recherchons un remplaçant en urgence.`,
-    'mission', mission.id, emitToUser
+    'mission', mission.id, emitToUser, null, 'missionChangeAlertTitle', 'missionChangeAlertBody', {missionTitle: mission.title}
   );
 
   // Message système dans le chat
@@ -1002,12 +1004,12 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
   await notify(db, oeil_id,
     '📋 Mission assignée par admin',
     `L'admin vous a assigné la mission "${mission.title}". Vérifiez les détails.`,
-    'mission', mission.id, emitToUser
+    'mission', mission.id, emitToUser, null, 'missionAssignedByAdminTitle', 'missionAssignedByAdminBody', {missionTitle: mission.title}
   );
   await notify(db, mission.client_id,
     '✅ Œil trouvé',
     `Un Œil a été assigné à votre mission "${mission.title}".`,
-    'mission', mission.id, emitToUser
+    'mission', mission.id, emitToUser, null, 'oeilFoundClientTitle', 'oeilFoundClientBody', {missionTitle: mission.title}
   );
 
   await db.query(
@@ -1082,8 +1084,8 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
     });
 
     await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,'❌ Mission annulée','Aucun Œil disponible. Remboursement intégral effectué.','error',$2,'mission_view')`,
-      [mission.client_id, mission.id]
+      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,'❌ Mission annulée','Aucun Œil disponible. Remboursement intégral effectué.','error',$2,'mission_view',$3,$4,$5)`,
+      [mission.client_id, mission.id, 'missionCancelledNoReplacementTitle', 'missionCancelledNoReplacementBody', null]
     );
   }
 }
@@ -1159,7 +1161,7 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandl
 
   // Notifier l'Œil embauché
   await notify(db, req.params.oeilId, '🎉 Vous avez été sélectionné !',
-    `Le client vous a choisi pour : ${mission.title}`, 'hired', req.params.id, emitToUser);
+    `Le client vous a choisi pour : ${mission.title}`, 'hired', req.params.id, emitToUser, null, 'oeilSelectedTitle', 'oeilSelectedBody', {missionTitle: mission.title});
 
   // Notifier les Œils non retenus
   const { rows: others } = await db.query(
@@ -1168,7 +1170,7 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandl
   );
   for (const o of others) {
     await notify(db, o.oeil_id, 'Mission pourvue',
-      `"${mission.title}" a été attribuée à un autre Œil.`, 'info', req.params.id, emitToUser);
+      `"${mission.title}" a été attribuée à un autre Œil.`, 'info', req.params.id, emitToUser, null, 'missionFilledTitle', 'missionFilledBody', {missionTitle: mission.title});
   }
 
   if (io) io.to('room:admin').emit('mission_assigned', updated);
@@ -1222,9 +1224,10 @@ router.post('/:id/report-problem', authenticate, asyncHandler(async (req, res) =
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
   for (const admin of admins) {
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
-       VALUES ($1, '🚨 Problème signalé en cours de mission', $2, 'error', $3, 'admin_problems')`,
-      [admin.id, `${reporterRole === 'client' ? 'Client' : 'Œil'} a signalé : "${type}" sur "${mission.title}"`, mission.id]
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+       VALUES ($1, '🚨 Problème signalé en cours de mission', $2, 'error', $3, 'admin_problems', $4, $5, $6)`,
+      [admin.id, `${reporterRole === 'client' ? 'Client' : 'Œil'} a signalé : "${type}" sur "${mission.title}"`, mission.id,
+       'problemReportedAdminTitle', 'problemReportedAdminBody', JSON.stringify({reporterRole: reporterRole === 'client' ? 'Client' : 'Œil', problemType: type, missionTitle: mission.title})]
     );
     if (emitToUser) emitToUser(admin.id, 'notification', {
       title: '🚨 Problème signalé en cours de mission',
@@ -1238,9 +1241,10 @@ router.post('/:id/report-problem', authenticate, asyncHandler(async (req, res) =
   const otherId = req.user.id === mission.client_id ? mission.oeil_id : mission.client_id;
   if (otherId) {
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
-       VALUES ($1, '⚠️ Problème signalé sur votre mission', $2, 'warning', $3, 'mission_view')`,
-      [otherId, `Un problème a été signalé : "${type}". L'équipe Shoofly a été alertée.`, mission.id]
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+       VALUES ($1, '⚠️ Problème signalé sur votre mission', $2, 'warning', $3, 'mission_view', $4, $5, $6)`,
+      [otherId, `Un problème a été signalé : "${type}". L'équipe Shoofly a été alertée.`, mission.id,
+       'problemReportedPartyTitle', 'problemReportedPartyBody', JSON.stringify({problemType: type})]
     );
     if (emitToUser) emitToUser(otherId, 'notification', {
       title: '⚠️ Problème signalé',
@@ -1317,10 +1321,13 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandl
     // Notifier le rapporteur (client ou Œil) de la décision admin — persistant, consultable même si la notif est ratée
     const emitToUser = req.app.get('emitToUser');
     const statusLabel = { in_progress: 'pris en charge', resolved: 'résolu', dismissed: 'classé sans suite' }[status] || status;
+    const reportStatusTitleKey = { in_progress: 'reportStatusInProgressTitle', resolved: 'reportStatusResolvedTitle', dismissed: 'reportStatusDismissedTitle' }[status] || null;
+    const reportBodyKey = admin_note ? null : 'reportStatusDefaultBody';
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
-       VALUES ($1, $2, $3, 'info', $4, 'mes_signalements')`,
-      [report.reporter_id, `📋 Votre signalement a été ${statusLabel}`, admin_note || 'Votre signalement a été traité par notre équipe.', report.mission_id]
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+       VALUES ($1, $2, $3, 'info', $4, 'mes_signalements', $5, $6, $7)`,
+      [report.reporter_id, `📋 Votre signalement a été ${statusLabel}`, admin_note || 'Votre signalement a été traité par notre équipe.', report.mission_id,
+       reportStatusTitleKey, reportBodyKey, null]
     );
     if (emitToUser) emitToUser(report.reporter_id, 'notification', {
       title: `📋 Votre signalement a été ${statusLabel}`,

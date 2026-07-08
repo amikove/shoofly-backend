@@ -916,7 +916,7 @@ router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), asyncHa
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   await db.query(`UPDATE oeil_profiles SET is_verified=true, id_verified_at=NOW() WHERE user_id=$1`, [req.params.id]);
-  const notif = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type) VALUES ($1,'✅ Profil vérifié !','Vous pouvez maintenant accepter des missions.','info','none') RETURNING *`, [req.params.id]);
+  const notif = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'✅ Profil vérifié !','Vous pouvez maintenant accepter des missions.','info','none',$2,$3,$4) RETURNING *`, [req.params.id, 'profileVerifiedTitle', 'profileVerifiedBody', null]);
   if (emitToUser) emitToUser(req.params.id, 'notification', notif.rows[0]);
   res.json({ message: 'Œil vérifié' });
 }));
@@ -997,10 +997,10 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
 
   const emitToUser = req.app.get('emitToUser');
-  const notify = async (userId, title, body) => {
+  const notify = async (userId, title, body, titleKey = null, bodyKey = null, params = null) => {
     await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type) VALUES ($1,$2,$3,'info',$4,'mission_view')`,
-      [userId, title, body, mission.id]
+      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'info',$4,'mission_view',$5,$6,$7)`,
+      [userId, title, body, mission.id, titleKey, bodyKey, params ? JSON.stringify(params) : null]
     );
     if (emitToUser) emitToUser(userId, 'notification', { title, body });
   }
@@ -1010,15 +1010,15 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Mission validée après réclamation',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
     await db.query(`UPDATE missions SET status='completed', validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
     await db.query(`UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
-    await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.');
-    await notify(mission.client_id, 'Réclamation résolue', 'Résolue en faveur de l\'Œil.');
+    await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.', 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
+    await notify(mission.client_id, 'Réclamation résolue', 'Résolue en faveur de l\'Œil.', 'claimResolvedClientLoseTitle', 'claimResolvedClientLoseBody', null);
   } else {
     await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement suite à réclamation',$3)`, [mission.client_id, mission.price, mission.id]);
     await db.query(`UPDATE missions SET status='cancelled', updated_at=NOW() WHERE id=$1`, [mission.id]);
     await db.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
-    await notify(mission.client_id, '✅ Réclamation résolue', `${mission.price} MAD crédités sur votre portefeuille.`);
-    await notify(mission.oeil_id, 'Réclamation résolue', 'Résolue en faveur du client.');
+    await notify(mission.client_id, '✅ Réclamation résolue', `${mission.price} MAD crédités sur votre portefeuille.`, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', { amount: mission.price });
+    await notify(mission.oeil_id, 'Réclamation résolue', 'Résolue en faveur du client.', 'claimResolvedClientLoseTitle', 'claimResolvedOeilLoseBody', null);
   }
 
   res.json({ ok: true });
@@ -1044,11 +1044,11 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), asyncHa
   await db.query(`UPDATE withdrawals SET status=$1,processed_by=$2,processed_at=NOW() WHERE id=$3`, [status, req.user.id, req.params.id]);
   if (status === 'rejected') {
     await db.query('UPDATE oeil_profiles SET balance=balance+$1 WHERE user_id=$2', [w.amount, w.oeil_id]);
-    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type) VALUES ($1,'Virement refusé','Votre demande a été refusée. Solde recrédité.','info','gains_page') RETURNING *`, [w.oeil_id]);
+    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Virement refusé','Votre demande a été refusée. Solde recrédité.','info','gains_page',$2,$3,$4) RETURNING *`, [w.oeil_id, 'withdrawalRejectedTitle', 'withdrawalRejectedBody', null]);
     if (emitToUser) emitToUser(w.oeil_id, 'notification', n.rows[0]);
   }
   if (status === 'paid') {
-    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type) VALUES ($1,'💸 Virement effectué',$2,'info','gains_page') RETURNING *`, [w.oeil_id, `${w.amount} MAD virés sur votre compte.`]);
+    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'💸 Virement effectué',$2,'info','gains_page',$3,$4,$5) RETURNING *`, [w.oeil_id, `${w.amount} MAD virés sur votre compte.`, 'withdrawalPaidTitle', 'withdrawalPaidBody', JSON.stringify({ amount: w.amount })]);
     if (emitToUser) emitToUser(w.oeil_id, 'notification', n.rows[0]);
   }
   res.json({ message: `Virement ${status}` });
@@ -1132,9 +1132,9 @@ router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('a
 
   // Notification in-app
   await db.query(
-    `INSERT INTO notifications (user_id, title, body, type, action_type)
-     VALUES ($1, '✅ Identité vérifiée', 'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.', 'success', 'none')`,
-    [doc.user_id]
+    `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
+     VALUES ($1, '✅ Identité vérifiée', 'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.', 'success', 'none', $2, $3, $4)`,
+    [doc.user_id, 'identityVerifiedTitle', 'identityVerifiedBody', null]
   );
 
   res.json({ message: 'Identité approuvée', user_id: doc.user_id });
@@ -1160,9 +1160,9 @@ router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('ad
 
   // Notification in-app
   await db.query(
-    `INSERT INTO notifications (user_id, title, body, type, action_type)
-     VALUES ($1, '❌ Vérification refusée', $2, 'error', 'verification_page')`,
-    [doc.user_id, `Votre demande de vérification a été refusée. Raison : ${reason || 'Documents non conformes'}. Vous pouvez soumettre de nouveaux documents.`]
+    `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
+     VALUES ($1, '❌ Vérification refusée', $2, 'error', 'verification_page', $3, $4, $5)`,
+    [doc.user_id, `Votre demande de vérification a été refusée. Raison : ${reason || 'Documents non conformes'}. Vous pouvez soumettre de nouveaux documents.`, 'identityRejectedTitle', 'identityRejectedBody', JSON.stringify({ reason: reason || 'Documents non conformes' })]
   );
 
   res.json({ message: 'Identité rejetée', user_id: doc.user_id });
@@ -1277,9 +1277,9 @@ router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('a
   );
 
   await db.query(
-    `INSERT INTO notifications (user_id, title, body, type, action_type)
-     VALUES ($1, '💰 Virement effectué', $2, 'success', 'gains_page')`,
-    [req.params.oeilId, `Un virement de ${amount} MAD a été enregistré vers votre compte bancaire.`]
+    `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
+     VALUES ($1, '💰 Virement effectué', $2, 'success', 'gains_page', $3, $4, $5)`,
+    [req.params.oeilId, `Un virement de ${amount} MAD a été enregistré vers votre compte bancaire.`, 'withdrawalRegisteredTitle', 'withdrawalRegisteredBody', JSON.stringify({ amount })]
   );
 
   res.json({ ok: true, transaction });

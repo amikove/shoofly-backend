@@ -41,9 +41,12 @@ router.post('/register', [
   );
   if (role === 'oeil') await db.query(`INSERT INTO oeil_profiles (user_id) VALUES ($1)`, [id]);
 
-  await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type) VALUES ($1,$2,$3,'info','none')`, [
+  await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'info','none',$4,$5,$6)`, [
     id, 'Bienvenue sur SHOOFLY 👁️',
-    role === 'oeil' ? 'Votre profil sera vérifié sous 24h.' : 'Vous pouvez commander votre première mission.'
+    role === 'oeil' ? 'Votre profil sera vérifié sous 24h.' : 'Vous pouvez commander votre première mission.',
+    'welcomeTitle',
+    role === 'oeil' ? 'welcomeBodyOeil' : 'welcomeBodyClient',
+    null
   ]);
 
   res.status(201).json({ token: makeToken(user), user: safe(user) });

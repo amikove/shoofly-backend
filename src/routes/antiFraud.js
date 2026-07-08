@@ -350,12 +350,15 @@ router.post('/warn/:userId', authenticate, requireRole('admin'), asyncHandler(as
 
   // 1. Logger dans la base
   await db.query(
-    `INSERT INTO notifications (user_id, title, body, type, action_type)
-     VALUES ($1, $2, $3, 'warning', 'none')`,
+    `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
+     VALUES ($1, $2, $3, 'warning', 'none', $4, $5, $6)`,
 [
       userId,
       '⚠️ Activité inhabituelle détectée sur votre compte',
-      reason || `Une activité suspecte a été détectée sur votre compte (${rule_label || rule_code}). Merci de vous assurer que vos actions respectent les conditions d'utilisation de Shoofly. En cas de récidive, votre compte pourra être suspendu.`
+      reason || `Une activité suspecte a été détectée sur votre compte (${rule_label || rule_code}). Merci de vous assurer que vos actions respectent les conditions d'utilisation de Shoofly. En cas de récidive, votre compte pourra être suspendu.`,
+      'suspiciousActivityTitle',
+      reason ? null : 'suspiciousActivityDefaultBody',
+      reason ? null : JSON.stringify({ ruleLabel: rule_label || rule_code })
     ]
   );
 
@@ -395,8 +398,8 @@ router.post('/block/:userId', authenticate, requireRole('admin'), asyncHandler(a
   const { reason } = req.body;
   await db.query('UPDATE users SET is_active=false WHERE id=$1', [req.params.userId]);
   await db.query(
-    `INSERT INTO notifications (user_id,title,body,type,action_type) VALUES ($1,'Compte suspendu',$2,'info','none')`,
-    [req.params.userId, reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.']
+    `INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Compte suspendu',$2,'info','none',$3,$4,$5)`,
+    [req.params.userId, reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.', 'accountSuspendedTitle', reason ? null : 'accountSuspendedDefaultBody', null]
   );
   res.json({ message: 'Compte bloqué', user_id: req.params.userId });
 }));

@@ -51,9 +51,9 @@ router.post('/:missionId', authenticate, requireRole('oeil'), asyncHandler(async
   if (submitted) {
     const emitToUser = req.app.get('emitToUser');
     await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type)
-       VALUES ($1, '📋 Rapport de visite disponible', $2, 'info', $3, 'mission_view')`,
-      [mission.client_id, `Le rapport de visite pour "${mission.title}" est prêt.`, req.params.missionId]
+      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+       VALUES ($1, '📋 Rapport de visite disponible', $2, 'info', $3, 'mission_view', $4, $5, $6)`,
+      [mission.client_id, `Le rapport de visite pour "${mission.title}" est prêt.`, req.params.missionId, 'visitReportAvailableTitle', 'visitReportAvailableBody', JSON.stringify({ missionTitle: mission.title })]
     );
     if (emitToUser) emitToUser(mission.client_id, 'notification', {
       title: '📋 Rapport de visite disponible',
