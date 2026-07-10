@@ -621,9 +621,10 @@ const { status, cancel_reason } = req.body;
   // causée par l'Œil ou décidée par un admin pour une raison hors faute du client. l'admine a quand meme le choix de decider qui est respnsable et le montant
   if (status === 'cancelled') {
     let refund;
-    // Un admin peut fixer un montant de remboursement précis, en dérogation à la règle automatique
-    if (req.user.role === 'admin' && req.body.refund_amount !== undefined) {
-      refund = Math.max(0, Math.min(parseFloat(req.body.refund_amount) || 0, mission.price));
+    // Un admin peut fixer un pourcentage de remboursement précis, en dérogation à la règle automatique
+    if (req.user.role === 'admin' && req.body.refund_percent !== undefined) {
+      const pct = Math.max(0, Math.min(parseFloat(req.body.refund_percent) || 0, 100));
+      refund = Math.round(mission.price * pct / 100 * 100) / 100;
       if (refund > 0) {
         await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [refund, mission.client_id]);
         await db.query(
