@@ -1,8 +1,3 @@
-
-const { execSync } = require('child_process')
-try {
-  execSync('node src/db/seed.js', { stdio: 'inherit' })
-} catch (e) {
-  console.log('Seed ignoré:', e.message)
-}
+// Le seed ne se lance plus automatiquement au démarrage — il TRUNCATE toutes les tables
+// et ne doit être exécuté qu'à la main, volontairement : node src/db/seed.js
 require('./src/index.js')
