@@ -288,7 +288,6 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
 
     ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
-   ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS platform_amount NUMERIC(10,2);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS is_priority BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_type TEXT CHECK(transfer_type IN ('before','during'));
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS transferred_from TEXT REFERENCES users(id);
