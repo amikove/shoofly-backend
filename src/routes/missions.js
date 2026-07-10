@@ -287,7 +287,13 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
 
 
 
-  const { rows: [{ n: total }] } = await db.query(`SELECT COUNT(*)::int AS n FROM missions m ${wc}`, params);
+  const { rows: [{ n: total }] } = await db.query(`
+      SELECT COUNT(*)::int AS n
+      FROM missions m
+      LEFT JOIN users c ON c.id=m.client_id
+      LEFT JOIN users o ON o.id=m.oeil_id
+      ${wc}
+    `, params);
 
   res.json({ missions, total, page: +page, pages: Math.ceil(total / limit) });
 }));
