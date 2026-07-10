@@ -1320,10 +1320,10 @@ router.get('/admin/problems', authenticate, requireRole('admin'), asyncHandler(a
 
       const { rows } = await db.query(`
         SELECT r.*,
-          m.title AS mission_title, m.city, m.scheduled_at,
-          u.first_name AS reporter_first, u.last_name AS reporter_last,
-          c.first_name AS client_first, c.last_name AS client_last,
-          o.first_name AS oeil_first, o.last_name AS oeil_last
+        m.title AS mission_title, m.city, m.scheduled_at, m.id AS mission_ref_id,
+        u.first_name AS reporter_first, u.last_name AS reporter_last,
+        c.id AS client_id, c.first_name AS client_first, c.last_name AS client_last,
+        o.id AS oeil_id, o.first_name AS oeil_first, o.last_name AS oeil_last
         FROM mission_reports r
         JOIN missions m ON m.id = r.mission_id
         JOIN users u ON u.id = r.reporter_id
