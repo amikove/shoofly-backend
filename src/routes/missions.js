@@ -77,6 +77,7 @@ router.post('/:id/claim', authenticate, asyncHandler(async (req, res) => {
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
   if (mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+  if (mission.validated_at) return res.status(400).json({ error: 'Cette mission a déjà été validée, aucune réclamation n\'est plus possible.' });
   if (mission.status !== 'completed') return res.status(400).json({ error: 'Mission non terminée' });
 
   const hoursSinceCompletion = (Date.now() - new Date(mission.completed_by_oeil_at).getTime()) / 3600000;
