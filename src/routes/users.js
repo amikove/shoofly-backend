@@ -207,6 +207,146 @@ router.get('/admin/all', authenticate, requireRole('admin'), asyncHandler(async 
     res.json({ users: rows });
   }));
 
+// ── GET /users/admin/profile/:userId — fiche détaillée consolidée (client ou Œil) ──
+router.get('/admin/profile/:userId', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { userId } = req.params;
+  const { page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
+
+  const { rows: [user] } = await db.query(`
+    SELECT id, role, first_name, last_name, email, phone, city, quartier, birth_date,
+           avatar_url, created_at, is_active, profil, situation, motivation
+    FROM users WHERE id=$1
+  `, [userId]);
+
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
+  if (!['client', 'oeil'].includes(user.role)) {
+    return res.status(400).json({ error: 'Fiche disponible uniquement pour un client ou un Œil' });
+  }
+
+  let oeilProfile = null;
+  if (user.role === 'oeil') {
+    const { rows: [p] } = await db.query(
+      `SELECT rating_avg, rating_count, total_earnings, balance FROM oeil_profiles WHERE user_id=$1`,
+      [userId]
+    );
+    oeilProfile = p || null;
+  }
+
+  // ── Onglet Production ──
+  const missionsWhere = user.role === 'client' ? 'client_id=$1' : 'oeil_id=$1';
+  const missionsSelect = user.role === 'client'
+    ? 'id, title, type, status, scheduled_at, created_at, price'
+    : 'id, title, type, status, scheduled_at, created_at, oeil_earning';
+
+  const { rows: missions } = await db.query(`
+    SELECT ${missionsSelect} FROM missions WHERE ${missionsWhere}
+    ORDER BY created_at DESC
+    LIMIT $2 OFFSET $3
+  `, [userId, limit, offset]);
+
+  const { rows: [{ n: missionsTotal }] } = await db.query(
+    `SELECT COUNT(*)::int AS n FROM missions WHERE ${missionsWhere}`, [userId]
+  );
+
+  const production = {
+    missions,
+    total: missionsTotal,
+    page: +page,
+    pages: Math.ceil(missionsTotal / limit),
+  };
+
+  // ── Onglet Financier ──
+  const { rows: walletTransactions } = await db.query(
+    `SELECT id, type, amount, reason, mission_id, created_at FROM wallet_transactions WHERE user_id=$1 ORDER BY created_at DESC`,
+    [userId]
+  );
+
+  let financial;
+  if (user.role === 'client') {
+    const { rows: [{ total_spent }] } = await db.query(
+      `SELECT COALESCE(SUM(price),0)::numeric AS total_spent FROM missions WHERE client_id=$1 AND status='completed'`,
+      [userId]
+    );
+    const { rows: [{ balance }] } = await db.query(`SELECT balance FROM users WHERE id=$1`, [userId]);
+    financial = {
+      total_spent: parseFloat(total_spent),
+      balance: parseFloat(balance),
+      wallet_transactions: walletTransactions,
+    };
+  } else {
+    financial = {
+      total_earnings: parseFloat(oeilProfile?.total_earnings || 0),
+      balance: parseFloat(oeilProfile?.balance || 0),
+      wallet_transactions: walletTransactions,
+      wire_transfers: walletTransactions.filter(t => t.reason === 'Virement bancaire'),
+    };
+  }
+
+  // ── Onglet Problèmes remontés ──
+  const { rows: reports } = await db.query(`
+    SELECT r.id, r.type, r.status, r.created_at, r.mission_id, m.title AS mission_title
+    FROM mission_reports r JOIN missions m ON m.id = r.mission_id
+    WHERE r.reporter_id=$1
+    ORDER BY r.created_at DESC
+  `, [userId]);
+
+  const claimsWhere = user.role === 'client' ? 'cl.client_id=$1' : 'm.oeil_id=$1';
+  const { rows: claims } = await db.query(`
+    SELECT cl.id, cl.status, cl.comment, cl.created_at, cl.resolved_at, cl.mission_id, m.title AS mission_title
+    FROM claims cl JOIN missions m ON m.id = cl.mission_id
+    WHERE ${claimsWhere}
+    ORDER BY cl.created_at DESC
+  `, [userId]);
+
+  // ── Onglet Fiabilité (Œil uniquement) ──
+  let reliability = null;
+  if (user.role === 'oeil') {
+    const { rows: [ru] } = await db.query(
+      `SELECT reliability_score, is_suspended, suspended_at, suspended_reason FROM users WHERE id=$1`,
+      [userId]
+    );
+    const { rows: events } = await db.query(
+      `SELECT id, points, reason, is_grave, created_at, mission_id FROM reliability_events WHERE oeil_id=$1 ORDER BY created_at DESC`,
+      [userId]
+    );
+    reliability = {
+      reliability_score: ru.reliability_score,
+      is_suspended: ru.is_suspended,
+      suspended_at: ru.suspended_at,
+      suspended_reason: ru.suspended_reason,
+      rating_avg: oeilProfile?.rating_avg || 0,
+      rating_count: oeilProfile?.rating_count || 0,
+      events,
+    };
+  }
+
+  res.json({
+    user: {
+      id: user.id,
+      role: user.role,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      email: user.email,
+      phone: user.phone,
+      city: user.city,
+      quartier: user.quartier,
+      birth_date: user.birth_date,
+      avatar_url: user.avatar_url,
+      created_at: user.created_at,
+      is_active: user.is_active,
+      profil: user.role === 'client' ? user.profil : undefined,
+      situation: user.role === 'oeil' ? user.situation : undefined,
+      motivation: user.role === 'oeil' ? user.motivation : undefined,
+    },
+    production,
+    financial,
+    problems: { reports, claims },
+    reliability,
+  });
+}));
+
 // ── Client : stats dashboard ────────────────────────────────
 router.get('/client/stats', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
@@ -974,8 +1114,8 @@ router.get('/admin/flagged-messages', authenticate, requireRole('admin'), asyncH
 router.get('/admin/claims', authenticate, requireRole('admin'), requirePermission('claims'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
-    SELECT cl.*, 
-      m.title AS mission_title, m.price AS mission_price, m.oeil_earning,
+    SELECT cl.*,
+      m.title AS mission_title, m.price AS mission_price, m.oeil_earning, m.oeil_id,
       c.first_name||' '||c.last_name AS client_name,
       o.first_name||' '||o.last_name AS oeil_name
     FROM claims cl
