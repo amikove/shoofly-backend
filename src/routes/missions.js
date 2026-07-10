@@ -4,6 +4,7 @@ const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { logReliabilityEvent } = require('../utils/reliabilityScore');
+const { refundOnCancellation } = require('../utils/refund');
 const asyncHandler = require('../middleware/asyncHandler');
 
 
@@ -121,12 +122,11 @@ router.put('/:id/resolve-claim', authenticate, asyncHandler(async (req, res) => 
     await notify(db, mission.oeil_id, '✅ Réclamation résolue', 'La réclamation a été résolue en votre faveur. Votre paiement a été crédité.', 'info', mission.id, emitToUser, null, 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
     await notify(db, mission.client_id, 'Réclamation résolue', 'La réclamation a été examinée et résolue en faveur de l\'Œil.', 'info', mission.id, emitToUser, null, 'claimResolvedClientLoseTitle', 'claimResolvedClientLoseBody', null);
   } else {
-    // Rembourser le client
-    await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
-    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement suite à réclamation',$3)`, [mission.client_id, mission.price, mission.id]);
+    // Rembourser le client — réclamation gagnée, non imputable au client : remboursement intégral
+    const refund = await refundOnCancellation(db, mission, false, 'Remboursement suite à réclamation');
     await db.query(`UPDATE missions SET status='cancelled', updated_at=NOW() WHERE id=$1`, [mission.id]);
     await db.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
-    await notify(db, mission.client_id, '✅ Réclamation résolue', `${mission.price} MAD ont été crédités sur votre portefeuille.`, 'info', mission.id, emitToUser, null, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', {amount: mission.price});
+    await notify(db, mission.client_id, '✅ Réclamation résolue', `${refund} MAD ont été crédités sur votre portefeuille.`, 'info', mission.id, emitToUser, null, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', {amount: refund});
     await notify(db, mission.oeil_id, 'Réclamation résolue', 'La réclamation a été résolue en faveur du client.', 'info', mission.id, emitToUser, null, 'claimResolvedClientLoseTitle', 'claimResolvedOeilLoseBody', null);
   }
 
@@ -616,28 +616,30 @@ const { status, cancel_reason } = req.body;
     await logStatus(db, mission.id, status, req.user.id, null);
   }
 
-  // Remboursement si annulation par le client
-  if (status === 'cancelled' && req.user.role === 'client' && mission.status === 'assigned') {
-    const hoursBeforeMission = (new Date(mission.scheduled_at).getTime() - Date.now()) / 3600000
-    if (hoursBeforeMission > 2) {
-      // Remboursement 50%
-      const refund = Math.round(mission.price * 0.5 * 100) / 100
-      await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [refund, mission.client_id])
-      await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement annulation (50%)',$3)`, [mission.client_id, refund, mission.id])
-      await notify(db, mission.client_id, '💰 Remboursement partiel', `${refund} MAD crédités sur votre portefeuille suite à l'annulation.`, 'info', mission.id, emitToUser, null, 'partialRefundTitle', 'partialRefundBody', {amount: refund})
-      await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title})
-    } else {
-      // Aucun remboursement
-      await notify(db, mission.client_id, 'Mission annulée', `Annulation dans les 2h — aucun remboursement conformément aux CGV.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledNoRefundBody', null)
-      await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title})
-    }
-  }
+  // Remboursement en cas d'annulation — dépend de QUI est à l'origine de l'annulation,
+  // pas seulement du timing. Le client n'a rien à se reprocher si l'annulation est
+  // causée par l'Œil ou décidée par un admin pour une raison hors faute du client.
+  if (status === 'cancelled') {
+    const initiatedByClient = req.user.role === 'client';
+    const refund = await refundOnCancellation(db, mission, initiatedByClient);
 
-  // Remboursement intégral si annulation avant assignation
-  if (status === 'cancelled' && req.user.role === 'client' && mission.status === 'pending') {
-    await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id])
-    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement annulation avant assignation',$3)`, [mission.client_id, mission.price, mission.id])
-    await notify(db, mission.client_id, '💰 Remboursement intégral', `${mission.price} MAD crédités sur votre portefeuille.`, 'info', mission.id, emitToUser, null, 'fullRefundTitle', 'fullRefundBody', {amount: mission.price})
+    if (initiatedByClient) {
+      if (!mission.oeil_id) {
+        await notify(db, mission.client_id, '💰 Remboursement intégral', `${refund} MAD crédités sur votre portefeuille.`, 'info', mission.id, emitToUser, null, 'fullRefundTitle', 'fullRefundBody', {amount: refund});
+      } else if (refund > 0) {
+        await notify(db, mission.client_id, '💰 Remboursement partiel', `${refund} MAD crédités sur votre portefeuille suite à l'annulation.`, 'info', mission.id, emitToUser, null, 'partialRefundTitle', 'partialRefundBody', {amount: refund});
+      } else {
+        await notify(db, mission.client_id, 'Mission annulée', `Annulation dans les 2h — aucun remboursement conformément aux CGV.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledNoRefundBody', null);
+      }
+      if (mission.oeil_id) {
+        await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
+      }
+    } else {
+      await notify(db, mission.client_id, '💰 Remboursement intégral', `${refund} MAD crédités sur votre portefeuille suite à l'annulation de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'fullRefundTitle', 'fullRefundBody', {amount: refund});
+      if (mission.oeil_id && mission.oeil_id !== req.user.id) {
+        await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
+      }
+    }
   }
 
 
@@ -1078,12 +1080,8 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
    
     }
 
-// Remboursement client
-      await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
-      await db.query(
-        `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement — aucun Œil disponible',$3)`,
-        [mission.client_id, mission.price, mission.id]
-      );
+// Remboursement client — annulation par le système (aucun remplaçant trouvé), non imputable au client : intégral
+      await refundOnCancellation(db, mission, false, 'Remboursement — aucun Œil disponible');
 
       // CRITIQUE : clôturer la mission pour qu'elle sorte définitivement de la boucle du cron.
       // Sans cette étape, la mission reste éligible indéfiniment et la pénalité/remboursement sont rejoués à chaque exécution.
@@ -1091,9 +1089,6 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
         `UPDATE missions SET status='cancelled', cancelled_at=NOW(), cancel_reason='Aucun remplaçant trouvé avant expiration du délai', is_priority=false, transfer_deadline=NULL, updated_at=NOW() WHERE id=$1`,
         [mission.id]
       );
-
-    // Annuler la mission
-    await db.query(`UPDATE missions SET status='cancelled', cancelled_at=NOW() WHERE id=$1`, [mission.id]);
 
     await emitToUser?.(mission.client_id, 'notification', {
       title: '❌ Mission annulée',

@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
+const { refundOnCancellation } = require('../utils/refund');
 const asyncHandler = require('../middleware/asyncHandler');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
@@ -1013,11 +1014,11 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
     await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.', 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
     await notify(mission.client_id, 'Réclamation résolue', 'Résolue en faveur de l\'Œil.', 'claimResolvedClientLoseTitle', 'claimResolvedClientLoseBody', null);
   } else {
-    await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [mission.price, mission.client_id]);
-    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Remboursement suite à réclamation',$3)`, [mission.client_id, mission.price, mission.id]);
+    // Réclamation gagnée par le client, non imputable à lui : remboursement intégral
+    const refund = await refundOnCancellation(db, mission, false, 'Remboursement suite à réclamation');
     await db.query(`UPDATE missions SET status='cancelled', updated_at=NOW() WHERE id=$1`, [mission.id]);
     await db.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
-    await notify(mission.client_id, '✅ Réclamation résolue', `${mission.price} MAD crédités sur votre portefeuille.`, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', { amount: mission.price });
+    await notify(mission.client_id, '✅ Réclamation résolue', `${refund} MAD crédités sur votre portefeuille.`, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', { amount: refund });
     await notify(mission.oeil_id, 'Réclamation résolue', 'Résolue en faveur du client.', 'claimResolvedClientLoseTitle', 'claimResolvedOeilLoseBody', null);
   }
 
