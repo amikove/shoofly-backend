@@ -618,9 +618,12 @@ const { status, cancel_reason } = req.body;
 
   // Remboursement en cas d'annulation — dépend de QUI est à l'origine de l'annulation,
   // pas seulement du timing. Le client n'a rien à se reprocher si l'annulation est
-  // causée par l'Œil ou décidée par un admin pour une raison hors faute du client.
+  // causée par l'Œil ou décidée par un admin pour une raison hors faute du client. l'admine a quand meme le choix de decider qui est respnsable et le montant
   if (status === 'cancelled') {
-    const initiatedByClient = req.user.role === 'client';
+    // Le client est traité comme "à l'origine" de l'annulation dans 2 cas :
+    // 1) c'est lui-même qui annule, 2) un admin annule en précisant que la faute lui revient
+    const initiatedByClient = req.user.role === 'client'
+      || (req.user.role === 'admin' && req.body.client_at_fault === true);
     const refund = await refundOnCancellation(db, mission, initiatedByClient);
 
     if (initiatedByClient) {
