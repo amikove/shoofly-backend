@@ -202,7 +202,7 @@ router.post('/:id/seen', authenticate, asyncHandler(async (req, res) => {
 // ── GET /missions ──────────────────────────────────────────
 router.get('/', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
-  const { status, type, mode, page = 1, limit = 20, sort = 'created_desc' } = req.query;
+  const { status, type, mode, search, page = 1, limit = 20, sort = 'created_desc' } = req.query;
   const offset = (page - 1) * limit;
 
   const ORDER = {
@@ -252,9 +252,19 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
     }
   }
   if (status) { where.push(`m.status=$${p++}`); params.push(status); }
-  if (type)   { where.push(`m.type=$${p++}`);   params.push(type); }
-
-  const wc = where.length ? 'WHERE ' + where.join(' AND ') : '';
+    if (type)   { where.push(`m.type=$${p++}`);   params.push(type); }
+    if (search) {
+      // Recherche sur : référence (fin de l'id), titre de mission, nom client, nom Œil
+      where.push(`(
+        m.id::text ILIKE $${p}
+        OR m.title ILIKE $${p}
+        OR (c.first_name || ' ' || c.last_name) ILIKE $${p}
+        OR (o.first_name || ' ' || o.last_name) ILIKE $${p}
+      )`);
+      params.push(`%${search}%`);
+      p++;
+    }
+    const wc = where.length ? 'WHERE ' + where.join(' AND ') : '';
 
 
   const { rows: missions } = await db.query(`
