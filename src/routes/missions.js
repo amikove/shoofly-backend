@@ -620,11 +620,27 @@ const { status, cancel_reason } = req.body;
   // pas seulement du timing. Le client n'a rien à se reprocher si l'annulation est
   // causée par l'Œil ou décidée par un admin pour une raison hors faute du client. l'admine a quand meme le choix de decider qui est respnsable et le montant
   if (status === 'cancelled') {
-    // Le client est traité comme "à l'origine" de l'annulation dans 2 cas :
-    // 1) c'est lui-même qui annule, 2) un admin annule en précisant que la faute lui revient
-    const initiatedByClient = req.user.role === 'client'
-      || (req.user.role === 'admin' && req.body.client_at_fault === true);
-    const refund = await refundOnCancellation(db, mission, initiatedByClient);
+    let refund;
+    // Un admin peut fixer un montant de remboursement précis, en dérogation à la règle automatique
+    if (req.user.role === 'admin' && req.body.refund_amount !== undefined) {
+      refund = Math.max(0, Math.min(parseFloat(req.body.refund_amount) || 0, mission.price));
+      if (refund > 0) {
+        await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [refund, mission.client_id]);
+        await db.query(
+          `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,$3,$4)`,
+          [mission.client_id, refund, 'Remboursement — montant fixé par l\'administrateur', mission.id]
+        );
+      }
+      await notify(db, mission.client_id, '💰 Remboursement', `${refund} MAD crédités sur votre portefeuille suite à l'annulation de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'fullRefundTitle', 'fullRefundBody', {amount: refund});
+      if (mission.oeil_id) {
+        await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
+      }
+    } else {
+      // Le client est traité comme "à l'origine" de l'annulation dans 2 cas :
+      // 1) c'est lui-même qui annule, 2) un admin annule en précisant que la faute lui revient
+      const initiatedByClient = req.user.role === 'client'
+        || (req.user.role === 'admin' && req.body.client_at_fault === true);
+      refund = await refundOnCancellation(db, mission, initiatedByClient);
 
     if (initiatedByClient) {
       if (!mission.oeil_id) {
@@ -643,10 +659,17 @@ const { status, cancel_reason } = req.body;
         await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
       }
     }
+    }
+
+    // Fermer automatiquement tout signalement encore ouvert lié à cette mission —
+    // la mission étant annulée, le problème signalé est désormais sans objet.
+    await db.query(
+      `UPDATE mission_reports SET status='resolved', admin_note=COALESCE(admin_note, 'Résolu automatiquement suite à l\'annulation de la mission'), resolved_by=$1, resolved_at=NOW()
+       WHERE mission_id=$2 AND status IN ('open','in_progress')`,
+      [req.user.id, mission.id]
+    );
+    await db.query(`UPDATE missions SET under_surveillance=false WHERE id=$1`, [mission.id]);
   }
-
-
-
 // Oeil marque terminée → démarrer le délai de 12h pour réclamation
 
   if (status === 'completed' && mission.oeil_id) {
