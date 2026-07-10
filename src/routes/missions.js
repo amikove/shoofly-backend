@@ -665,7 +665,7 @@ const { status, cancel_reason } = req.body;
     // Fermer automatiquement tout signalement encore ouvert lié à cette mission —
     // la mission étant annulée, le problème signalé est désormais sans objet.
     await db.query(
-      `UPDATE mission_reports SET status='resolved', admin_note=COALESCE(admin_note, 'Résolu automatiquement suite à l\'annulation de la mission'), resolved_by=$1, resolved_at=NOW()
+      `UPDATE mission_reports SET status='resolved', admin_note=COALESCE(admin_note, 'Résolu automatiquement suite à l''annulation de la mission'), resolved_by=$1, resolved_at=NOW()
        WHERE mission_id=$2 AND status IN ('open','in_progress')`,
       [req.user.id, mission.id]
     );
