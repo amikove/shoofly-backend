@@ -4,6 +4,8 @@ const { authenticate, requireRole } = require('../middleware/auth');
 const { getReliabilityLevel, reactivateWithCorrectiveEvent } = require('../utils/reliabilityScore');
 const asyncHandler = require('../middleware/asyncHandler');
 
+const DEFAULT_REACTIVATION_SCORE = 70; // score appliqué à une réintégration si l'admin n'en précise pas un autre
+
 // ── GET /reliability/me — Œil consulte son propre score ───
 router.get('/me', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
@@ -120,7 +122,7 @@ router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), as
   if (!request) return res.status(404).json({ error: 'Demande introuvable' });
 
   if (decision === 'approved') {
-      const newScore = reset_score || 70; // score de réintégration par défaut
+      const newScore = reset_score || DEFAULT_REACTIVATION_SCORE;
       await reactivateWithCorrectiveEvent(db, request.oeil_id, newScore, req.user.id);
     await db.query(
       `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
@@ -191,7 +193,7 @@ router.get('/admin/all-scores', authenticate, requireRole('admin'), asyncHandler
 router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
     const db = getDb();
     const { reset_score } = req.body;
-    const newScore = reset_score || 70;
+    const newScore = reset_score || DEFAULT_REACTIVATION_SCORE;
     const { rows: [oeilCheck] } = await db.query(`SELECT id, first_name, last_name FROM users WHERE id=$1 AND role='oeil'`, [req.params.oeilId]);
     if (!oeilCheck) return res.status(404).json({ error: 'Œil introuvable' });
     await reactivateWithCorrectiveEvent(db, req.params.oeilId, newScore, req.user.id);
