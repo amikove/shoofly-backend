@@ -390,10 +390,10 @@ initDb().then(() => {
       `);
 
       for (const m of lateH30) {
-        // Pénalité fiabilité
+        // Pénalité fiabilité — le score est entièrement recalculé par logReliabilityEvent ci-dessous,
+        // pas besoin de le décrémenter manuellement ici (ancien code mort, toujours écrasé après coup).
         await db.query(
           `UPDATE users SET
-            reliability_score = GREATEST(0, reliability_score - 20),
             transfer_cooldown_until = NOW() + INTERVAL '4 hours',
             transfer_count = transfer_count + 1
            WHERE id = $1`,
