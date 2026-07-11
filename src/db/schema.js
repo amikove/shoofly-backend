@@ -430,6 +430,7 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS content_key TEXT;
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS params JSONB;
     ALTER TABLE reliability_events ADD COLUMN IF NOT EXISTS is_reset BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS stale_notified_at TIMESTAMPTZ;
 
     -- Index de performance sur les colonnes fréquemment filtrées/jointes
     CREATE INDEX IF NOT EXISTS idx_withdrawals_oeil_id ON withdrawals(oeil_id);

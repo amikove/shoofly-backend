@@ -241,6 +241,7 @@ initDb().then(() => {
   let cronPreMissionRemindersRunning = false;
   let cronTransferDeadlineRunning = false;
   let cronAutoValidateRunning = false;
+  let cronStaleMissionsRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain ─────────────────
   cron.schedule('0 20 * * *', async () => {
@@ -606,6 +607,48 @@ initDb().then(() => {
     } catch (e) { console.error('❌ Cron error:', e.message); }
     finally { cronAutoValidateRunning = false; }
   });
+
+  // ── Cron toutes les 30 min — Missions jamais assignées (12h+, encore >4h avant le créneau) ──
+  cron.schedule('*/30 * * * *', async () => {
+    if (cronStaleMissionsRunning) { console.warn('⏭️ Cron missions sans Œil déjà en cours, tick ignoré'); return; }
+    cronStaleMissionsRunning = true;
+    try {
+      const db = getDb();
+
+      const { rows: staleMissions } = await db.query(`
+        SELECT * FROM missions
+        WHERE status = 'pending'
+          AND oeil_id IS NULL
+          AND created_at <= NOW() - INTERVAL '12 hours'
+          AND scheduled_at >= NOW() + INTERVAL '4 hours'
+          AND stale_notified_at IS NULL
+      `);
+
+      for (const m of staleMissions) {
+        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+        for (const admin of admins) {
+          await db.query(
+            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+             VALUES ($1, $2, $3, 'warning', $4, 'admin_missions', $5, $6, $7)`,
+            [admin.id, '⏳ Mission sans Œil depuis 12h', `Aucun Œil n'a encore été trouvé pour "${m.title}", en attente depuis plus de 12h.`, m.id,
+             'staleMissionAdminTitle', 'staleMissionAdminBody', JSON.stringify({ missionTitle: m.title })]
+          );
+        }
+
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+           VALUES ($1, $2, $3, 'warning', $4, 'mission_view', $5, $6, $7)`,
+          [m.client_id, '💡 Toujours aucun Œil pour votre mission', `Votre mission "${m.title}" n'a pas encore trouvé d'Œil après 12h. Augmenter le budget peut attirer plus de candidats. Consultez votre mission pour l'ajuster.`, m.id,
+           'staleMissionClientTitle', 'staleMissionClientBody', JSON.stringify({ missionTitle: m.title })]
+        );
+
+        await db.query(`UPDATE missions SET stale_notified_at = NOW() WHERE id = $1`, [m.id]);
+        console.log(`⏳ Notification mission sans Œil envoyée pour ${m.id}`);
+      }
+    } catch (e) { console.error('❌ Cron missions sans Œil error:', e.message); }
+    finally { cronStaleMissionsRunning = false; }
+  });
+
   // Keep-alive pour Render plan gratuit
 if (process.env.NODE_ENV === 'production') {
   setInterval(() => {
