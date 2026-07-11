@@ -75,25 +75,29 @@ function isWithinSchedule(disponibilites) {
 
 // ── Oeils publics ──────────────────────────────────────────
 router.get('/oeils', authenticate, asyncHandler(async (req, res) => {
-  const db = getDb();
-  const { city, available, search } = req.query;
-  let where = ["u.role='oeil'", "p.is_verified=true"], params = [], p = 1;
-  if (city)          { where.push(`u.city ILIKE $${p++}`); params.push(`%${city}%`); }
-  if (search) { where.push(`(u.first_name ILIKE $${p} OR u.last_name ILIKE $${p} OR u.city ILIKE $${p})`); params.push(`%${search}%`); p++; }
-  if (available==='1') { where.push('p.is_available=true'); }
-  const { rows } = await db.query(`
-    SELECT u.id,u.first_name,u.last_name,u.city,u.avatar_url,u.disponibilites,
-  p.bio,p.coverage_zone,p.is_verified,p.is_available,p.rating_avg,p.rating_count,p.total_missions
-FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-
-    WHERE ${where.join(' AND ')} ORDER BY p.rating_avg DESC, p.total_missions DESC
-  `, params);
-  const oeils = rows.map(o => ({
-  ...o,
-  is_available: o.is_available && isWithinSchedule(o.disponibilites)
-}))
-res.json({ oeils });
-}));
+    const db = getDb();
+    const { city, available, search, page = 1, limit = 100 } = req.query;
+    const offset = (page - 1) * limit;
+    let where = ["u.role='oeil'", "p.is_verified=true"], params = [], p = 1;
+    if (city)          { where.push(`u.city ILIKE $${p++}`); params.push(`%${city}%`); }
+    if (search) { where.push(`(u.first_name ILIKE $${p} OR u.last_name ILIKE $${p} OR u.city ILIKE $${p})`); params.push(`%${search}%`); p++; }
+    if (available==='1') { where.push('p.is_available=true'); }
+    const { rows } = await db.query(`
+      SELECT u.id,u.first_name,u.last_name,u.city,u.avatar_url,u.disponibilites,
+    p.bio,p.coverage_zone,p.is_verified,p.is_available,p.rating_avg,p.rating_count,p.total_missions
+  FROM users u JOIN oeil_profiles p ON p.user_id=u.id
+      WHERE ${where.join(' AND ')} ORDER BY p.rating_avg DESC, p.total_missions DESC
+      LIMIT $${p++} OFFSET $${p++}
+    `, [...params, limit, offset]);
+    const { rows: [{ n: total }] } = await db.query(`
+      SELECT COUNT(*)::int AS n FROM users u JOIN oeil_profiles p ON p.user_id=u.id WHERE ${where.join(' AND ')}
+    `, params);
+    const oeils = rows.map(o => ({
+    ...o,
+    is_available: o.is_available && isWithinSchedule(o.disponibilites)
+  }))
+  res.json({ oeils, total, page: +page, pages: Math.ceil(total / limit) });
+  }));
 
 router.get('/oeils/:id', authenticate, asyncHandler(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store')
