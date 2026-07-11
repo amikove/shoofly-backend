@@ -207,12 +207,23 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
   const offset = (page - 1) * limit;
 
   const ORDER = {
-    created_desc:   'm.created_at DESC',
-    created_asc:    'm.created_at ASC',
-    scheduled_asc:  'm.scheduled_at ASC NULLS LAST',
-    scheduled_desc: 'm.scheduled_at DESC NULLS LAST',
-    deadline_asc:   'm.transfer_deadline ASC NULLS LAST',
-  }
+      created_desc:   'm.created_at DESC',
+      created_asc:    'm.created_at ASC',
+      scheduled_asc:  'm.scheduled_at ASC NULLS LAST',
+      scheduled_desc: 'm.scheduled_at DESC NULLS LAST',
+      deadline_asc:   'm.transfer_deadline ASC NULLS LAST',
+      deadline_desc:  'm.transfer_deadline DESC NULLS LAST',
+      title_asc:      'm.title ASC',
+      title_desc:     'm.title DESC',
+      client_asc:     'c.first_name ASC, c.last_name ASC',
+      client_desc:    'c.first_name DESC, c.last_name DESC',
+      oeil_asc:       'o.first_name ASC, o.last_name ASC',
+      oeil_desc:      'o.first_name DESC, o.last_name DESC',
+      price_asc:      'm.price ASC',
+      price_desc:     'm.price DESC',
+      status_asc:     'm.status ASC',
+      status_desc:    'm.status DESC',
+    }
   const orderBy = ORDER[sort] || 'm.created_at DESC';
 
   let where = [], params = [];
