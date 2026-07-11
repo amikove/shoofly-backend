@@ -250,7 +250,7 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS subcategory VARCHAR(150);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS completed_by_oeil_at TIMESTAMPTZ;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ;
-    ALTER TABLE missions ADD COLUMN IF NOT EXISTS claim_comment TEXT;
+    ALTER TABLE missions DROP COLUMN IF EXISTS claim_comment; -- colonne morte, jamais utilisée (le vrai commentaire de réclamation est dans claims.comment)
     ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(10,2) NOT NULL DEFAULT 0;
 
     CREATE TABLE IF NOT EXISTS wallet_transactions (
