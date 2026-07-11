@@ -193,11 +193,9 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
   if (req.user.role === 'client') {
     where.push(`m.client_id=$${p++}`); params.push(req.user.id);
   } else if (req.user.role === 'oeil') {
-    // Un Œil suspendu ne doit voir aucune mission disponible, peu importe le mode
-    const { rows: [suspensionCheck] } = await db.query('SELECT is_suspended FROM users WHERE id=$1', [req.user.id]);
-    if (suspensionCheck?.is_suspended) {
-      return res.json({ missions: [], total: 0, page: +page, pages: 0 });
-    }
+    // La suspension est désormais gérée en amont par le middleware authenticate
+    // (mode='available' bloqué entièrement pour un Œil suspendu ; ses propres
+    // missions restent consultables pour qu'il puisse les terminer proprement).
 // placer les missions ignorées dans une table à part
     if (mode === 'available') {
       where.push(`m.status='pending' AND m.oeil_id IS NULL AND m.city=$${p++}`);
@@ -907,8 +905,9 @@ await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${
 router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
     const db = getDb();
     const { message } = req.body;
-    const { rows: [oeilUser] } = await db.query('SELECT is_suspended, transfer_cooldown_until FROM users WHERE id=$1', [req.user.id]);
-    if (oeilUser?.is_suspended) return res.status(403).json({ error: 'Votre compte est suspendu, vous ne pouvez pas postuler à une mission.' });
+    // La suspension est vérifiée en amont par le middleware authenticate ; le cooldown
+    // de transfert reste à vérifier ici, ce n'est pas la même chose qu'une suspension.
+    const { rows: [oeilUser] } = await db.query('SELECT transfer_cooldown_until FROM users WHERE id=$1', [req.user.id]);
     if (oeilUser?.transfer_cooldown_until && new Date(oeilUser.transfer_cooldown_until) > new Date()) {
       const remaining = Math.ceil((new Date(oeilUser.transfer_cooldown_until) - Date.now()) / 3600000);
       return res.status(403).json({ error: `Vous ne pouvez pas postuler pendant encore ${remaining}h suite à un transfert de mission.` });
