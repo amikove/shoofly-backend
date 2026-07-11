@@ -85,25 +85,26 @@ router.get('/permissions', authenticate, requireSuperAdmin, (req, res) => {
 });
 
 
-// ── POST /super-admin/test-reliability/:oeilId — TEST UNIQUEMENT ──
+// ── POST /super-admin/test-reliability/:oeilId — TEST UNIQUEMENT, désactivé en production ──
 router.post('/test-reliability/:oeilId', authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ error: 'Cet outil de simulation est désactivé en production.' });
+  }
   const db = getDb();
   const { logReliabilityEvent } = require('../utils/reliabilityScore');
   const oeilId = req.params.oeilId;
-
   const { rows: [oeil] } = await db.query('SELECT * FROM users WHERE id=$1 AND role=\'oeil\'', [oeilId]);
   if (!oeil) return res.status(404).json({ error: 'Œil introuvable' });
-
   // Nettoyer l'historique existant
   await db.query('DELETE FROM reliability_events WHERE oeil_id=$1', [oeilId]);
   await db.query('UPDATE users SET is_suspended=false, suspended_at=NULL, suspended_reason=NULL WHERE id=$1', [oeilId]);
-
   const scenarios = [
     ...Array(10).fill().map((_, i) => ({ points: 10, reason: `Mission honorée parfaitement #${i + 1}`, grave: false })),
     ...Array(5).fill().map((_, i) => ({ points: 5, reason: `Mission avec souci mineur #${i + 1}`, grave: false })),
     ...Array(3).fill().map((_, i) => ({ points: 0, reason: `Mission mal notée par le client #${i + 1}`, grave: true })),
     ...Array(2).fill().map((_, i) => ({ points: 5, reason: `Transfert avant démarrage avec remplaçant #${i + 1}`, grave: false })),
-    ...Array(2).fill().map((_, i) => ({ points: -20, reason: `Transfert pendant mission sans remplaçant #${i + 1}`, grave: true })),
+    { points: -10, reason: 'Transfert avant démarrage sans remplaçant trouvé', grave: true },
+    ...Array(2).fill().map((_, i) => ({ points: -70, reason: `Transfert pendant mission sans remplaçant #${i + 1}`, grave: true })),
     { points: -20, reason: 'Mission non démarrée à l\'heure (H+30)', grave: true },
   ];
 
