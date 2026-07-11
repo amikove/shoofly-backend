@@ -21,15 +21,18 @@ async function computeReliabilityScore(db, oeilId) {
   if (totalMissions === 0) return 90; // score de départ
 
   // Score historique complet
-  const sumAll = allEvents.reduce((s, e) => s + e.points, 0);
-  const maxAll = totalMissions * 10;
-  const scoreHistorique = maxAll > 0 ? (sumAll / maxAll) * 100 : 90;
-
-  // Score sur les 20 dernières missions
-  const last20 = allEvents.slice(-20);
-  const sum20 = last20.reduce((s, e) => s + e.points, 0);
-  const max20 = last20.length * 10;
-  const score20 = max20 > 0 ? (sum20 / max20) * 100 : 90;
+    // Chaque événement est plafonné à ±10 dans ce calcul : la formule suppose une échelle -10/+10,
+    // donc une pénalité plus sévère (ex: -15, -25...) ne doit pas faire s'effondrer le score de façon
+    // disproportionnée avec un petit historique — le barème réel reste inchangé en base (reliability_events).
+    const clamp = (v) => Math.max(-10, Math.min(10, v));
+    const sumAll = allEvents.reduce((s, e) => s + clamp(e.points), 0);
+    const maxAll = totalMissions * 10;
+    const scoreHistorique = maxAll > 0 ? (sumAll / maxAll) * 100 : 90;
+    // Score sur les 20 dernières missions
+    const last20 = allEvents.slice(-20);
+    const sum20 = last20.reduce((s, e) => s + clamp(e.points), 0);
+    const max20 = last20.length * 10;
+    const score20 = max20 > 0 ? (sum20 / max20) * 100 : 90;
 
   // Pondération : 70% récent, 30% historique
   let finalScore = (0.7 * score20) + (0.3 * scoreHistorique);
