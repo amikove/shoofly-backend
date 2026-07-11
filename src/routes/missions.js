@@ -232,9 +232,12 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
   if (req.user.role === 'client') {
     where.push(`m.client_id=$${p++}`); params.push(req.user.id);
   } else if (req.user.role === 'oeil') {
-
+    // Un Œil suspendu ne doit voir aucune mission disponible, peu importe le mode
+    const { rows: [suspensionCheck] } = await db.query('SELECT is_suspended FROM users WHERE id=$1', [req.user.id]);
+    if (suspensionCheck?.is_suspended) {
+      return res.json({ missions: [], total: 0, page: +page, pages: 0 });
+    }
 // placer les missions ignorées dans une table à part
-
     if (mode === 'available') {
       where.push(`m.status='pending' AND m.oeil_id IS NULL AND m.city=$${p++}`);
       params.push(req.user.city);
