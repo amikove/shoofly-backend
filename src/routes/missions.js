@@ -1190,16 +1190,18 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandl
     [req.params.id, req.user.id]
   );
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
- if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
-
-  // Vérifier cooldown transfert
-  const { rows: [oeilUser] } = await db.query(
-    'SELECT transfer_cooldown_until FROM users WHERE id=$1', [req.user.id]
-  );
-  if (oeilUser?.transfer_cooldown_until && new Date(oeilUser.transfer_cooldown_until) > new Date()) {
-    const remaining = Math.ceil((new Date(oeilUser.transfer_cooldown_until) - Date.now()) / 3600000);
-    return res.status(403).json({ error: `Vous ne pouvez pas postuler pendant encore ${remaining}h suite à un transfert de mission.` });
-  }
+if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
+    // Vérifier suspension et cooldown de transfert — sur l'Œil qu'on embauche, pas sur le client
+    const { rows: [oeilUser] } = await db.query(
+      'SELECT is_suspended, transfer_cooldown_until FROM users WHERE id=$1', [req.params.oeilId]
+    );
+    if (oeilUser?.is_suspended) {
+      return res.status(403).json({ error: 'Cet Œil est actuellement suspendu et ne peut pas être embauché.' });
+    }
+    if (oeilUser?.transfer_cooldown_until && new Date(oeilUser.transfer_cooldown_until) > new Date()) {
+      const remaining = Math.ceil((new Date(oeilUser.transfer_cooldown_until) - Date.now()) / 3600000);
+      return res.status(403).json({ error: `Cet Œil ne peut pas être embauché pendant encore ${remaining}h suite à un transfert de mission.` });
+    }
 
   const { rows: [interest] } = await db.query(
     'SELECT * FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2',
