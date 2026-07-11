@@ -1,5 +1,24 @@
 const { getDb } = require('../db/schema');
 
+// ── Pénalité proportionnelle au délai avant la mission ────
+// Plus l'action (refus, annulation...) est tardive, plus elle désorganise
+// le client et pèse sur la réputation de la plateforme. Barème partagé par
+// toutes les routes qui pénalisent un abandon d'Œil sur une mission assignée.
+function computeLatePenalty(scheduledAt, actionLabel) {
+  const hoursBeforeMission = scheduledAt
+    ? (new Date(scheduledAt).getTime() - Date.now()) / 3600000
+    : null;
+  let points, timing;
+  if (hoursBeforeMission === null || hoursBeforeMission > 24) {
+    points = -15; timing = 'plus de 24h avant';
+  } else if (hoursBeforeMission > 2) {
+    points = -35; timing = 'entre 2h et 24h avant';
+  } else {
+    points = -50; timing = 'moins de 2h avant, très tardif';
+  }
+  return { points, reason: `Mission ${actionLabel} (${timing})`, isGrave: points <= -35 };
+}
+
 // ── Enregistrer un événement de fiabilité ─────────────────
 async function logReliabilityEvent(db, oeilId, missionId, points, reason, isGrave = false) {
   await db.query(
@@ -116,4 +135,5 @@ module.exports = {
   checkAndUpdateSuspension,
   getReliabilityLevel,
   reactivateWithCorrectiveEvent,
+  computeLatePenalty,
 };

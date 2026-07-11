@@ -3,7 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
-const { logReliabilityEvent } = require('../utils/reliabilityScore');
+const { logReliabilityEvent, computeLatePenalty } = require('../utils/reliabilityScore');
 const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -523,23 +523,9 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async
       );
       if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
 
-      // Pénalité de fiabilité proportionnelle au délai avant la mission :
-        // plus le refus est tardif, plus il désorganise le client et pèse sur la réputation de la plateforme.
-        const hoursBeforeMission = mission.scheduled_at
-          ? (new Date(mission.scheduled_at).getTime() - Date.now()) / 3600000
-          : null;
-        let penaltyPoints, penaltyReason;
-        if (hoursBeforeMission === null || hoursBeforeMission > 24) {
-          penaltyPoints = -15;
-          penaltyReason = 'Mission assignée refusée par l\'Œil (plus de 24h avant)';
-        } else if (hoursBeforeMission > 2) {
-          penaltyPoints = -35;
-          penaltyReason = 'Mission assignée refusée par l\'Œil (entre 2h et 24h avant)';
-        } else {
-          penaltyPoints = -50;
-          penaltyReason = 'Mission assignée refusée par l\'Œil (moins de 2h avant, très tardif)';
-        }
-        await logReliabilityEvent(db, req.user.id, mission.id, penaltyPoints, penaltyReason, penaltyPoints <= -35);
+      // Pénalité de fiabilité proportionnelle au délai avant la mission
+      const { points: penaltyPoints, reason: penaltyReason, isGrave } = computeLatePenalty(mission.scheduled_at, 'assignée refusée par l\'Œil');
+        await logReliabilityEvent(db, req.user.id, mission.id, penaltyPoints, penaltyReason, isGrave);
         // Cooldown de 4h : empêche l'Œil d'accepter immédiatement une autre mission après avoir abandonné celle-ci
         await db.query(
           `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '4 hours' WHERE id=$1`,
@@ -629,6 +615,12 @@ const { status, cancel_reason } = req.body;
   // pas seulement du timing. Le client n'a rien à se reprocher si l'annulation est
   // causée par l'Œil ou décidée par un admin pour une raison hors faute du client. l'admine a quand meme le choix de decider qui est respnsable et le montant
   if (status === 'cancelled') {
+    // Pénalité de fiabilité — sans ça, un Œil pouvait annuler directement via ce
+    // endpoint pour échapper à la conséquence appliquée sur /refuse et /transfer.
+    if (req.user.role === 'oeil') {
+      const { points, reason, isGrave } = computeLatePenalty(mission.scheduled_at, 'annulée par l\'Œil');
+      await logReliabilityEvent(db, req.user.id, mission.id, points, reason, isGrave);
+    }
     let refund;
     // Un admin peut fixer un pourcentage de remboursement précis, en dérogation à la règle automatique
     if (req.user.role === 'admin' && req.body.refund_percent !== undefined) {
