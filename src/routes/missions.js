@@ -1062,22 +1062,34 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
 
 // ── POST /missions/:id/assign-admin ── Admin affecte manuellement ──
 router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
-  const db = getDb();
-  const emitToUser = req.app.get('emitToUser');
-  const io = req.app.get('io');
-  const { oeil_id } = req.body;
-
-  if (!oeil_id) return res.status(400).json({ error: 'oeil_id requis' });
-
-  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
-  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (!['pending'].includes(mission.status)) return res.status(400).json({ error: 'Mission non disponible pour affectation' });
-
-  // Vérifier que l'Œil est vérifié et disponible
-  const { rows: [profile] } = await db.query(
-    `SELECT is_verified, is_available FROM oeil_profiles WHERE user_id=$1`, [oeil_id]
-  );
-  if (!profile?.is_verified) return res.status(400).json({ error: 'Œil non vérifié' });
+    const db = getDb();
+    const emitToUser = req.app.get('emitToUser');
+    const io = req.app.get('io');
+    const { oeil_id, override_warning } = req.body;
+    if (!oeil_id) return res.status(400).json({ error: 'oeil_id requis' });
+    const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+    if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+    if (!['pending'].includes(mission.status)) return res.status(400).json({ error: 'Mission non disponible pour affectation' });
+    // Vérifier que l'Œil est vérifié et disponible
+    const { rows: [profile] } = await db.query(
+      `SELECT is_verified, is_available FROM oeil_profiles WHERE user_id=$1`, [oeil_id]
+    );
+    if (!profile?.is_verified) return res.status(400).json({ error: 'Œil non vérifié' });
+    // Suspension/cooldown : bloqué par défaut, mais l'admin peut passer outre avec confirmation explicite
+    const { rows: [oeilStatus] } = await db.query('SELECT is_suspended, transfer_cooldown_until FROM users WHERE id=$1', [oeil_id]);
+    const hasCooldown = oeilStatus?.transfer_cooldown_until && new Date(oeilStatus.transfer_cooldown_until) > new Date();
+    if ((oeilStatus?.is_suspended || hasCooldown) && !override_warning) {
+      const reasons = [];
+      if (oeilStatus?.is_suspended) reasons.push('cet Œil est actuellement suspendu');
+      if (hasCooldown) {
+        const remaining = Math.ceil((new Date(oeilStatus.transfer_cooldown_until) - Date.now()) / 3600000);
+        reasons.push(`cet Œil est en cooldown pour encore ${remaining}h suite à un transfert de mission`);
+      }
+      return res.status(409).json({
+        error: `Attention : ${reasons.join(' et ')}. Confirmez pour affecter quand même.`,
+        requires_confirmation: true,
+      });
+    }
 
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [oeil_id]);
 
