@@ -38,7 +38,9 @@ async function computeReliabilityScore(db, oeilId) {
   let finalScore = (0.7 * score20) + (0.3 * scoreHistorique);
 
   // Plancher protégé pour débutants (< 10 missions)
-  const plancher = totalMissions < 10 ? 40 : 0;
+  // Le plancher doit rester au-dessus du seuil de suspension (50) pour vraiment protéger
+    // un débutant d'une suspension automatique après une seule erreur, même grave.
+    const plancher = totalMissions < 10 ? 55 : 0;
 
   finalScore = Math.max(plancher, Math.min(100, finalScore));
 
