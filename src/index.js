@@ -558,7 +558,17 @@ initDb().then(() => {
           AND validated_at IS NULL
       `);
       for (const mission of missions) {
-        await db.query(`UPDATE missions SET validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
+        // Le statut a pu changer entre le SELECT et ici (ex: réclamation déposée
+        // entre-temps) — la garde sur le WHERE évite de payer une mission qui n'est
+        // plus 'completed'.
+        const { rowCount } = await db.query(
+          `UPDATE missions SET validated_at=NOW(), updated_at=NOW() WHERE id=$1 AND status='completed'`,
+          [mission.id]
+        );
+        if (rowCount === 0) {
+          console.log(`ℹ️ Auto-validation ignorée pour mission ${mission.id} : statut a changé entre-temps`);
+          continue;
+        }
         await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
         await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Validation automatique après 12h',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
         console.log(`✅ Auto-validé mission ${mission.id}`);
