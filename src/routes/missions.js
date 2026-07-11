@@ -1207,12 +1207,10 @@ if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission 
     const { rows: [oeilUser] } = await db.query(
       'SELECT is_suspended, transfer_cooldown_until FROM users WHERE id=$1', [req.params.oeilId]
     );
-    if (oeilUser?.is_suspended) {
-      return res.status(403).json({ error: 'Cet Œil est actuellement suspendu et ne peut pas être embauché.' });
-    }
-    if (oeilUser?.transfer_cooldown_until && new Date(oeilUser.transfer_cooldown_until) > new Date()) {
-      const remaining = Math.ceil((new Date(oeilUser.transfer_cooldown_until) - Date.now()) / 3600000);
-      return res.status(403).json({ error: `Cet Œil ne peut pas être embauché pendant encore ${remaining}h suite à un transfert de mission.` });
+    if (oeilUser?.is_suspended || (oeilUser?.transfer_cooldown_until && new Date(oeilUser.transfer_cooldown_until) > new Date())) {
+      // Message volontairement générique côté client — la raison précise (suspension, cooldown)
+      // est une information interne de fiabilité, non communicable au client.
+      return res.status(403).json({ error: 'Cet Œil n\'est plus disponible pour cette mission.' });
     }
 
   const { rows: [interest] } = await db.query(
