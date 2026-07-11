@@ -1181,10 +1181,12 @@ if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission 
   if (!interest) return res.status(400).json({ error: "Cet Œil n'a pas exprimé son intérêt" });
 
   const { rows: [updated] } = await db.query(
-    `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), updated_at=NOW()
+    `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), is_priority=false, transfer_deadline=NULL, updated_at=NOW()
      WHERE id=$2 RETURNING *`,
     [req.params.oeilId, req.params.id]
   );
+
+  await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil choisi par le client parmi les intéressés');
 
   // Re-vérifier le créneau avant assignation
   const { rows: creneauConflicts } = await db.query(`
