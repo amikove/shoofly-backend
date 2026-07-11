@@ -2,6 +2,7 @@ const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
+const { logStatus } = require('../utils/missionHistory');
 
 // ══ RÈGLES ANTI-FRAUDE ════════════════════════════════════════
 // Score de risque : 0-100. Au-delà de 70 → alerte. Au-delà de 90 → blocage auto.
@@ -395,13 +396,53 @@ router.post('/warn/:userId', authenticate, requireRole('admin'), asyncHandler(as
 // ── POST /anti-fraud/block/:userId ───────────────────────
 router.post('/block/:userId', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
   const { reason } = req.body;
   await db.query('UPDATE users SET is_active=false WHERE id=$1', [req.params.userId]);
   await db.query(
     `INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Compte suspendu',$2,'info','none',$3,$4,$5)`,
     [req.params.userId, reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.', 'accountSuspendedTitle', reason ? null : 'accountSuspendedDefaultBody', null]
   );
-  res.json({ message: 'Compte bloqué', user_id: req.params.userId });
+
+  // Si l'utilisateur bloqué est un Œil avec des missions en cours, les remettre
+  // automatiquement en file d'attente prioritaire plutôt que de les laisser
+  // bloquées avec un prestataire qui ne peut plus les honorer. Même mécanisme
+  // que POST /:id/transfer (missions.js) : pending + is_priority + délai de
+  // grâce selon le type de mission. Pas de pénalité de fiabilité ici — le
+  // blocage du compte est déjà la conséquence.
+  const { rows: strandedMissions } = await db.query(
+    `SELECT * FROM missions WHERE oeil_id=$1 AND status IN ('assigned','en_route','active')`,
+    [req.params.userId]
+  );
+  for (const mission of strandedMissions) {
+    const transferType = mission.status === 'assigned' ? 'before' : 'during';
+    const graceMinutes = mission.type === 'file_attente' ? 45 : 60;
+    const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+
+    const { rowCount } = await db.query(
+      `UPDATE missions SET
+         status='pending', is_priority=true, transfer_type=$1, transferred_from=$2,
+         transfer_reason=$3, transfer_deadline=$4, oeil_id=NULL, updated_at=NOW()
+       WHERE id=$5 AND status=$6`,
+      [transferType, req.params.userId, 'Compte prestataire indisponible', deadline, mission.id, mission.status]
+    );
+    if (rowCount === 0) continue; // statut déjà changé entre-temps
+
+    await logStatus(db, mission.id, 'pending', req.user.id, 'Réattribution automatique — Œil bloqué par un admin');
+
+    // Formulation neutre côté client : ne mentionne ni blocage ni fraude.
+    const title = '⚠️ Changement sur votre mission';
+    const body = `Votre mission "${mission.title}" est en cours de réattribution suite à un changement côté prestataire. Nous recherchons un remplaçant en urgence.`;
+    await db.query(
+      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'info',$4,'mission_view',$5,$6,$7)`,
+      [mission.client_id, title, body, mission.id, 'missionChangeAlertTitle', 'missionChangeAlertBody', JSON.stringify({ missionTitle: mission.title })]
+    );
+    if (emitToUser) emitToUser(mission.client_id, 'notification', { title, body });
+    if (io) io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
+  }
+
+  res.json({ message: 'Compte bloqué', user_id: req.params.userId, reassigned_missions: strandedMissions.length });
 }));
 
 // ── POST /anti-fraud/hold-withdrawal/:id ─────────────────
