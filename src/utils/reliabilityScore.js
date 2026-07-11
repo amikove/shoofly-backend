@@ -88,9 +88,39 @@ function getReliabilityLevel(score) {
   return { label: 'Suspendu', stars: 0, badge: '🔴', color: 'red' };
 }
 
+// Réintégration : insère un événement correctif dont le poids ramène le score recalculé
+// à la valeur cible voulue par l'admin — garde l'historique complet et honnête,
+// plutôt que d'écraser reliability_score directement (ce qui serait effacé au prochain événement).
+async function reactivateWithCorrectiveEvent(db, oeilId, targetScore, adminId) {
+  const { rows: allEvents } = await db.query(
+    `SELECT points FROM reliability_events WHERE oeil_id=$1 ORDER BY created_at ASC`,
+    [oeilId]
+  );
+  const clamp = (v) => Math.max(-10, Math.min(10, v));
+  const currentSum = allEvents.reduce((s, e) => s + clamp(e.points), 0);
+  const totalMissions = allEvents.length + 1; // +1 pour l'événement correctif qu'on va ajouter
+
+  // On cherche X (le point correctif, potentiellement > 10, volontairement PAS clampé lui-même,
+  // pour pouvoir vraiment compenser un historique très négatif) tel que :
+  // ((currentSum + X) / (totalMissions * 10)) * 100 = targetScore
+  const requiredSum = (targetScore / 100) * (totalMissions * 10);
+  const correctivePoints = Math.round(requiredSum - currentSum);
+
+  await db.query(
+    `INSERT INTO reliability_events (oeil_id, mission_id, points, reason, is_grave)
+     VALUES ($1, NULL, $2, $3, false)`,
+    [oeilId, correctivePoints, `Réintégration administrative — ajustement vers ${targetScore}%`]
+  );
+
+  const score = await computeReliabilityScore(db, oeilId);
+  await db.query(`UPDATE users SET reliability_score=$1, is_suspended=false, suspended_at=NULL, suspended_reason=NULL WHERE id=$2`, [score, oeilId]);
+  return score;
+}
+
 module.exports = {
   logReliabilityEvent,
   computeReliabilityScore,
   checkAndUpdateSuspension,
   getReliabilityLevel,
+  reactivateWithCorrectiveEvent,
 };
