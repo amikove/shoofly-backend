@@ -1052,6 +1052,19 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
       });
     }
 
+  // Vérifier les conflits de créneau (même requête que POST /:id/hire/:oeilId)
+  const { rows: creneauConflicts } = await db.query(`
+    SELECT m.id FROM missions m
+    WHERE m.oeil_id = $1
+      AND m.status IN ('assigned','en_route','active')
+      AND m.id != $2
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
+  `, [oeil_id, mission.id, mission.scheduled_at])
+
+  if (creneauConflicts.length > 0) {
+    return res.status(400).json({ error: 'Cet Œil a déjà une mission dans le même créneau.' })
+  }
+
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [oeil_id]);
 
   await db.query(`
