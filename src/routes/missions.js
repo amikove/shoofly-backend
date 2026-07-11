@@ -39,8 +39,9 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
   if (mission.status !== 'completed') return res.status(400).json({ error: 'Mission non terminée' });
   if (mission.validated_at) return res.status(400).json({ error: 'Mission déjà validée' });
 
-  await db.query(`UPDATE missions SET validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
- 
+  const { rowCount } = await db.query(`UPDATE missions SET validated_at=NOW(), updated_at=NOW() WHERE id=$1 AND status='completed' AND validated_at IS NULL`, [mission.id]);
+  if (rowCount === 0) return res.status(409).json({ error: 'Cette mission a déjà été validée ou a changé de statut entre-temps.' });
+
   if (mission.transfer_type === 'during' && mission.transferred_from && mission.oeil2_id) {
     // Split 50/50
     const half = Math.round(mission.oeil_earning * 0.5 * 100) / 100;
@@ -80,7 +81,8 @@ router.post('/:id/claim', authenticate, asyncHandler(async (req, res) => {
   const emitToUser = req.app.get('emitToUser');
 
 
-  await db.query(`UPDATE missions SET status='sous_reclamation', updated_at=NOW() WHERE id=$1`, [req.params.id]);
+  const { rowCount } = await db.query(`UPDATE missions SET status='sous_reclamation', updated_at=NOW() WHERE id=$1 AND status='completed'`, [req.params.id]);
+  if (rowCount === 0) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
   await db.query(`INSERT INTO claims (mission_id, client_id, comment) VALUES ($1, $2, $3)`, [req.params.id, req.user.id, comment.trim()]);
   await logStatus(db, mission.id, 'sous_reclamation', req.user.id, 'Réclamation client');
   
@@ -449,9 +451,10 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
         is_priority=false,
         transfer_deadline=NULL,
         updated_at=NOW()
-      WHERE id=$2 RETURNING *`,
+      WHERE id=$2 AND status='pending' RETURNING *`,
     [req.user.id, req.params.id]
   );
+  if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
 
   await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil sélectionné par le client');
 
@@ -518,10 +521,10 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async
     }
     // Mission assignée — refuser
       const { rows: [mission] } = await db.query(
-        `UPDATE missions SET status='pending', oeil_id=NULL, updated_at=NOW() WHERE id=$1 AND oeil_id=$2 RETURNING *`,
+        `UPDATE missions SET status='pending', oeil_id=NULL, updated_at=NOW() WHERE id=$1 AND oeil_id=$2 AND status='assigned' RETURNING *`,
         [req.params.id, req.user.id]
       );
-      if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+      if (!mission) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
 
       // Pénalité de fiabilité proportionnelle au délai avant la mission
       const { points: penaltyPoints, reason: penaltyReason, isGrave } = computeLatePenalty(mission.scheduled_at, 'assignée refusée par l\'Œil');
@@ -603,8 +606,9 @@ const { status, cancel_reason } = req.body;
         started_at   = CASE WHEN $1='active'    THEN NOW() ELSE started_at END,
         is_priority  = CASE WHEN $1 IN ('cancelled','completed') THEN false ELSE is_priority END,
         updated_at   = NOW()
-      WHERE id=$3 RETURNING *
-  `, [status, cancel_reason||null, mission.id]);
+      WHERE id=$3 AND status=$4 RETURNING *
+  `, [status, cancel_reason||null, mission.id, mission.status]);
+  if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
 
   // Logger le changement de statut (sauf completed géré plus bas)
   if (status !== 'completed') {
@@ -969,6 +973,23 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   const graceMinutes = mission.type === 'file_attente' ? 45 : 60;
   const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
 
+  // Remettre la mission en pending avec flag priorité — vérifié et appliqué
+  // avant de toucher au compte de l'Œil, pour ne pas lui imputer un cooldown
+  // si la mission a en fait déjà changé de statut entre-temps.
+  const { rowCount: transferRowCount } = await db.query(`
+    UPDATE missions SET
+      status='pending',
+      is_priority=true,
+      transfer_type=$1,
+      transferred_from=$2,
+      transfer_reason=$3,
+      transfer_deadline=$4,
+      oeil_id=NULL,
+      updated_at=NOW()
+    WHERE id=$5 AND status=$6
+  `, [transferType, req.user.id, reason, deadline, mission.id, mission.status]);
+  if (transferRowCount === 0) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+
   // Cooldown 4h si transfert pendant mission
   if (transferType === 'during') {
     await db.query(
@@ -981,20 +1002,6 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
       [req.user.id]
     );
   }
-
-  // Remettre la mission en pending avec flag priorité
-  await db.query(`
-    UPDATE missions SET
-      status='pending',
-      is_priority=true,
-      transfer_type=$1,
-      transferred_from=$2,
-      transfer_reason=$3,
-      transfer_deadline=$4,
-      oeil_id=NULL,
-      updated_at=NOW()
-    WHERE id=$5
-  `, [transferType, req.user.id, reason, deadline, mission.id]);
 
 // Pénalité fiabilité — sera recalculée précisément si pas de remplaçant (cron)
   if (transferType === 'before') {
@@ -1067,7 +1074,7 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
 
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [oeil_id]);
 
-  await db.query(`
+  const { rowCount: assignRowCount } = await db.query(`
       UPDATE missions SET
         oeil_id=$1,
         status='assigned',
@@ -1075,8 +1082,9 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
         is_priority=false,
         transfer_deadline=NULL,
         updated_at=NOW()
-      WHERE id=$2
+      WHERE id=$2 AND status='pending'
     `, [oeil_id, mission.id]);
+  if (assignRowCount === 0) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
 
   await logStatus(db, mission.id, 'assigned', req.user.id, 'Affectation manuelle par admin');
 
@@ -1113,6 +1121,19 @@ async function checkTransferDeadlines(db, emitToUser) {
   `);
 
   for (const mission of expired) {
+    // Clôturer la mission d'abord, sous garde de statut — si un remplaçant l'a
+    // entre-temps acceptée/embauchée (sortie de pending/is_priority) entre le
+    // SELECT ci-dessus et cette itération, on ne rejoue pas la pénalité et le
+    // remboursement dessus.
+    const { rowCount: cancelRowCount } = await db.query(
+      `UPDATE missions SET status='cancelled', cancelled_at=NOW(), cancel_reason='Aucun remplaçant trouvé avant expiration du délai', is_priority=false, transfer_deadline=NULL, updated_at=NOW() WHERE id=$1 AND status='pending' AND is_priority=true`,
+      [mission.id]
+    );
+    if (cancelRowCount === 0) {
+      console.log(`ℹ️ checkTransferDeadlines: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
+      continue;
+    }
+
     // Pénalité aggravée sur l'Œil 1 si pendant mission
 if (mission.transfer_type === 'during' && mission.transferred_from) {
         await db.query(`
@@ -1141,13 +1162,6 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
 
 // Remboursement client — annulation par le système (aucun remplaçant trouvé), non imputable au client : intégral
       await refundOnCancellation(db, mission, false, 'Remboursement — aucun Œil disponible');
-
-      // CRITIQUE : clôturer la mission pour qu'elle sorte définitivement de la boucle du cron.
-      // Sans cette étape, la mission reste éligible indéfiniment et la pénalité/remboursement sont rejoués à chaque exécution.
-      await db.query(
-        `UPDATE missions SET status='cancelled', cancelled_at=NOW(), cancel_reason='Aucun remplaçant trouvé avant expiration du délai', is_priority=false, transfer_deadline=NULL, updated_at=NOW() WHERE id=$1`,
-        [mission.id]
-      );
 
     await emitToUser?.(mission.client_id, 'notification', {
       title: '❌ Mission annulée',
@@ -1195,9 +1209,10 @@ if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission 
 
   const { rows: [updated] } = await db.query(
     `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), is_priority=false, transfer_deadline=NULL, updated_at=NOW()
-     WHERE id=$2 RETURNING *`,
+     WHERE id=$2 AND status='pending' RETURNING *`,
     [req.params.oeilId, req.params.id]
   );
+  if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
 
   await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil choisi par le client parmi les intéressés');
 
