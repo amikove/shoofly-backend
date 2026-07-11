@@ -100,6 +100,16 @@ async function checkAndUpdateSuspension(db, oeilId) {
   return score;
 }
 
+// ── Statut "nouveau" ────────────────────────────────────────
+// Un Œil avec moins de NEW_OEIL_MISSION_THRESHOLD missions n'a pas assez
+// d'historique pour qu'un score/note affiché à un tiers soit significatif —
+// utilisé par les routes exposant un Œil à un client ou un autre Œil pour
+// remplacer le score par un badge "Nouveau" plutôt qu'un chiffre trompeur.
+const NEW_OEIL_MISSION_THRESHOLD = 10;
+function isNewOeil(totalMissions) {
+  return (totalMissions || 0) < NEW_OEIL_MISSION_THRESHOLD;
+}
+
 // ── Niveaux et badges ──────────────────────────────────────
 function getReliabilityLevel(score) {
   if (score >= 95) return { label: 'Excellent', stars: 5, badge: '⭐⭐⭐⭐⭐', color: 'green' };
@@ -136,4 +146,6 @@ module.exports = {
   getReliabilityLevel,
   reactivateWithCorrectiveEvent,
   computeLatePenalty,
+  isNewOeil,
+  NEW_OEIL_MISSION_THRESHOLD,
 };

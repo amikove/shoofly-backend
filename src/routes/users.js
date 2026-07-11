@@ -5,6 +5,7 @@ const { authenticate, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
+const { isNewOeil } = require('../utils/reliabilityScore');
 const asyncHandler = require('../middleware/asyncHandler');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
@@ -93,10 +94,19 @@ router.get('/oeils', authenticate, asyncHandler(async (req, res) => {
     const { rows: [{ n: total }] } = await db.query(`
       SELECT COUNT(*)::int AS n FROM users u JOIN oeil_profiles p ON p.user_id=u.id WHERE ${where.join(' AND ')}
     `, params);
-    const oeils = rows.map(o => ({
-    ...o,
-    is_available: o.is_available && isWithinSchedule(o.disponibilites)
-  }))
+    const oeils = rows.map(o => {
+      const is_new_oeil = isNewOeil(o.total_missions);
+      // Un admin ou l'Œil consultant sa propre fiche voit toujours la vraie note ;
+      // seul un tiers (client ou autre Œil) reçoit la valeur masquée.
+      const showRealScore = req.user.role === 'admin' || o.id === req.user.id;
+      return {
+        ...o,
+        is_available: o.is_available && isWithinSchedule(o.disponibilites),
+        is_new_oeil,
+        rating_avg: (!showRealScore && is_new_oeil) ? null : o.rating_avg,
+        rating_count: (!showRealScore && is_new_oeil) ? null : o.rating_count,
+      };
+    })
   res.json({ oeils, total, page: +page, pages: Math.ceil(total / limit) });
   }));
 
@@ -112,6 +122,19 @@ router.get('/oeils/:id', authenticate, asyncHandler(async (req, res) => {
     SELECT r.score,r.comment,r.created_at,c.first_name AS client_name
     FROM ratings r JOIN users c ON c.id=r.client_id WHERE r.oeil_id=$1 ORDER BY r.created_at DESC LIMIT 10
   `, [req.params.id]);
+
+  // Consulté par un client (ou un autre Œil) : un débutant (< 10 missions) n'a pas
+  // assez d'historique pour qu'un score/note affiché soit significatif — on masque
+  // les valeurs brutes plutôt que de compter sur le frontend pour respecter le flag.
+  // L'admin et l'Œil consultant sa propre fiche voient toujours le vrai score.
+  const showRealScore = req.user.role === 'admin' || oeil.id === req.user.id;
+  oeil.is_new_oeil = isNewOeil(oeil.total_missions);
+  if (!showRealScore && oeil.is_new_oeil) {
+    oeil.reliability_score = null;
+    oeil.rating_avg = null;
+    oeil.rating_count = null;
+  }
+
   res.json({ oeil, reviews });
 }));
 
@@ -168,7 +191,11 @@ router.get('/favorites', authenticate, requireRole('client'), asyncHandler(async
     FROM favorites f JOIN users u ON u.id=f.oeil_id JOIN oeil_profiles p ON p.user_id=u.id
     WHERE f.client_id=$1 ORDER BY f.created_at DESC
   `, [req.user.id]);
-  res.json({ favorites: rows });
+  const favorites = rows.map(f => {
+    const is_new_oeil = isNewOeil(f.total_missions);
+    return { ...f, is_new_oeil, rating_avg: is_new_oeil ? null : f.rating_avg };
+  });
+  res.json({ favorites });
 }));
 
 router.post('/favorites/:oeilId', authenticate, requireRole('client'), asyncHandler(async (req, res) => {

@@ -3,7 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
-const { logReliabilityEvent, computeLatePenalty } = require('../utils/reliabilityScore');
+const { logReliabilityEvent, computeLatePenalty, isNewOeil } = require('../utils/reliabilityScore');
 const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -422,6 +422,14 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   // Mark messages as read
   await db.query(`UPDATE mission_messages SET is_read=true WHERE mission_id=$1 AND sender_id!=$2`, [req.params.id, req.user.id]);
 
+  // Le client voit le profil d'un tiers (l'Œil assigné) : un débutant (< 10 missions)
+  // n'a pas assez d'historique pour qu'une note affichée soit significative.
+  // L'Œil consultant sa propre mission et l'admin gardent la vraie valeur.
+  if (req.user.role === 'client' && mission.oeil_id) {
+    mission.is_new_oeil = isNewOeil(mission.oeil_total_missions);
+    if (mission.is_new_oeil) mission.oeil_rating = null;
+  }
+
   res.json({ mission, media, messages, report: report||null, rating: rating||null });
 }));
 
@@ -501,7 +509,18 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
       [req.params.id]
     );
 
-    res.json({ interests: rows });
+    // Le client voit des tiers (Œils candidats) : masque la note d'un débutant
+    // (< 10 missions) pour ne pas afficher un signal peu significatif.
+    // L'admin, qui peut aussi consulter cette liste, garde la vraie valeur.
+    const interests = rows.map(o => {
+      const is_new_oeil = isNewOeil(o.total_missions);
+      if (req.user.role === 'client' && is_new_oeil) {
+        return { ...o, is_new_oeil, rating_avg: null, rating_count: null };
+      }
+      return { ...o, is_new_oeil };
+    });
+
+    res.json({ interests });
   }));
 
 
@@ -892,6 +911,9 @@ router.post('/:id/rate', authenticate, requireRole('client'), [
   const { rows: [avg] } = await db.query('SELECT AVG(score)::numeric(3,1) AS a, COUNT(*)::int AS c FROM ratings WHERE oeil_id=$1', [mission.oeil_id]);
   await db.query('UPDATE oeil_profiles SET rating_avg=$1, rating_count=$2 WHERE user_id=$3', [avg.a, avg.c, mission.oeil_id]);
 
+  const { rows: [oeilProfile] } = await db.query('SELECT total_missions FROM oeil_profiles WHERE user_id=$1', [mission.oeil_id]);
+  const is_new_oeil = isNewOeil(oeilProfile?.total_missions);
+
 await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${mission.title}" notée par un client.`, 'rating', mission.id, emitToUser, null, 'newRatingTitle', 'newRatingBody', {score: req.body.score, missionTitle: mission.title});
 
   // Score de fiabilité selon la note
@@ -902,7 +924,11 @@ await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${
   else { points = 0; reason = `Mission complétée, note ${score}/5 — insatisfaisant`; }
   await logReliabilityEvent(db, mission.oeil_id, mission.id, points, reason, score <= 2);
 
-  res.status(201).json({ rating_avg: avg.a, rating_count: avg.c });
+  res.status(201).json({
+    rating_avg: is_new_oeil ? null : avg.a,
+    rating_count: is_new_oeil ? null : avg.c,
+    is_new_oeil,
+  });
 }));
 
 // ── POST /:id/interest ── Œil exprime son intérêt ─────────
