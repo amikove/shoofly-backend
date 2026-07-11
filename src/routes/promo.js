@@ -75,6 +75,9 @@ router.post('/admin', authenticate, requireRole('admin'), asyncHandler(async (re
   if (type === 'percent' && (value < 1 || value > 100))
       return res.status(400).json({ error: 'Pourcentage entre 1 et 100' });
 
+    if (expires_at && new Date(expires_at) < new Date())
+      return res.status(400).json({ error: 'La date d\'expiration doit être dans le futur' });
+
     const { rows: [existing] } = await db.query(
       `SELECT id FROM promo_codes WHERE UPPER(code)=UPPER($1)`, [code]
     );
