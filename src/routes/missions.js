@@ -1121,18 +1121,18 @@ async function checkTransferDeadlines(db, emitToUser) {
   for (const mission of expired) {
     // Pénalité aggravée sur l'Œil 1 si pendant mission
 if (mission.transfer_type === 'during' && mission.transferred_from) {
-      await db.query(`
-        UPDATE users SET
-          balance=GREATEST(0, balance-100),
-          transfer_no_replacement_count=transfer_no_replacement_count+1
-        WHERE id=$1
-      `, [mission.transferred_from]);
-      await logReliabilityEvent(db, mission.transferred_from, mission.id, -20, 'Transfert pendant mission sans remplaçant trouvé', true);
-
-      await db.query(
-        `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',100,'Pénalité — aucun remplaçant trouvé',$2)`,
-        [mission.transferred_from, mission.id]
-      );
+        await db.query(`
+          UPDATE users SET
+            balance=GREATEST(0, balance-100),
+            transfer_no_replacement_count=transfer_no_replacement_count+1,
+            transfer_cooldown_until=NOW() + INTERVAL '48 hours'
+          WHERE id=$1
+        `, [mission.transferred_from]);
+        await logReliabilityEvent(db, mission.transferred_from, mission.id, -70, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
+        await db.query(
+          `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',100,'Pénalité — aucun remplaçant trouvé',$2)`,
+          [mission.transferred_from, mission.id]
+        );
 
       await emitToUser?.(mission.transferred_from, 'notification', {
         title: '⚠️ Pénalité appliquée',
