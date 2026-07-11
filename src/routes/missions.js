@@ -561,8 +561,23 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async
       );
       if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
 
-      // Pénalité de fiabilité : refuser une mission déjà assignée retarde le client et déstabilise le planning
-        await logReliabilityEvent(db, req.user.id, mission.id, -15, 'Mission assignée refusée par l\'Œil', false);
+      // Pénalité de fiabilité proportionnelle au délai avant la mission :
+        // plus le refus est tardif, plus il désorganise le client et pèse sur la réputation de la plateforme.
+        const hoursBeforeMission = mission.scheduled_at
+          ? (new Date(mission.scheduled_at).getTime() - Date.now()) / 3600000
+          : null;
+        let penaltyPoints, penaltyReason;
+        if (hoursBeforeMission === null || hoursBeforeMission > 24) {
+          penaltyPoints = -15;
+          penaltyReason = 'Mission assignée refusée par l\'Œil (plus de 24h avant)';
+        } else if (hoursBeforeMission > 2) {
+          penaltyPoints = -35;
+          penaltyReason = 'Mission assignée refusée par l\'Œil (entre 2h et 24h avant)';
+        } else {
+          penaltyPoints = -50;
+          penaltyReason = 'Mission assignée refusée par l\'Œil (moins de 2h avant, très tardif)';
+        }
+        await logReliabilityEvent(db, req.user.id, mission.id, penaltyPoints, penaltyReason, penaltyPoints <= -35);
         // Cooldown de 4h : empêche l'Œil d'accepter immédiatement une autre mission après avoir abandonné celle-ci
         await db.query(
           `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '4 hours' WHERE id=$1`,
