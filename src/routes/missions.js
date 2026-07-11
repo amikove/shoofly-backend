@@ -57,7 +57,7 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
 
 await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'paymentReceivedOeilTitle', 'paymentReceivedOeilBody', {missionTitle: mission.title, amount: mission.oeil_earning});
   await notify(db, mission.client_id, '✅ Mission validée', `Vous avez validé "${mission.title}".`, 'info', mission.id, emitToUser, null, 'missionValidatedClientTitle', 'missionValidatedClientBody', {missionTitle: mission.title});
-  await logStatus(db, mission.id, 'validated', req.user.id, 'Validée par le client');
+  await logStatus(db, mission.id, 'completed', req.user.id, 'Validée par le client (paiement libéré)');
 
   res.json({ ok: true });
 }));
