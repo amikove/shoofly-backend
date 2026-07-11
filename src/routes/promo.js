@@ -73,15 +73,19 @@ router.post('/admin', authenticate, requireRole('admin'), asyncHandler(async (re
   if (!['percent','fixed','free'].includes(type))
     return res.status(400).json({ error: 'Type invalide' });
   if (type === 'percent' && (value < 1 || value > 100))
-    return res.status(400).json({ error: 'Pourcentage entre 1 et 100' });
+      return res.status(400).json({ error: 'Pourcentage entre 1 et 100' });
 
-  const { rows: [promo] } = await db.query(
-    `INSERT INTO promo_codes (code, type, value, max_uses, max_uses_per_user, expires_at, platform_amount, created_by)
-     VALUES (UPPER($1), $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-    [code, type, value, max_uses || null, max_uses_per_user || 1, expires_at || null, platform_amount || null, req.user.id]
-  );
+    const { rows: [existing] } = await db.query(
+      `SELECT id FROM promo_codes WHERE UPPER(code)=UPPER($1)`, [code]
+    );
+    if (existing) return res.status(409).json({ error: `Le code "${code.toUpperCase()}" existe déjà` });
 
-  res.status(201).json({ promo });
+    const { rows: [promo] } = await db.query(
+      `INSERT INTO promo_codes (code, type, value, max_uses, max_uses_per_user, expires_at, platform_amount, created_by)
+       VALUES (UPPER($1), $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [code, type, value, max_uses || null, max_uses_per_user || 1, expires_at || null, platform_amount || null, req.user.id]
+    );
+    res.status(201).json({ promo });
 }));
 
 // ── PUT /promo/admin/:id/toggle — activer/désactiver ─────
