@@ -944,14 +944,19 @@ await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${
 // ── POST /:id/interest ── Œil exprime son intérêt ─────────
 
 router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
-  const db = getDb();
-  const { message } = req.body;
-
-  const { rows: [mission] } = await db.query(
-    'SELECT * FROM missions WHERE id=$1', [req.params.id]
-  );
-  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
+    const db = getDb();
+    const { message } = req.body;
+    const { rows: [oeilUser] } = await db.query('SELECT is_suspended, transfer_cooldown_until FROM users WHERE id=$1', [req.user.id]);
+    if (oeilUser?.is_suspended) return res.status(403).json({ error: 'Votre compte est suspendu, vous ne pouvez pas postuler à une mission.' });
+    if (oeilUser?.transfer_cooldown_until && new Date(oeilUser.transfer_cooldown_until) > new Date()) {
+      const remaining = Math.ceil((new Date(oeilUser.transfer_cooldown_until) - Date.now()) / 3600000);
+      return res.status(403).json({ error: `Vous ne pouvez pas postuler pendant encore ${remaining}h suite à un transfert de mission.` });
+    }
+    const { rows: [mission] } = await db.query(
+      'SELECT * FROM missions WHERE id=$1', [req.params.id]
+    );
+    if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+    if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
 
   // Vérifier les conflits de créneau
   const { rows: conflicts } = await db.query(`
