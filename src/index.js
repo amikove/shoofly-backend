@@ -232,8 +232,20 @@ initDb().then(() => {
 
   // Job toutes les heures — valider automatiquement les missions après 12h sans réclamation
 
+  // Verrous anti-chevauchement en mémoire — un flag par cron, empêche une exécution
+  // de démarrer si la précédente n'est pas terminée (process unique, pas de verrou distribué).
+  let cronReminderJ1Running = false;
+  let cronRecapAdminRunning = false;
+  let cronAlertHRunning = false;
+  let cronExpiredMissionsRunning = false;
+  let cronPreMissionRemindersRunning = false;
+  let cronTransferDeadlineRunning = false;
+  let cronAutoValidateRunning = false;
+
 // ── Cron J-1 20h — Rappel mission demain ─────────────────
   cron.schedule('0 20 * * *', async () => {
+    if (cronReminderJ1Running) { console.warn('⏭️ Cron J-1 rappel déjà en cours, tick ignoré'); return; }
+    cronReminderJ1Running = true;
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
@@ -271,10 +283,13 @@ initDb().then(() => {
         console.log(`⏰ Rappel J-1 envoyé pour mission ${m.id}`);
       }
     } catch (e) { console.error('❌ Cron J-1 rappel error:', e.message); }
+    finally { cronReminderJ1Running = false; }
   });
 
   // ── Cron J-1 22h — Email récap admin non-confirmations ───
   cron.schedule('0 22 * * *', async () => {
+    if (cronRecapAdminRunning) { console.warn('⏭️ Cron récap admin déjà en cours, tick ignoré'); return; }
+    cronRecapAdminRunning = true;
     try {
       const db = getDb();
       const tomorrow = new Date();
@@ -331,10 +346,13 @@ initDb().then(() => {
       }
       console.log(`📋 Récap admin envoyé — ${missions.length} missions demain`);
     } catch (e) { console.error('❌ Cron récap admin error:', e.message); }
+    finally { cronRecapAdminRunning = false; }
   });
 
   // ── Cron toutes les heures — Alertes H et H+30 ───────────
   cron.schedule('*/30 * * * *', async () => {
+    if (cronAlertHRunning) { console.warn('⏭️ Cron alertes H/H+30 déjà en cours, tick ignoré'); return; }
+    cronAlertHRunning = true;
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
@@ -442,10 +460,13 @@ initDb().then(() => {
       }
 
     } catch (e) { console.error('❌ Cron H/H+30 error:', e.message); }
+    finally { cronAlertHRunning = false; }
   });
 
   // ── Cron toutes les heures — Missions expirées (niveau 3) ─
   cron.schedule('0 * * * *', async () => {
+    if (cronExpiredMissionsRunning) { console.warn('⏭️ Cron missions expirées déjà en cours, tick ignoré'); return; }
+    cronExpiredMissionsRunning = true;
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
@@ -474,10 +495,13 @@ initDb().then(() => {
         console.log(`🔍 Alerte mission expirée ${m.id}`);
       }
     } catch (e) { console.error('❌ Cron missions expirées error:', e.message); }
+    finally { cronExpiredMissionsRunning = false; }
   });
 
   // ── Cron J H-2h et H-30min — Rappels avant mission ──────
   cron.schedule('*/30 * * * *', async () => {
+    if (cronPreMissionRemindersRunning) { console.warn('⏭️ Cron rappels avant mission déjà en cours, tick ignoré'); return; }
+    cronPreMissionRemindersRunning = true;
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
@@ -536,18 +560,24 @@ initDb().then(() => {
         }
       }
     } catch (e) { console.error('❌ Cron rappels error:', e.message); }
+    finally { cronPreMissionRemindersRunning = false; }
   });
 
   // Vérifier deadlines transfert toutes les 5 minutes
   cron.schedule('*/5 * * * *', async () => {
+    if (cronTransferDeadlineRunning) { console.warn('⏭️ Cron deadlines transfert déjà en cours, tick ignoré'); return; }
+    cronTransferDeadlineRunning = true;
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
       await checkTransferDeadlines(db, emitToUser);
     } catch (e) { console.error('❌ Transfer deadline cron error:', e.message); }
+    finally { cronTransferDeadlineRunning = false; }
   });
 
   cron.schedule('0 * * * *', async () => {
+    if (cronAutoValidateRunning) { console.warn('⏭️ Cron auto-validation déjà en cours, tick ignoré'); return; }
+    cronAutoValidateRunning = true;
     try {
       const db = getDb();
       const { rows: missions } = await db.query(`
@@ -574,6 +604,7 @@ initDb().then(() => {
         console.log(`✅ Auto-validé mission ${mission.id}`);
       }
     } catch (e) { console.error('❌ Cron error:', e.message); }
+    finally { cronAutoValidateRunning = false; }
   });
   // Keep-alive pour Render plan gratuit
 if (process.env.NODE_ENV === 'production') {
