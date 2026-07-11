@@ -354,7 +354,6 @@ const { rows: [mission] } = await db.query(`
     company_name,audit_type,frequency,criteria,oeil_id
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
   RETURNING *
-
 `, [
   id, req.user.id, type, subcategory||null, status, title, description||null, address, city, quartier||null,
   new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
@@ -362,6 +361,15 @@ const { rows: [mission] } = await db.query(`
   institution||null, purpose||null, company_name||null, audit_type||null,
   frequency||null, criteria||null, oeil_id||null
 ]);
+
+// Mission offerte via code promo gratuit : Shoofly paie l'Œil de sa poche, sans commission générée.
+// On enregistre ce coût comme une dépense pour qu'il reste visible dans le Dashboard Financier.
+if (promo_code && +price === 0 && platform_amount) {
+  await db.query(
+    `INSERT INTO expenses (amount, category, description, expense_date, created_by) VALUES ($1, $2, $3, $4, $5)`,
+    [parseFloat(platform_amount), 'Promotions', `[Généré automatiquement] Mission offerte "${title}" — code promo ${promo_code}`, new Date().toISOString().slice(0, 10), null]
+  );
+}
 
 await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
 
