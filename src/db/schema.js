@@ -429,6 +429,12 @@ CREATE TABLE IF NOT EXISTS identity_documents (
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS content_key TEXT;
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS params JSONB;
+
+    -- Index de performance sur les colonnes fréquemment filtrées/jointes
+    CREATE INDEX IF NOT EXISTS idx_withdrawals_oeil_id ON withdrawals(oeil_id);
+    CREATE INDEX IF NOT EXISTS idx_identity_documents_user_id ON identity_documents(user_id);
+    CREATE INDEX IF NOT EXISTS idx_ratings_oeil_id ON ratings(oeil_id);
+    CREATE INDEX IF NOT EXISTS idx_ratings_client_id ON ratings(client_id);
   `);
   console.log('✅ PostgreSQL schema ready');
 }
