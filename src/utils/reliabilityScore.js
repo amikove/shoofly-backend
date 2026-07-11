@@ -12,12 +12,15 @@ async function logReliabilityEvent(db, oeilId, missionId, points, reason, isGrav
 
 // ── Calculer le score d'un Œil ────────────────────────────
 async function computeReliabilityScore(db, oeilId) {
-  const { rows: allEvents } = await db.query(
-    `SELECT points FROM reliability_events WHERE oeil_id=$1 ORDER BY created_at ASC`,
-    [oeilId]
-  );
-
-  const totalMissions = allEvents.length;
+    const { rows: rawEvents } = await db.query(
+      `SELECT points, is_reset FROM reliability_events WHERE oeil_id=$1 ORDER BY created_at ASC`,
+      [oeilId]
+    );
+    // Si un événement de reset (réintégration admin) existe, on ignore tout l'historique
+    // avant lui — il reste consultable dans le détail des événements, mais ne compte plus dans le score actif.
+    const lastResetIndex = rawEvents.map(e => e.is_reset).lastIndexOf(true);
+    const allEvents = lastResetIndex >= 0 ? rawEvents.slice(lastResetIndex) : rawEvents;
+    const totalMissions = allEvents.length;
   if (totalMissions === 0) return 90; // score de départ
 
   // Score historique complet
@@ -92,24 +95,14 @@ function getReliabilityLevel(score) {
 // à la valeur cible voulue par l'admin — garde l'historique complet et honnête,
 // plutôt que d'écraser reliability_score directement (ce qui serait effacé au prochain événement).
 async function reactivateWithCorrectiveEvent(db, oeilId, targetScore, adminId) {
-  const { rows: allEvents } = await db.query(
-    `SELECT points FROM reliability_events WHERE oeil_id=$1 ORDER BY created_at ASC`,
-    [oeilId]
-  );
-  const clamp = (v) => Math.max(-10, Math.min(10, v));
-  const currentSum = allEvents.reduce((s, e) => s + clamp(e.points), 0);
-  const totalMissions = allEvents.length + 1; // +1 pour l'événement correctif qu'on va ajouter
-
-  // On cherche X (le point correctif, potentiellement > 10, volontairement PAS clampé lui-même,
-  // pour pouvoir vraiment compenser un historique très négatif) tel que :
-  // ((currentSum + X) / (totalMissions * 10)) * 100 = targetScore
-  const requiredSum = (targetScore / 100) * (totalMissions * 10);
-  const correctivePoints = Math.round(requiredSum - currentSum);
-
+  // Événement de "reset" : le calcul du score ignorera tout l'historique avant ce point.
+  // Le point de l'événement (targetScore/10, entre 0 et 10) reste dans les bornes du clamp ±10,
+  // donc il compte pour sa pleine valeur au recalcul — pas de plafonnement qui viendrait l'annuler.
+  const resetPoints = Math.round(Math.max(0, Math.min(100, targetScore)) / 10);
   await db.query(
-    `INSERT INTO reliability_events (oeil_id, mission_id, points, reason, is_grave)
-     VALUES ($1, NULL, $2, $3, false)`,
-    [oeilId, correctivePoints, `Réintégration administrative — ajustement vers ${targetScore}%`]
+    `INSERT INTO reliability_events (oeil_id, mission_id, points, reason, is_grave, is_reset)
+     VALUES ($1, NULL, $2, $3, false, true)`,
+    [oeilId, resetPoints, `Réintégration administrative — redémarrage à ${targetScore}%`]
   );
 
   const score = await computeReliabilityScore(db, oeilId);
