@@ -584,6 +584,15 @@ const { status, cancel_reason } = req.body;
   if (!transitions[mission.status]?.includes(status))
     return res.status(400).json({ error: `Transition invalide: ${mission.status} → ${status}` });
 
+  // Seul l'Œil assigné fait progresser la mission dans le sens normal — le client
+  // n'est jamais à l'origine de ces transitions, même s'il est partie prenante.
+  // L'annulation reste ouverte à l'Œil et au client, chacun sur ses propres missions.
+  if (['en_route', 'active', 'completed'].includes(status)) {
+    if (req.user.role !== 'oeil' || mission.oeil_id !== req.user.id) {
+      return res.status(403).json({ error: 'Seul l\'Œil assigné peut faire progresser la mission.' });
+    }
+  }
+
   // Bloquer si rapport non soumis pour audit ou airbnb
   if (status === 'completed' && req.user.role === 'oeil') {
     const isAudit  = mission.type === 'audit'
