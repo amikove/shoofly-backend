@@ -1,7 +1,7 @@
 const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
-const { getReliabilityLevel } = require('../utils/reliabilityScore');
+const { getReliabilityLevel, reactivateWithCorrectiveEvent } = require('../utils/reliabilityScore');
 const asyncHandler = require('../middleware/asyncHandler');
 
 // ── GET /reliability/me — Œil consulte son propre score ───
@@ -120,11 +120,8 @@ router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), as
   if (!request) return res.status(404).json({ error: 'Demande introuvable' });
 
   if (decision === 'approved') {
-    const newScore = reset_score || 70; // score de réintégration par défaut
-    await db.query(
-      `UPDATE users SET is_suspended=false, suspended_at=NULL, suspended_reason=NULL, reliability_score=$1 WHERE id=$2`,
-      [newScore, request.oeil_id]
-    );
+      const newScore = reset_score || 70; // score de réintégration par défaut
+      await reactivateWithCorrectiveEvent(db, request.oeil_id, newScore, req.user.id);
     await db.query(
       `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
        VALUES ($1, '✅ Compte réactivé', $2, 'success', 'none', $3, $4, $5)`,
@@ -192,16 +189,13 @@ router.get('/admin/all-scores', authenticate, requireRole('admin'), asyncHandler
 
 // ── POST /reliability/admin/:oeilId/reactivate — réactivation directe (sans demande d'examen) ──
 router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
-  const db = getDb();
-  const { reset_score } = req.body;
-  const newScore = reset_score || 70;
-
-  const { rows: [oeil] } = await db.query(
-    `UPDATE users SET is_suspended=false, suspended_at=NULL, suspended_reason=NULL, reliability_score=$1
-     WHERE id=$2 AND role='oeil' RETURNING id, first_name, last_name`,
-    [newScore, req.params.oeilId]
-  );
-  if (!oeil) return res.status(404).json({ error: 'Œil introuvable' });
+    const db = getDb();
+    const { reset_score } = req.body;
+    const newScore = reset_score || 70;
+    const { rows: [oeilCheck] } = await db.query(`SELECT id, first_name, last_name FROM users WHERE id=$1 AND role='oeil'`, [req.params.oeilId]);
+    if (!oeilCheck) return res.status(404).json({ error: 'Œil introuvable' });
+    await reactivateWithCorrectiveEvent(db, req.params.oeilId, newScore, req.user.id);
+    const oeil = oeilCheck;
 
   await db.query(
     `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
