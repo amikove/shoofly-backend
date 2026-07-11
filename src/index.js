@@ -625,26 +625,22 @@ initDb().then(() => {
       `);
 
       for (const m of staleMissions) {
-        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
-        for (const admin of admins) {
-          await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-             VALUES ($1, $2, $3, 'warning', $4, 'admin_missions', $5, $6, $7)`,
-            [admin.id, '⏳ Mission sans Œil depuis 12h', `Aucun Œil n'a encore été trouvé pour "${m.title}", en attente depuis plus de 12h.`, m.id,
-             'staleMissionAdminTitle', 'staleMissionAdminBody', JSON.stringify({ missionTitle: m.title })]
-          );
+          // Notification admin uniquement — la suggestion client (augmenter le budget) a été retirée :
+          // aucune page d'édition de mission n'existe encore pour que le client agisse dessus.
+          // TODO : ajouter aussi un envoi WhatsApp automatique à l'admin une fois un compte WhatsApp
+          // Business API configuré (Badr SMS, OrangeSMS Maroc, ou Yobota — déjà étudiés précédemment).
+          const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+          for (const admin of admins) {
+            await db.query(
+              `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+               VALUES ($1, $2, $3, 'warning', $4, 'admin_missions', $5, $6, $7)`,
+              [admin.id, '⏳ Mission sans Œil depuis 12h', `Aucun Œil n'a encore été trouvé pour "${m.title}", en attente depuis plus de 12h.`, m.id,
+               'staleMissionAdminTitle', 'staleMissionAdminBody', JSON.stringify({ missionTitle: m.title })]
+            );
+          }
+          await db.query(`UPDATE missions SET stale_notified_at = NOW() WHERE id = $1`, [m.id]);
+          console.log(`⏳ Notification mission sans Œil envoyée pour ${m.id}`);
         }
-
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, $2, $3, 'warning', $4, 'mission_view', $5, $6, $7)`,
-          [m.client_id, '💡 Toujours aucun Œil pour votre mission', `Votre mission "${m.title}" n'a pas encore trouvé d'Œil après 12h. Augmenter le budget peut attirer plus de candidats. Consultez votre mission pour l'ajuster.`, m.id,
-           'staleMissionClientTitle', 'staleMissionClientBody', JSON.stringify({ missionTitle: m.title })]
-        );
-
-        await db.query(`UPDATE missions SET stale_notified_at = NOW() WHERE id = $1`, [m.id]);
-        console.log(`⏳ Notification mission sans Œil envoyée pour ${m.id}`);
-      }
     } catch (e) { console.error('❌ Cron missions sans Œil error:', e.message); }
     finally { cronStaleMissionsRunning = false; }
   });
