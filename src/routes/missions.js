@@ -1207,16 +1207,7 @@ if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission 
   );
   if (!interest) return res.status(400).json({ error: "Cet Œil n'a pas exprimé son intérêt" });
 
-  const { rows: [updated] } = await db.query(
-    `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), is_priority=false, transfer_deadline=NULL, updated_at=NOW()
-     WHERE id=$2 AND status='pending' RETURNING *`,
-    [req.params.oeilId, req.params.id]
-  );
-  if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
-
-  await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil choisi par le client parmi les intéressés');
-
-  // Re-vérifier le créneau avant assignation
+  // Vérifier le créneau avant assignation (doit précéder toute mutation de la mission)
   const { rows: creneauConflicts } = await db.query(`
     SELECT m.id FROM missions m
     WHERE m.oeil_id = $1
@@ -1228,6 +1219,15 @@ if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission 
   if (creneauConflicts.length > 0) {
     return res.status(400).json({ error: 'Cet Œil a déjà une mission dans le même créneau.' })
   }
+
+  const { rows: [updated] } = await db.query(
+    `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), is_priority=false, transfer_deadline=NULL, updated_at=NOW()
+     WHERE id=$2 AND status='pending' RETURNING *`,
+    [req.params.oeilId, req.params.id]
+  );
+  if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+
+  await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil choisi par le client parmi les intéressés');
 
   // Supprimer les intérêts en conflit de créneau
   const { rows: conflictInterests } = await db.query(`
