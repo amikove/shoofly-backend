@@ -117,14 +117,14 @@ router.put('/:id/resolve-claim', authenticate, asyncHandler(async (req, res) => 
     // Payer l'Œil
     await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Mission validée après réclamation',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
-    await db.query(`UPDATE missions SET status='completed', validated_at=NOW(), updated_at=NOW() WHERE id=$1`, [mission.id]);
+    await db.query(`UPDATE missions SET status='completed', validated_at=NOW(), is_priority=false, updated_at=NOW() WHERE id=$1`, [mission.id]);
     await db.query(`UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
     await notify(db, mission.oeil_id, '✅ Réclamation résolue', 'La réclamation a été résolue en votre faveur. Votre paiement a été crédité.', 'info', mission.id, emitToUser, null, 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
     await notify(db, mission.client_id, 'Réclamation résolue', 'La réclamation a été examinée et résolue en faveur de l\'Œil.', 'info', mission.id, emitToUser, null, 'claimResolvedClientLoseTitle', 'claimResolvedClientLoseBody', null);
   } else {
     // Rembourser le client — réclamation gagnée, non imputable au client : remboursement intégral
     const refund = await refundOnCancellation(db, mission, false, 'Remboursement suite à réclamation');
-    await db.query(`UPDATE missions SET status='cancelled', updated_at=NOW() WHERE id=$1`, [mission.id]);
+    await db.query(`UPDATE missions SET status='cancelled', is_priority=false, updated_at=NOW() WHERE id=$1`, [mission.id]);
     await db.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
     await notify(db, mission.client_id, '✅ Réclamation résolue', `${refund} MAD ont été crédités sur votre portefeuille.`, 'info', mission.id, emitToUser, null, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', {amount: refund});
     await notify(db, mission.oeil_id, 'Réclamation résolue', 'La réclamation a été résolue en faveur du client.', 'info', mission.id, emitToUser, null, 'claimResolvedClientLoseTitle', 'claimResolvedOeilLoseBody', null);
