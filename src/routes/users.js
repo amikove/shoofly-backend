@@ -285,12 +285,12 @@ router.get('/admin/profile/:userId', authenticate, requireRole('admin'), asyncHa
   }
 
   // ── Onglet Problèmes remontés ──
-  const { rows: reports } = await db.query(`
-    SELECT r.id, r.type, r.status, r.created_at, r.mission_id, m.title AS mission_title
-    FROM mission_reports r JOIN missions m ON m.id = r.mission_id
-    WHERE r.reporter_id=$1
-    ORDER BY r.created_at DESC
-  `, [userId]);
+    const { rows: reports } = await db.query(`
+      SELECT r.id, r.type, r.status, r.created_at, r.mission_id, m.title AS mission_title
+      FROM mission_problem_reports r JOIN missions m ON m.id = r.mission_id
+      WHERE r.reporter_id=$1
+      ORDER BY r.created_at DESC
+    `, [userId]);
 
   const claimsWhere = user.role === 'client' ? 'cl.client_id=$1' : 'm.oeil_id=$1';
   const { rows: claims } = await db.query(`
