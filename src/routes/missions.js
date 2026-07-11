@@ -399,10 +399,10 @@ router.get('/my-reports', authenticate, asyncHandler(async (req, res) => {
   const { rows } = await db.query(`
     SELECT r.*,
       m.title AS mission_title, m.city, m.scheduled_at
-    FROM mission_reports r
-    JOIN missions m ON m.id = r.mission_id
-    WHERE r.reporter_id=$1
-    ORDER BY r.created_at DESC
+    FROM mission_problem_reports r
+      JOIN missions m ON m.id = r.mission_id
+      WHERE r.reporter_id=$1
+      ORDER BY r.created_at DESC
   `, [req.user.id]);
 
   res.json({ reports: rows });
@@ -665,8 +665,8 @@ const { status, cancel_reason } = req.body;
     // Fermer automatiquement tout signalement encore ouvert lié à cette mission —
     // la mission étant annulée, le problème signalé est désormais sans objet.
     await db.query(
-      `UPDATE mission_reports SET status='resolved', admin_note=COALESCE(admin_note, 'Résolu automatiquement suite à l''annulation de la mission'), resolved_by=$1, resolved_at=NOW()
-       WHERE mission_id=$2 AND status IN ('open','in_progress')`,
+      `UPDATE mission_problem_reports SET status='resolved', admin_note=COALESCE(admin_note, 'Résolu automatiquement suite à l''annulation de la mission'), resolved_by=$1, resolved_at=NOW()
+         WHERE mission_id=$2 AND status IN ('open','in_progress')`,
       [req.user.id, mission.id]
     );
     await db.query(`UPDATE missions SET under_surveillance=false WHERE id=$1`, [mission.id]);
@@ -1239,18 +1239,17 @@ router.post('/:id/report-problem', authenticate, asyncHandler(async (req, res) =
   }
 
   // Vérifier qu'un signalement n'existe pas déjà pour cette mission (contrainte UNIQUE en base)
-  const { rows: [existingReport] } = await db.query(
-    `SELECT id FROM mission_reports WHERE mission_id=$1`, [mission.id]
-  );
-  if (existingReport) {
-    return res.status(409).json({ error: 'Un problème a déjà été signalé pour cette mission' });
-  }
-
-  // Créer le ticket
-  const reporterRole = req.user.id === mission.client_id ? 'client' : 'oeil';
-  const { rows: [report] } = await db.query(
-    `INSERT INTO mission_reports (mission_id, reporter_id, reporter_role, type, description)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    const { rows: [existingReport] } = await db.query(
+      `SELECT id FROM mission_problem_reports WHERE mission_id=$1`, [mission.id]
+    );
+    if (existingReport) {
+      return res.status(409).json({ error: 'Un problème a déjà été signalé pour cette mission' });
+    }
+    // Créer le ticket
+    const reporterRole = req.user.id === mission.client_id ? 'client' : 'oeil';
+    const { rows: [report] } = await db.query(
+      `INSERT INTO mission_problem_reports (mission_id, reporter_id, reporter_role, type, description)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
     [mission.id, req.user.id, reporterRole, type, description || null]
   );
 
@@ -1335,13 +1334,13 @@ router.get('/admin/problems', authenticate, requireRole('admin'), asyncHandler(a
       `, [...params, limit, offset]);
 
       const { rows: [{ n: total }] } = await db.query(
-        `SELECT COUNT(*)::int AS n FROM mission_reports r JOIN missions m ON m.id = r.mission_id ${wc}`, params
+        `SELECT COUNT(*)::int AS n FROM mission_problem_reports r JOIN missions m ON m.id = r.mission_id ${wc}`, params
       );
 
       // Villes distinctes disponibles pour peupler le filtre (sur le statut actif, indépendamment des autres filtres)
       const { rows: cities } = await db.query(`
-        SELECT DISTINCT m.city FROM mission_reports r JOIN missions m ON m.id = r.mission_id
-        WHERE r.status=$1 ORDER BY m.city ASC
+        SELECT DISTINCT m.city FROM mission_problem_reports r JOIN missions m ON m.id = r.mission_id
+          WHERE r.status=$1 ORDER BY m.city ASC
       `, [status]);
 
       res.json({ reports: rows, total, page: +page, pages: Math.ceil(total / limit), availableCities: cities.map(c => c.city) });
@@ -1352,8 +1351,8 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandl
     const db = getDb();
     const { status, admin_note } = req.body;
     const { rows: [report] } = await db.query(
-      `UPDATE mission_reports SET status=$1, admin_note=$2, resolved_by=$3, resolved_at=NOW()
-       WHERE id=$4 RETURNING *`,
+        `UPDATE mission_problem_reports SET status=$1, admin_note=$2, resolved_by=$3, resolved_at=NOW()
+         WHERE id=$4 RETURNING *`,
       [status, admin_note || null, req.user.id, req.params.id]
     );
     if (!report) return res.status(404).json({ error: 'Ticket introuvable' });
@@ -1378,7 +1377,7 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandl
     // Si résolu → retirer sous_surveillance si plus aucun ticket ouvert
     if (['resolved','dismissed'].includes(status)) {
       const { rows: [{ n }] } = await db.query(
-        `SELECT COUNT(*)::int AS n FROM mission_reports WHERE mission_id=$1 AND status='open'`,
+          `SELECT COUNT(*)::int AS n FROM mission_problem_reports WHERE mission_id=$1 AND status='open'`,
         [report.mission_id]
       );
       if (n === 0) {
