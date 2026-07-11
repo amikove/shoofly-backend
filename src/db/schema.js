@@ -345,31 +345,50 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT;
 
 
-    -- Signalements de problèmes en cours de mission
-    CREATE TABLE IF NOT EXISTS mission_reports (
-      id          SERIAL PRIMARY KEY,
-      mission_id  TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-      reporter_id TEXT NOT NULL REFERENCES users(id),
-      reporter_role TEXT NOT NULL CHECK(reporter_role IN ('client','oeil')),
-      type        TEXT NOT NULL,
-      description TEXT,
-      status      TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','in_progress','resolved','dismissed')),
-      resolved_by TEXT REFERENCES users(id),
-      resolved_at TIMESTAMPTZ,
-      admin_note  TEXT,
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
+    -- Signalements de problèmes en cours de mission — table dédiée, séparée des rapports de visite
+      -- (avant, les deux partageaient mission_reports avec une seule contrainte UNIQUE(mission_id),
+      -- ce qui provoquait des écrasements silencieux entre rapport de visite et signalement)
+      CREATE TABLE IF NOT EXISTS mission_problem_reports (
+        id          SERIAL PRIMARY KEY,
+        mission_id  TEXT UNIQUE NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        reporter_id TEXT NOT NULL REFERENCES users(id),
+        reporter_role TEXT NOT NULL CHECK(reporter_role IN ('client','oeil')),
+        type        TEXT NOT NULL,
+        description TEXT,
+        status      TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','in_progress','resolved','dismissed')),
+        resolved_by TEXT REFERENCES users(id),
+        resolved_at TIMESTAMPTZ,
+        admin_note  TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      ALTER TABLE missions ADD COLUMN IF NOT EXISTS under_surveillance BOOLEAN NOT NULL DEFAULT FALSE;
 
-    ALTER TABLE missions ADD COLUMN IF NOT EXISTS under_surveillance BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE mission_reports ALTER COLUMN created_by DROP NOT NULL;
-    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS reporter_id TEXT REFERENCES users(id);
-    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS reporter_role TEXT CHECK(reporter_role IN ('client','oeil'));
-    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS type TEXT;
-    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS description TEXT;
-    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open' CHECK(status IN ('open','in_progress','resolved','dismissed'));
-    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS resolved_by TEXT REFERENCES users(id);
-    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
-    ALTER TABLE mission_reports ADD COLUMN IF NOT EXISTS admin_note TEXT;
+      -- Migration ponctuelle (ne s'exécute qu'une seule fois, à la première exécution après ce changement) :
+      -- déplace les anciens signalements — mélangés jusqu'ici dans mission_reports — vers la nouvelle table.
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name='mission_reports' AND column_name='reporter_id'
+        ) THEN
+          INSERT INTO mission_problem_reports (mission_id, reporter_id, reporter_role, type, description, status, resolved_by, resolved_at, admin_note, created_at)
+          SELECT mission_id, reporter_id, reporter_role, type, description, status, resolved_by, resolved_at, admin_note, created_at
+          FROM mission_reports
+          WHERE reporter_id IS NOT NULL
+          ON CONFLICT (mission_id) DO NOTHING;
+
+          DELETE FROM mission_reports WHERE reporter_id IS NOT NULL;
+
+          ALTER TABLE mission_reports DROP COLUMN reporter_id;
+          ALTER TABLE mission_reports DROP COLUMN IF EXISTS reporter_role;
+          ALTER TABLE mission_reports DROP COLUMN IF EXISTS type;
+          ALTER TABLE mission_reports DROP COLUMN IF EXISTS description;
+          ALTER TABLE mission_reports DROP COLUMN IF EXISTS status;
+          ALTER TABLE mission_reports DROP COLUMN IF EXISTS resolved_by;
+          ALTER TABLE mission_reports DROP COLUMN IF EXISTS resolved_at;
+          ALTER TABLE mission_reports DROP COLUMN IF EXISTS admin_note;
+        END IF;
+      END $$;
 
 
     CREATE TABLE IF NOT EXISTS reliability_review_requests (
