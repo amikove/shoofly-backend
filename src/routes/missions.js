@@ -1263,6 +1263,108 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
 
 
 
+// ── Cœur de la logique d'embauche d'un Œil parmi les intéressés — réutilisé
+// par POST /:id/hire/:oeilId (client) et par le cron de sélection automatique
+// de fin de fenêtre de candidature (index.js). Retourne { ok:false, status, error }
+// si une vérification échoue (le cron essaie alors le candidat suivant),
+// ou { ok:true, mission } en cas de succès.
+async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
+  const {
+    changedById = null,
+    historyNote = 'Œil choisi parmi les intéressés',
+    oeilNotifTitle = '🎉 Vous avez été sélectionné !',
+    oeilNotifBody = `Vous avez été retenu pour : ${mission.title}`,
+    oeilNotifTitleKey = null,
+    oeilNotifBodyKey = null,
+    oeilNotifParams = null,
+  } = opts || {};
+
+  // Vérifier suspension et cooldown de transfert — sur l'Œil qu'on embauche, pas sur le client
+  const { rows: [oeilUser] } = await db.query(
+    'SELECT is_suspended, transfer_cooldown_until FROM users WHERE id=$1', [oeilId]
+  );
+  if (oeilUser?.is_suspended || (oeilUser?.transfer_cooldown_until && new Date(oeilUser.transfer_cooldown_until) > new Date())) {
+    // Message volontairement générique côté client — la raison précise (suspension, cooldown)
+    // est une information interne de fiabilité, non communicable au client.
+    return { ok: false, status: 403, error: 'Cet Œil n\'est plus disponible pour cette mission.' };
+  }
+
+  const { rows: [interest] } = await db.query(
+    'SELECT * FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2',
+    [mission.id, oeilId]
+  );
+  if (!interest) return { ok: false, status: 400, error: "Cet Œil n'a pas exprimé son intérêt" };
+
+  // Vérifier le créneau avant assignation (doit précéder toute mutation de la mission)
+  const { rows: creneauConflicts } = await db.query(`
+    SELECT m.id FROM missions m
+    WHERE m.oeil_id = $1
+      AND m.status IN ('assigned','en_route','active')
+      AND m.id != $2
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
+  `, [oeilId, mission.id, mission.scheduled_at])
+
+  if (creneauConflicts.length > 0) {
+    return { ok: false, status: 400, error: 'Cet Œil a déjà une mission dans le même créneau.' };
+  }
+
+  // candidate_window_ends_at remis à NULL ici (même en dehors du cron) pour qu'une
+  // sélection manuelle par le client n'importe quand pendant la fenêtre "choose"
+  // empêche définitivement le cron de rejouer une sélection automatique ensuite.
+  const { rows: [updated] } = await db.query(
+    `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), is_priority=false, transfer_deadline=NULL, candidate_window_ends_at=NULL, updated_at=NOW()
+     WHERE id=$2 AND status='pending' RETURNING *`,
+    [oeilId, mission.id]
+  );
+  if (!updated) return { ok: false, status: 409, error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' };
+
+    // Démarrage réel de la mission : on ouvre la première ligne de la chaîne de transferts,
+    // point de départ indispensable pour calculer un split correct même sans aucun transfert.
+    if (updated.status === 'active') {
+      await db.query(
+        `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
+         VALUES ($1, $2, NOW(), 1)`,
+        [updated.id, updated.oeil_id]
+      );
+    }
+
+  await logStatus(db, mission.id, 'assigned', changedById, historyNote);
+
+  // Supprimer les intérêts en conflit de créneau
+  const { rows: conflictInterests } = await db.query(`
+    SELECT mi.mission_id FROM mission_interests mi
+    JOIN missions m ON m.id = mi.mission_id
+    WHERE mi.oeil_id = $1
+      AND mi.mission_id != $2
+      AND m.status = 'pending'
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
+  `, [oeilId, mission.id, mission.scheduled_at])
+
+  for (const ci of conflictInterests) {
+    await db.query(
+      `DELETE FROM mission_interests WHERE oeil_id=$1 AND mission_id=$2`,
+      [oeilId, ci.mission_id]
+    )
+  }
+
+  // Notifier l'Œil embauché
+  await notify(db, oeilId, oeilNotifTitle, oeilNotifBody, 'hired', mission.id, emitToUser, null, oeilNotifTitleKey, oeilNotifBodyKey, oeilNotifParams);
+
+  // Notifier les Œils non retenus
+  const { rows: others } = await db.query(
+    'SELECT oeil_id FROM mission_interests WHERE mission_id=$1 AND oeil_id!=$2',
+    [mission.id, oeilId]
+  );
+  for (const o of others) {
+    await notify(db, o.oeil_id, 'Mission pourvue',
+      `"${mission.title}" a été attribuée à un autre Œil.`, 'info', mission.id, emitToUser, null, 'missionFilledTitle', 'missionFilledBody', {missionTitle: mission.title});
+  }
+
+  if (io) io.to('room:admin').emit('mission_assigned', updated);
+
+  return { ok: true, mission: updated };
+}
+
 // ── POST /:id/hire/:oeilId ── Client choisit un Œil ───────
 router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
@@ -1274,91 +1376,20 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandl
     [req.params.id, req.user.id]
   );
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
-    // Vérifier suspension et cooldown de transfert — sur l'Œil qu'on embauche, pas sur le client
-    const { rows: [oeilUser] } = await db.query(
-      'SELECT is_suspended, transfer_cooldown_until FROM users WHERE id=$1', [req.params.oeilId]
-    );
-    if (oeilUser?.is_suspended || (oeilUser?.transfer_cooldown_until && new Date(oeilUser.transfer_cooldown_until) > new Date())) {
-      // Message volontairement générique côté client — la raison précise (suspension, cooldown)
-      // est une information interne de fiabilité, non communicable au client.
-      return res.status(403).json({ error: 'Cet Œil n\'est plus disponible pour cette mission.' });
-    }
+  if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
 
-  const { rows: [interest] } = await db.query(
-    'SELECT * FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2',
-    [req.params.id, req.params.oeilId]
-  );
-  if (!interest) return res.status(400).json({ error: "Cet Œil n'a pas exprimé son intérêt" });
+  const result = await hireOeilCore(db, io, emitToUser, mission, req.params.oeilId, {
+    changedById: req.user.id,
+    historyNote: 'Œil choisi par le client parmi les intéressés',
+    oeilNotifTitle: '🎉 Vous avez été sélectionné !',
+    oeilNotifBody: `Le client vous a choisi pour : ${mission.title}`,
+    oeilNotifTitleKey: 'oeilSelectedTitle',
+    oeilNotifBodyKey: 'oeilSelectedBody',
+    oeilNotifParams: {missionTitle: mission.title},
+  });
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
 
-  // Vérifier le créneau avant assignation (doit précéder toute mutation de la mission)
-  const { rows: creneauConflicts } = await db.query(`
-    SELECT m.id FROM missions m
-    WHERE m.oeil_id = $1
-      AND m.status IN ('assigned','en_route','active')
-      AND m.id != $2
-      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
-  `, [req.params.oeilId, req.params.id, mission.scheduled_at])
-
-  if (creneauConflicts.length > 0) {
-    return res.status(400).json({ error: 'Cet Œil a déjà une mission dans le même créneau.' })
-  }
-
-  const { rows: [updated] } = await db.query(
-    `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), is_priority=false, transfer_deadline=NULL, updated_at=NOW()
-     WHERE id=$2 AND status='pending' RETURNING *`,
-    [req.params.oeilId, req.params.id]
-  );
-  if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
-
-    // Démarrage réel de la mission : on ouvre la première ligne de la chaîne de transferts,
-    // point de départ indispensable pour calculer un split correct même sans aucun transfert.
-    if (status === 'active') {
-      await db.query(
-        `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
-         VALUES ($1, $2, NOW(), 1)`,
-        [updated.id, updated.oeil_id]
-      );
-    }
-
-  await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil choisi par le client parmi les intéressés');
-
-  // Supprimer les intérêts en conflit de créneau
-  const { rows: conflictInterests } = await db.query(`
-    SELECT mi.mission_id FROM mission_interests mi
-    JOIN missions m ON m.id = mi.mission_id
-    WHERE mi.oeil_id = $1
-      AND mi.mission_id != $2
-      AND m.status = 'pending'
-      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
-  `, [req.params.oeilId, req.params.id, mission.scheduled_at])
-
-  for (const ci of conflictInterests) {
-    await db.query(
-      `DELETE FROM mission_interests WHERE oeil_id=$1 AND mission_id=$2`,
-      [req.params.oeilId, ci.mission_id]
-    )
-  }
-
-
-
-  // Notifier l'Œil embauché
-  await notify(db, req.params.oeilId, '🎉 Vous avez été sélectionné !',
-    `Le client vous a choisi pour : ${mission.title}`, 'hired', req.params.id, emitToUser, null, 'oeilSelectedTitle', 'oeilSelectedBody', {missionTitle: mission.title});
-
-  // Notifier les Œils non retenus
-  const { rows: others } = await db.query(
-    'SELECT oeil_id FROM mission_interests WHERE mission_id=$1 AND oeil_id!=$2',
-    [req.params.id, req.params.oeilId]
-  );
-  for (const o of others) {
-    await notify(db, o.oeil_id, 'Mission pourvue',
-      `"${mission.title}" a été attribuée à un autre Œil.`, 'info', req.params.id, emitToUser, null, 'missionFilledTitle', 'missionFilledBody', {missionTitle: mission.title});
-  }
-
-  if (io) io.to('room:admin').emit('mission_assigned', updated);
-
-  res.json({ mission: updated });
+  res.json({ mission: result.mission });
 }));
 
 
@@ -1533,4 +1564,6 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandl
 
 
 router.checkTransferDeadlines = checkTransferDeadlines;
+router.hireOeilCore = hireOeilCore;
+router.notify = notify;
 module.exports = router;
