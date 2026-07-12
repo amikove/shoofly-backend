@@ -451,18 +451,32 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
 
   
   const { rows: [updated] } = await db.query(
-    `UPDATE missions SET
-        oeil_id=$1,
-        oeil2_id=CASE WHEN is_priority=true AND transferred_from IS NOT NULL THEN $1 ELSE oeil2_id END,
-        status='assigned',
-        assigned_at=NOW(),
-        is_priority=false,
-        transfer_deadline=NULL,
-        updated_at=NOW()
-      WHERE id=$2 AND status='pending' RETURNING *`,
-    [req.user.id, req.params.id]
-  );
-  if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+  `UPDATE missions SET
+          oeil_id=$1,
+          oeil2_id=CASE WHEN is_priority=true AND transferred_from IS NOT NULL THEN $1 ELSE oeil2_id END,
+          status='assigned',
+          assigned_at=NOW(),
+          is_priority=false,
+          transfer_deadline=NULL,
+          updated_at=NOW()
+        WHERE id=$2 AND status='pending' RETURNING *`,
+      [req.user.id, req.params.id]
+    );
+    if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+
+    // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
+    // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
+    if (mission.transfer_type === 'during') {
+      const { rows: [{ n: nextOrder }] } = await db.query(
+        `SELECT COALESCE(MAX(sequence_order), 0) + 1 AS n FROM mission_transfer_chain WHERE mission_id=$1`,
+        [updated.id]
+      );
+      await db.query(
+        `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
+         VALUES ($1, $2, NOW(), $3)`,
+        [updated.id, req.user.id, nextOrder]
+      );
+    }
 
   await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil sélectionné par le client');
 
@@ -1016,13 +1030,22 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   `, [transferType, req.user.id, reason, deadline, mission.id, mission.status]);
   if (transferRowCount === 0) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
 
-  // Cooldown 4h si transfert pendant mission
-  if (transferType === 'during') {
-    await db.query(
-      `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '4 hours', transfer_count=transfer_count+1 WHERE id=$1`,
-      [req.user.id]
-    );
-  } else {
+// Transfert pendant mission : ferme la ligne active de la chaîne (le nouvel Œil n'est pas
+    // encore connu à ce stade — la nouvelle ligne sera ouverte au moment où quelqu'un accepte
+    // effectivement cette mission remise en file prioritaire).
+    if (transferType === 'during') {
+      await db.query(
+        `UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`,
+        [mission.id]
+      );
+    }
+    // Cooldown 4h si transfert pendant mission
+    if (transferType === 'during') {
+      await db.query(
+        `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '4 hours', transfer_count=transfer_count+1 WHERE id=$1`,
+        [req.user.id]
+      );
+    } else {
     await db.query(
       `UPDATE users SET transfer_count=transfer_count+1 WHERE id=$1`,
       [req.user.id]
