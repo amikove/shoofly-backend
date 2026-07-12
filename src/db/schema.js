@@ -492,6 +492,9 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_id ON ticket_messages(ticket_id);
+    -- Nécessaire pour réutiliser le pattern "marquer comme lu" de mission_messages
+    -- (voir GET /tickets/:id) — absent du schéma minimal initial de l'étape 1.
+    ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN NOT NULL DEFAULT FALSE;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

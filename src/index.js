@@ -29,6 +29,7 @@ const notify = missionRoutesModule.notify;
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
 const reportRoutes = require('./routes/reports');
+const ticketRoutes = require('./routes/tickets');
 
 const app    = express();
 const server = http.createServer(app);
@@ -113,6 +114,7 @@ app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/reliability', reliabilityRoutes);
 app.use('/api/promo', promoRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api/tickets', ticketRoutes);
 
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 app.get('/api', (_, res) => res.json({ name: 'SHOOFLY API', version: '1.0.0' }));

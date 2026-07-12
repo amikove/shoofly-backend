@@ -23,6 +23,16 @@ function isSuspendedOeilAllowed(req) {
     return false;
   }
 
+  // Un Œil suspendu doit pouvoir ouvrir un ticket de support (notamment pour
+  // contester/comprendre son blocage) et suivre ses échanges avec l'admin.
+  if (baseUrl === '/api/tickets') {
+    if (method === 'POST' && path === '/') return true;
+    if (method === 'GET'  && path === '/mine') return true;
+    if (method === 'GET'  && /^\/[^/]+$/.test(path) && !path.startsWith('/admin')) return true;
+    if (method === 'POST' && /^\/[^/]+\/messages$/.test(path)) return true;
+    return false;
+  }
+
   if (baseUrl === '/api/missions') {
     // GET / est toujours autorisé, y compris mode="available" : la route
     // elle-même renvoie une liste vide pour un Œil suspendu dans ce mode
