@@ -675,13 +675,21 @@ const { status, cancel_reason } = req.body;
 
   // Démarrage réel de la mission : on ouvre la première ligne de la chaîne de transferts,
   // point de départ indispensable pour calculer un split correct si la mission est transférée
-  // 'during' plus tard (la ligne reste simplement inutilisée à la validation sinon).
+  // 'during' plus tard (la ligne reste simplement inutilisée à la validation sinon). Uniquement
+  // si aucune ligne n'existe déjà : un Œil de remplacement a la sienne ouverte par hireOeilCore
+  // dès l'embauche — sans cette garde, son passage à 'active' créerait un doublon et le paierait deux fois.
   if (status === 'active') {
-    await db.query(
-      `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
-       VALUES ($1, $2, NOW(), 1)`,
-      [updated.id, updated.oeil_id]
+    const { rows: [{ n: existingChainRows }] } = await db.query(
+      `SELECT COUNT(*)::int AS n FROM mission_transfer_chain WHERE mission_id=$1`,
+      [updated.id]
     );
+    if (existingChainRows === 0) {
+      await db.query(
+        `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
+         VALUES ($1, $2, NOW(), 1)`,
+        [updated.id, updated.oeil_id]
+      );
+    }
   }
 
   // Logger le changement de statut (sauf completed géré plus bas)
