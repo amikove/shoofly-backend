@@ -217,9 +217,12 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
   if (req.user.role === 'client') {
     where.push(`m.client_id=$${p++}`); params.push(req.user.id);
   } else if (req.user.role === 'oeil') {
-    // La suspension est désormais gérée en amont par le middleware authenticate
-    // (mode='available' bloqué entièrement pour un Œil suspendu ; ses propres
-    // missions restent consultables pour qu'il puisse les terminer proprement).
+    // Un Œil suspendu ne doit se voir proposer aucune nouvelle mission — l'appel
+    // reste autorisé (le middleware ne bloque plus mode='available'), mais on
+    // renvoie directement une liste vide sans même construire la requête.
+    if (mode === 'available' && req.user.is_suspended) {
+      return res.json({ missions: [], total: 0, page: +page, pages: 0 });
+    }
 // placer les missions ignorées dans une table à part
     if (mode === 'available') {
       where.push(`m.status='pending' AND m.oeil_id IS NULL AND m.city=$${p++}`);

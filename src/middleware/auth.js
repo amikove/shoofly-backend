@@ -24,9 +24,11 @@ function isSuspendedOeilAllowed(req) {
   }
 
   if (baseUrl === '/api/missions') {
-    // Liste de ses propres missions (hors mode="available", qui expose les
-    // nouvelles missions à prendre — ça reste interdit).
-    if (method === 'GET' && path === '/' && req.query.mode !== 'available') return true;
+    // GET / est toujours autorisé, y compris mode="available" : la route
+    // elle-même renvoie une liste vide pour un Œil suspendu dans ce mode
+    // (il ne doit pas se voir proposer de nouvelles missions, mais l'appel
+    // ne doit pas échouer en 403 — voir routes/missions.js GET /).
+    if (method === 'GET' && path === '/') return true;
     if (method === 'GET' && path === '/inbox') return true;
     if (method === 'GET' && /^\/[^/]+\/history$/.test(path)) return true;
     if (method === 'GET' && /^\/[^/]+$/.test(path) && !['/inbox', '/my-reports'].includes(path)) return true;
@@ -61,6 +63,7 @@ async function authenticate(req, res, next) {
       quartier:       user.quartier,
       is_super_admin: user.is_super_admin || false,
       permissions:    Array.isArray(user.permissions) ? user.permissions : [],
+      is_suspended:   user.is_suspended || false,
     };
     next();
   } catch { return res.status(401).json({ error: 'Token invalide ou expiré' }); }
