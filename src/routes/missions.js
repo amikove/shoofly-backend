@@ -1036,6 +1036,14 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   const graceMinutes = mission.type === 'file_attente' ? 45 : 60;
   const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
 
+  // Fenêtre de candidature : durée fixe de 10 min en "fast" (peu importe le type),
+  // 5 min (file_attente) ou 10 min (autres types) en "choose" — indépendante du
+  // délai de grâce (transfer_deadline) ci-dessus, qui continue de courir en toile de fond.
+  const candidateWindowMinutes = mission.replacement_preference === 'choose'
+    ? (mission.type === 'file_attente' ? 5 : 10)
+    : 10;
+  const candidateWindowEndsAt = new Date(Date.now() + candidateWindowMinutes * 60 * 1000);
+
   // Remettre la mission en pending avec flag priorité — vérifié et appliqué
   // avant de toucher au compte de l'Œil, pour ne pas lui imputer un cooldown
   // si la mission a en fait déjà changé de statut entre-temps.
@@ -1047,10 +1055,11 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
       transferred_from=$2,
       transfer_reason=$3,
       transfer_deadline=$4,
+      candidate_window_ends_at=$5,
       oeil_id=NULL,
       updated_at=NOW()
-    WHERE id=$5 AND status=$6
-  `, [transferType, req.user.id, reason, deadline, mission.id, mission.status]);
+    WHERE id=$6 AND status=$7
+  `, [transferType, req.user.id, reason, deadline, candidateWindowEndsAt, mission.id, mission.status]);
   if (transferRowCount === 0) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
 
 // Transfert pendant mission : ferme la ligne active de la chaîne (le nouvel Œil n'est pas
