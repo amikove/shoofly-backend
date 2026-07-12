@@ -42,15 +42,36 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
   const { rowCount } = await db.query(`UPDATE missions SET validated_at=NOW(), updated_at=NOW() WHERE id=$1 AND status='completed' AND validated_at IS NULL`, [mission.id]);
   if (rowCount === 0) return res.status(409).json({ error: 'Cette mission a déjà été validée ou a changé de statut entre-temps.' });
 
-  if (mission.transfer_type === 'during' && mission.transferred_from && mission.oeil2_id) {
-    // Split 50/50
-    const half = Math.round(mission.oeil_earning * 0.5 * 100) / 100;
-    await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [half, mission.transferred_from]);
-    await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [half, mission.oeil_id]);
-    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Part mission — transfert (50%)',$3)`, [mission.transferred_from, half, mission.id]);
-    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Part mission — transfert (50%)',$3)`, [mission.oeil_id, half, mission.id]);
-    await notify(db, mission.transferred_from, '💰 Paiement partiel reçu', `${half} MAD crédités — votre part du transfert de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'partialPaymentReceivedTitle', 'partialPaymentReceivedBody', {amount: half, missionTitle: mission.title});
-  } else {
+  if (mission.transfer_type === 'during') {
+      // Split au prorata du temps réel de chaque Œil dans la chaîne de transferts —
+      // fonctionne peu importe le nombre de transferts (remplace l'ancien split 50/50 figé à 2 Œils).
+      await db.query(
+        `UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`,
+        [mission.id]
+      );
+      const { rows: chain } = await db.query(
+        `SELECT oeil_id, started_at, ended_at FROM mission_transfer_chain WHERE mission_id=$1 ORDER BY sequence_order ASC`,
+        [mission.id]
+      );
+      if (chain.length > 0) {
+        const durations = chain.map(c => Math.max(0, new Date(c.ended_at) - new Date(c.started_at)));
+        const totalDuration = durations.reduce((s, d) => s + d, 0);
+        for (let i = 0; i < chain.length; i++) {
+          const link = chain[i];
+          const share = totalDuration > 0
+            ? Math.round(mission.oeil_earning * (durations[i] / totalDuration) * 100) / 100
+            : Math.round((mission.oeil_earning / chain.length) * 100) / 100; // repli si durées nulles (cas limite)
+          await db.query(`UPDATE mission_transfer_chain SET earning_share=$1 WHERE mission_id=$2 AND oeil_id=$3`, [share, mission.id, link.oeil_id]);
+          await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [share, link.oeil_id]);
+          await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Part mission — transfert au prorata',$3)`, [link.oeil_id, share, mission.id]);
+          await notify(db, link.oeil_id, '💰 Paiement partiel reçu', `${share} MAD crédités — votre part de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'partialPaymentReceivedTitle', 'partialPaymentReceivedBody', {amount: share, missionTitle: mission.title});
+        }
+      } else {
+        // Filet de sécurité : transfer_type='during' mais aucune ligne de chaîne trouvée
+        // (ne devrait plus arriver avec le nouveau système, mais protège les missions en transition).
+        await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
+      }
+    } else {
     await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
     await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Validation client',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
   }
