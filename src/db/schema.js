@@ -454,6 +454,44 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_transfer_chain_mission_id ON mission_transfer_chain(mission_id);
+
+    -- Système de tickets de support : fil de discussion bidirectionnel (remplace à terme
+    -- mission_problem_reports, laissée en place pour l'instant — voir routes/tickets.js).
+    CREATE TABLE IF NOT EXISTS support_tickets (
+      id                     TEXT PRIMARY KEY,
+      reference              TEXT UNIQUE NOT NULL,
+      user_id                TEXT NOT NULL REFERENCES users(id),
+      user_role              TEXT NOT NULL CHECK(user_role IN ('client','oeil')),
+      category               TEXT NOT NULL CHECK(category IN (
+        'mission','paiement','compte','facturation','verification','securite',
+        'application','assistance_technique','confidentialite','reclamation',
+        'suggestion','urgence','autre'
+      )),
+      subcategory            TEXT,
+      mission_id             TEXT REFERENCES missions(id),
+      initial_message        TEXT NOT NULL,
+      status                 TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','in_progress','resolved','dismissed')),
+      is_urgent              BOOLEAN NOT NULL DEFAULT FALSE,
+      last_admin_message_at  TIMESTAMPTZ,
+      last_user_message_at   TIMESTAMPTZ,
+      resolved_at            TIMESTAMPTZ,
+      resolved_by            TEXT REFERENCES users(id),
+      created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_support_tickets_user_id ON support_tickets(user_id);
+    CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status);
+
+    CREATE TABLE IF NOT EXISTS ticket_messages (
+      id          SERIAL PRIMARY KEY,
+      ticket_id   TEXT NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,
+      sender_id   TEXT NOT NULL REFERENCES users(id),
+      sender_role TEXT NOT NULL CHECK(sender_role IN ('client','oeil','admin')),
+      content     TEXT NOT NULL,
+      is_system   BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_id ON ticket_messages(ticket_id);
   `);
   console.log('✅ PostgreSQL schema ready');
 }
