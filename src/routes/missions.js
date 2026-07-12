@@ -70,6 +70,7 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
         // Filet de sécurité : transfer_type='during' mais aucune ligne de chaîne trouvée
         // (ne devrait plus arriver avec le nouveau système, mais protège les missions en transition).
         await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
+        await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Mission validée (paiement intégral)',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
       }
     } else {
     await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
