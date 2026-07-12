@@ -83,7 +83,7 @@ router.post('/', authenticate, requireRole('client', 'oeil'), asyncHandler(async
         `${req.user.role === 'client' ? 'Client' : 'Œil'} a ouvert un ticket urgent : "${subcategory || category}" (${reference})`,
         'error', mission ? mission.id : null, emitToUser, 'admin_urgent_ticket',
         'urgentTicketAdminTitle', 'urgentTicketAdminBody',
-        { reporterRole: req.user.role === 'client' ? 'Client' : 'Œil', subcategory: subcategory || category, reference }
+        { reporterRole: req.user.role === 'client' ? 'Client' : 'Œil', subcategory: subcategory || category, reference, ticketId: ticket.id }
       );
     }
     const io = req.app.get('io');
@@ -167,7 +167,7 @@ router.put('/admin/:id/status', authenticate, requireRole('admin'), asyncHandler
     `📋 Votre ticket ${ticket.reference} a été ${statusLabel}`,
     `Le statut de votre ticket a été mis à jour par notre équipe.`,
     'info', ticket.mission_id, emitToUser, 'ticket_view',
-    titleKey, 'ticketStatusDefaultBody', { reference: ticket.reference }
+    titleKey, 'ticketStatusDefaultBody', { reference: ticket.reference, ticketId: ticket.id }
   );
 
   res.json({ ticket });
@@ -218,7 +218,11 @@ router.post('/:id/messages', authenticate, asyncHandler(async (req, res) => {
   );
 
   const timestampField = isAdmin ? 'last_admin_message_at' : 'last_user_message_at';
-  const newStatus = (isAdmin && ticket.status === 'open') ? 'in_progress' : ticket.status;
+  // Un admin qui répond à un ticket ouvert le prend en charge ; un créateur qui répond à
+  // un ticket résolu/classé (y compris auto-résolu par le cron 72h) le rouvre.
+  const newStatus = isAdmin
+    ? (ticket.status === 'open' ? 'in_progress' : ticket.status)
+    : (['resolved', 'dismissed'].includes(ticket.status) ? 'in_progress' : ticket.status);
   await db.query(
     `UPDATE support_tickets SET ${timestampField}=NOW(), status=$1, updated_at=NOW() WHERE id=$2`,
     [newStatus, ticket.id]
@@ -230,7 +234,7 @@ router.post('/:id/messages', authenticate, asyncHandler(async (req, res) => {
       `💬 Nouvelle réponse sur votre ticket ${ticket.reference}`,
       content.trim().slice(0, 140),
       'info', ticket.mission_id, emitToUser, 'ticket_view',
-      'ticketNewMessageAdminReplyTitle', 'ticketNewMessageAdminReplyBody', { reference: ticket.reference }
+      'ticketNewMessageAdminReplyTitle', 'ticketNewMessageAdminReplyBody', { reference: ticket.reference, ticketId: ticket.id }
     );
   } else {
     const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
@@ -240,7 +244,7 @@ router.post('/:id/messages', authenticate, asyncHandler(async (req, res) => {
         `💬 Nouveau message sur le ticket ${ticket.reference}`,
         content.trim().slice(0, 140),
         'info', ticket.mission_id, emitToUser, 'admin_ticket_message',
-        'ticketNewMessageUserReplyTitle', 'ticketNewMessageUserReplyBody', { reference: ticket.reference }
+        'ticketNewMessageUserReplyTitle', 'ticketNewMessageUserReplyBody', { reference: ticket.reference, ticketId: ticket.id }
       );
     }
   }

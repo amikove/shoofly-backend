@@ -754,7 +754,7 @@ initDb().then(() => {
           `📋 Ticket ${ticket.reference} résolu automatiquement`,
           'Aucune réponse de votre part depuis 72h — le ticket a été résolu automatiquement. Vous pouvez le rouvrir en répondant.',
           'info', ticket.mission_id, emitToUser, 'ticket_view',
-          'ticketAutoResolvedTitle', 'ticketAutoResolvedBody', { reference: ticket.reference }
+          'ticketAutoResolvedTitle', 'ticketAutoResolvedBody', { reference: ticket.reference, ticketId: ticket.id }
         );
         console.log(`📋 Ticket ${ticket.reference} auto-résolu après 72h d'inactivité`);
       }
