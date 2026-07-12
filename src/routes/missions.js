@@ -468,6 +468,9 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
   if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission plus disponible' });
+  if (mission.candidate_window_ends_at && new Date(mission.candidate_window_ends_at) > new Date()) {
+    return res.status(400).json({ error: "Cette mission est en phase de sélection de remplaçant, merci de manifester votre intérêt via le bouton dédié plutôt que d'accepter directement." });
+  }
 
   const { rows: [profile] } = await db.query('SELECT is_verified FROM oeil_profiles WHERE user_id=$1', [req.user.id]);
   if (!profile?.is_verified) return res.status(403).json({ error: 'Profil non vérifié' });
