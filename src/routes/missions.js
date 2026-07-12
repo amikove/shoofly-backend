@@ -1318,13 +1318,17 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   );
   if (!updated) return { ok: false, status: 409, error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' };
 
-    // Démarrage réel de la mission : on ouvre la première ligne de la chaîne de transferts,
-    // point de départ indispensable pour calculer un split correct même sans aucun transfert.
-    if (updated.status === 'active') {
+    // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
+    // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
+    if (mission.transfer_type === 'during') {
+      const { rows: [{ n: nextOrder }] } = await db.query(
+        `SELECT COALESCE(MAX(sequence_order), 0) + 1 AS n FROM mission_transfer_chain WHERE mission_id=$1`,
+        [updated.id]
+      );
       await db.query(
         `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
-         VALUES ($1, $2, NOW(), 1)`,
-        [updated.id, updated.oeil_id]
+         VALUES ($1, $2, NOW(), $3)`,
+        [updated.id, updated.oeil_id, nextOrder]
       );
     }
 
