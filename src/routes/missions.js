@@ -303,6 +303,7 @@ router.post('/', authenticate, requireRole('client'), [
   body('city').trim().notEmpty(),
   body('scheduled_at').isISO8601(),
   body('price').isFloat({ min: 0 }),
+  body('replacement_preference').optional().isIn(['fast','choose']),
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
@@ -318,6 +319,7 @@ router.post('/', authenticate, requireRole('client'), [
     institution, purpose,
     company_name, audit_type, frequency, criteria, subcategory,
     promo_code, discount, original_price, platform_amount,
+    replacement_preference,
   } = req.body;
 
 const id = uuidv4();
@@ -336,15 +338,15 @@ const { rows: [mission] } = await db.query(`
     id,client_id,type,subcategory,status,title,description,address,city,quartier,scheduled_at,
     duration_est,price,commission,oeil_earning,is_urgent,
     property_type,visit_type,video_call,institution,purpose,
-    company_name,audit_type,frequency,criteria,oeil_id
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+    company_name,audit_type,frequency,criteria,oeil_id,replacement_preference
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
   RETURNING *
 `, [
   id, req.user.id, type, subcategory||null, status, title, description||null, address, city, quartier||null,
   new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
   !!is_urgent, property_type||null, visit_type||null, !!video_call,
   institution||null, purpose||null, company_name||null, audit_type||null,
-  frequency||null, criteria||null, oeil_id||null
+  frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast'
 ]);
 
 // Mission offerte via code promo gratuit : Shoofly paie l'Œil de sa poche, sans commission générée.
