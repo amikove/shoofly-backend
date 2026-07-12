@@ -1253,6 +1253,16 @@ if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission 
   );
   if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
 
+    // Démarrage réel de la mission : on ouvre la première ligne de la chaîne de transferts,
+    // point de départ indispensable pour calculer un split correct même sans aucun transfert.
+    if (status === 'active') {
+      await db.query(
+        `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
+         VALUES ($1, $2, NOW(), 1)`,
+        [updated.id, updated.oeil_id]
+      );
+    }
+
   await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil choisi par le client parmi les intéressés');
 
   // Supprimer les intérêts en conflit de créneau
