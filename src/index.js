@@ -247,6 +247,7 @@ initDb().then(() => {
   let cronAutoValidateRunning = false;
   let cronStaleMissionsRunning = false;
   let cronCandidateWindowRunning = false;
+  let cronTicketAutoResolveRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain ─────────────────
   cron.schedule('0 20 * * *', async () => {
@@ -707,6 +708,58 @@ initDb().then(() => {
         }
     } catch (e) { console.error('❌ Cron missions sans Œil error:', e.message); }
     finally { cronStaleMissionsRunning = false; }
+  });
+
+  // ── Cron toutes les heures — auto-résolution des tickets après 72h d'inactivité ──
+  // IMPORTANT : is_urgent=true est EXCLU explicitement de la requête (jamais concerné
+  // par cette auto-résolution, quelle que soit la durée d'inactivité).
+  cron.schedule('0 * * * *', async () => {
+    if (cronTicketAutoResolveRunning) { console.warn('⏭️ Cron auto-résolution tickets déjà en cours, tick ignoré'); return; }
+    cronTicketAutoResolveRunning = true;
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+
+      const { rows: tickets } = await db.query(`
+        SELECT * FROM support_tickets
+        WHERE status = 'in_progress'
+          AND is_urgent = false
+          AND last_admin_message_at IS NOT NULL
+          AND last_admin_message_at > COALESCE(last_user_message_at, '1970-01-01')
+          AND last_admin_message_at <= NOW() - INTERVAL '72 hours'
+      `);
+
+      // ticket_messages.sender_id référence users(id) sans exception "système" — on
+      // attribue donc le message automatique à un admin actif (peu importe lequel : le
+      // flag is_system=true est ce qui fait foi côté affichage, pas le sender_id).
+      let systemSenderId = null;
+      if (tickets.length) {
+        const { rows: [anyAdmin] } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true LIMIT 1`);
+        systemSenderId = anyAdmin ? anyAdmin.id : null;
+      }
+
+      for (const ticket of tickets) {
+        if (!systemSenderId) { console.warn('⏭️ Cron auto-résolution tickets : aucun admin actif trouvé, tick ignoré'); break; }
+        await db.query(
+          `UPDATE support_tickets SET status='resolved', resolved_by=NULL, resolved_at=NOW(), updated_at=NOW() WHERE id=$1`,
+          [ticket.id]
+        );
+        await db.query(
+          `INSERT INTO ticket_messages (ticket_id, sender_id, sender_role, content, is_system)
+           VALUES ($1, $2, 'admin', 'Ticket résolu automatiquement après 72h sans réponse de votre part.', true)`,
+          [ticket.id, systemSenderId]
+        );
+        await notify(
+          db, ticket.user_id,
+          `📋 Ticket ${ticket.reference} résolu automatiquement`,
+          'Aucune réponse de votre part depuis 72h — le ticket a été résolu automatiquement. Vous pouvez le rouvrir en répondant.',
+          'info', ticket.mission_id, emitToUser, 'ticket_view',
+          'ticketAutoResolvedTitle', 'ticketAutoResolvedBody', { reference: ticket.reference }
+        );
+        console.log(`📋 Ticket ${ticket.reference} auto-résolu après 72h d'inactivité`);
+      }
+    } catch (e) { console.error('❌ Cron auto-résolution tickets error:', e.message); }
+    finally { cronTicketAutoResolveRunning = false; }
   });
 
   // Keep-alive pour Render plan gratuit
