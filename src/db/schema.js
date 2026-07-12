@@ -437,7 +437,21 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     CREATE INDEX IF NOT EXISTS idx_identity_documents_user_id ON identity_documents(user_id);
     CREATE INDEX IF NOT EXISTS idx_ratings_oeil_id ON ratings(oeil_id);
     CREATE INDEX IF NOT EXISTS idx_ratings_client_id ON ratings(client_id);
-    
+
+    -- Chaîne de transferts en cours de mission (transfer_type='during') : une ligne par Œil ayant
+    -- porté la mission, avec sa portion de temps réel — permet un split des gains au prorata,
+    -- peu importe le nombre de transferts (remplace l'ancien split 50/50 figé à 2 Œils).
+    CREATE TABLE IF NOT EXISTS mission_transfer_chain (
+      id             SERIAL PRIMARY KEY,
+      mission_id     TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      oeil_id        TEXT NOT NULL REFERENCES users(id),
+      started_at     TIMESTAMPTZ NOT NULL,
+      ended_at       TIMESTAMPTZ,
+      earning_share  NUMERIC(10,2),
+      sequence_order INTEGER NOT NULL,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_transfer_chain_mission_id ON mission_transfer_chain(mission_id);
   `);
   console.log('✅ PostgreSQL schema ready');
 }
