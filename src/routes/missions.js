@@ -669,6 +669,17 @@ const { status, cancel_reason } = req.body;
   `, [status, cancel_reason||null, mission.id, mission.status]);
   if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
 
+  // Démarrage réel de la mission : on ouvre la première ligne de la chaîne de transferts,
+  // point de départ indispensable pour calculer un split correct si la mission est transférée
+  // 'during' plus tard (la ligne reste simplement inutilisée à la validation sinon).
+  if (status === 'active') {
+    await db.query(
+      `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
+       VALUES ($1, $2, NOW(), 1)`,
+      [updated.id, updated.oeil_id]
+    );
+  }
+
   // Logger le changement de statut (sauf completed géré plus bas)
   if (status !== 'completed') {
     await logStatus(db, mission.id, status, req.user.id, null);
