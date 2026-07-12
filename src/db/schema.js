@@ -294,6 +294,8 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_reason TEXT;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_deadline TIMESTAMPTZ;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS oeil2_id TEXT REFERENCES users(id);
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS replacement_preference TEXT NOT NULL DEFAULT 'fast' CHECK(replacement_preference IN ('fast','choose'));
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS candidate_window_ends_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_cooldown_until TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS reliability_score INTEGER NOT NULL DEFAULT 90;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_count INTEGER NOT NULL DEFAULT 0;
