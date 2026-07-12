@@ -24,6 +24,8 @@ const promoRoutes   = require('./routes/promo');
 const missionRoutes = require('./routes/missions');
 const missionRoutesModule = require('./routes/missions');
 const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
+const hireOeilCore = missionRoutesModule.hireOeilCore;
+const notify = missionRoutesModule.notify;
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
 const reportRoutes = require('./routes/reports');
@@ -242,6 +244,7 @@ initDb().then(() => {
   let cronTransferDeadlineRunning = false;
   let cronAutoValidateRunning = false;
   let cronStaleMissionsRunning = false;
+  let cronCandidateWindowRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain ─────────────────
   cron.schedule('0 20 * * *', async () => {
@@ -574,6 +577,65 @@ initDb().then(() => {
       await checkTransferDeadlines(db, emitToUser);
     } catch (e) { console.error('❌ Transfer deadline cron error:', e.message); }
     finally { cronTransferDeadlineRunning = false; }
+  });
+
+  // ── Cron toutes les 2 min — Sélection automatique de candidat à expiration
+  // de la fenêtre de candidature (fast : 10min fixe / choose : 5 ou 10min) ──
+  cron.schedule('*/2 * * * *', async () => {
+    if (cronCandidateWindowRunning) { console.warn('⏭️ Cron sélection candidat déjà en cours, tick ignoré'); return; }
+    cronCandidateWindowRunning = true;
+    try {
+      const db = getDb();
+      const io = app.get('io');
+      const emitToUser = app.get('emitToUser');
+
+      const { rows: expiredWindows } = await db.query(`
+        SELECT * FROM missions
+        WHERE candidate_window_ends_at IS NOT NULL
+          AND candidate_window_ends_at <= NOW()
+          AND status='pending'
+          AND oeil_id IS NULL
+      `);
+
+      for (const mission of expiredWindows) {
+        // Classement des candidats : reliability_score décroissant, puis rating_avg décroissant
+        const { rows: candidates } = await db.query(`
+          SELECT u.id
+          FROM mission_interests mi
+          JOIN users u ON u.id = mi.oeil_id
+          LEFT JOIN oeil_profiles p ON p.user_id = u.id
+          WHERE mi.mission_id = $1
+          ORDER BY u.reliability_score DESC, p.rating_avg DESC
+        `, [mission.id]);
+
+        let assigned = null;
+        for (const candidate of candidates) {
+          // Si le meilleur candidat échoue une vérification (suspension/cooldown/créneau),
+          // on tente le suivant du classement plutôt que d'échouer silencieusement.
+          const result = await hireOeilCore(db, io, emitToUser, mission, candidate.id, {
+            changedById: null,
+            historyNote: 'Sélection automatique du meilleur candidat (fin de fenêtre de candidature)',
+            oeilNotifTitle: '🎉 Vous avez été sélectionné !',
+            oeilNotifBody: `Vous avez été automatiquement retenu comme remplaçant pour "${mission.title}".`,
+          });
+          if (result.ok) { assigned = result.mission; break; }
+        }
+
+        if (assigned) {
+          const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [assigned.oeil_id]);
+          await notify(db, mission.client_id, '✅ Remplaçant trouvé',
+            `${oeil.first_name} ${oeil.last_name} a été automatiquement sélectionné pour remplacer sur "${mission.title}".`,
+            'mission', mission.id, emitToUser);
+          console.log(`✅ Sélection automatique — mission ${mission.id} assignée à ${assigned.oeil_id}`);
+        } else {
+          // Aucun candidat (ou tous invalides) : on ne touche à rien d'autre, le
+          // transfer_deadline existant continue de courir en toile de fond.
+          await db.query(`UPDATE missions SET candidate_window_ends_at=NULL WHERE id=$1`, [mission.id]);
+          console.log(`ℹ️ Fenêtre de candidature expirée sans candidat valide — mission ${mission.id}`);
+        }
+      }
+    } catch (e) { console.error('❌ Cron sélection candidat error:', e.message); }
+    finally { cronCandidateWindowRunning = false; }
   });
 
   cron.schedule('0 * * * *', async () => {
