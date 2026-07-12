@@ -1427,6 +1427,13 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandl
 }));
 
 
+// ── DÉPRÉCIATION CANDIDATE ──────────────────────────────────
+// Ce système de signalement à sens unique (mission_problem_reports) est remplacé
+// par le système de tickets bidirectionnel (voir routes/tickets.js, POST /api/tickets).
+// Le frontend n'appelle plus report-problem (bouton "Signaler un problème" migré vers
+// NewTicketModal). Conservé tel quel pour l'historique et le temps de confirmer que le
+// nouveau système tient la route en production — à supprimer dans un futur nettoyage
+// (table, ces 3 routes, et la page frontend MesSignalements/AdminProblemes).
 // ── POST /missions/:id/report-problem ── Signaler un problème ──
 router.post('/:id/report-problem', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
