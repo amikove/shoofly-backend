@@ -1,4 +1,4 @@
-const router = require('express').Router();
+﻿const router = require('express').Router();
 const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
@@ -710,6 +710,11 @@ const { status, cancel_reason } = req.body;
     let refund;
     // Un admin peut fixer un pourcentage de remboursement précis, en dérogation à la règle automatique
     if (req.user.role === 'admin' && req.body.refund_percent !== undefined) {
+        const hasFinancePermission = req.user.is_super_admin ||
+          (Array.isArray(req.user.permissions) && req.user.permissions.includes('finance'));
+        if (!hasFinancePermission) {
+          return res.status(403).json({ error: 'Permission insuffisante pour fixer un remboursement personnalise (finance requise)' });
+        }
       const pct = Math.max(0, Math.min(parseFloat(req.body.refund_percent) || 0, 100));
       refund = Math.round(mission.price * pct / 100 * 100) / 100;
       if (refund > 0) {
