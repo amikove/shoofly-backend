@@ -149,7 +149,7 @@ router.put('/password', authenticate, asyncHandler(async (req, res) => {
   const { rows: [user] } = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
   if (!bcrypt.compareSync(req.body.current_password, user.password))
     return res.status(400).json({ error: 'Mot de passe actuel incorrect' });
-  await db.query('UPDATE users SET password=$1 WHERE id=$2', [bcrypt.hashSync(req.body.new_password, 10), req.user.id]);
+  await db.query('UPDATE users SET password=$1, password_changed_at=NOW() WHERE id=$2', [bcrypt.hashSync(req.body.new_password, 10), req.user.id]);
   res.json({ message: 'Mot de passe modifié' });
 }));
 

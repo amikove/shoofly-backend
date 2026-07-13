@@ -59,10 +59,13 @@ async function authenticate(req, res, next) {
   try {
     const payload = jwt.verify(header.slice(7), process.env.JWT_SECRET);
     const { rows: [user] } = await getDb().query(
-      'SELECT id, role, is_active, is_suspended, city, quartier, is_super_admin, permissions FROM users WHERE id=$1',
+      'SELECT id, role, is_active, is_suspended, city, quartier, is_super_admin, permissions, password_changed_at FROM users WHERE id=$1',
       [payload.id]
     );
     if (!user || !user.is_active) return res.status(401).json({ error: 'Compte introuvable ou suspendu' });
+    if (user.password_changed_at && payload.iat * 1000 < new Date(user.password_changed_at).getTime()) {
+      return res.status(401).json({ error: 'Session expirée suite à un changement de mot de passe, veuillez vous reconnecter.' });
+    }
     if (user.role === 'oeil' && user.is_suspended && !isSuspendedOeilAllowed(req)) {
       return res.status(403).json({ error: 'Votre compte est suspendu.' });
     }

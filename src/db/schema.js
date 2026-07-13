@@ -345,6 +345,7 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ;
 
 
     -- Signalements de problèmes en cours de mission — table dédiée, séparée des rapports de visite
