@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const { requirePermission } = require('../middleware/permissions');
 const asyncHandler = require('../middleware/asyncHandler');
 const { logStatus } = require('../utils/missionHistory');
 
@@ -394,12 +395,12 @@ router.post('/warn/:userId', authenticate, requireRole('admin'), asyncHandler(as
 }));
 
 // ── POST /anti-fraud/block/:userId ───────────────────────
-router.post('/block/:userId', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.post('/block/:userId', authenticate, requireRole('admin'), requirePermission('moderation'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
   const { reason } = req.body;
-  await db.query('UPDATE users SET is_active=false WHERE id=$1', [req.params.userId]);
+  await db.query(`UPDATE users SET is_active=false WHERE id=$1 AND role != 'admin'`, [req.params.userId]);
   await db.query(
     `INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Compte suspendu',$2,'info','none',$3,$4,$5)`,
     [req.params.userId, reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.', 'accountSuspendedTitle', reason ? null : 'accountSuspendedDefaultBody', null]
