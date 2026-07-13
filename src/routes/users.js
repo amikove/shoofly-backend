@@ -1095,11 +1095,15 @@ router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), asyncHa
 }));
 
 router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requirePermission('users'), asyncHandler(async (req, res) => {
-  const db = getDb();
-  const { rows: [u] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 AND role != 'admin' RETURNING is_active`, [req.params.id]);
-  if (!u) return res.status(404).json({ error: 'Introuvable' });
-  res.json({ is_active: u.is_active });
-}));
+    const db = getDb();
+    const { rows: [target] } = await db.query('SELECT role FROM users WHERE id=$1', [req.params.id]);
+    if (!target) return res.status(404).json({ error: 'Introuvable' });
+    if (target.role === 'admin' && !req.user.is_super_admin) {
+      return res.status(403).json({ error: 'Seul le Super Admin peut activer/désactiver un compte administrateur.' });
+    }
+    const { rows: [u] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 RETURNING is_active`, [req.params.id]);
+    res.json({ is_active: u.is_active });
+  }));
 
 // ── Admin : paramètres ─────────────────────────────────────
 router.get('/admin/settings', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
