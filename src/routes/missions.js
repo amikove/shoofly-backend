@@ -670,6 +670,14 @@ const { status, cancel_reason } = req.body;
     }
   }
 
+  if (status === 'cancelled' && req.user.role === 'admin' && req.body.refund_percent !== undefined) {
+    const hasFinancePermission = req.user.is_super_admin ||
+      (Array.isArray(req.user.permissions) && req.user.permissions.includes('finance'));
+    if (!hasFinancePermission) {
+      return res.status(403).json({ error: 'Permission insuffisante pour fixer un remboursement personnalise (finance requise)' });
+    }
+  }
+
   const { rows: [updated] } = await db.query(`
     UPDATE missions SET
       status=$1,
@@ -719,12 +727,8 @@ const { status, cancel_reason } = req.body;
     }
     let refund;
     // Un admin peut fixer un pourcentage de remboursement précis, en dérogation à la règle automatique
+    // (permission déjà vérifiée plus haut, avant l'UPDATE, pour ne jamais annuler sans pouvoir rembourser)
     if (req.user.role === 'admin' && req.body.refund_percent !== undefined) {
-        const hasFinancePermission = req.user.is_super_admin ||
-          (Array.isArray(req.user.permissions) && req.user.permissions.includes('finance'));
-        if (!hasFinancePermission) {
-          return res.status(403).json({ error: 'Permission insuffisante pour fixer un remboursement personnalise (finance requise)' });
-        }
       const pct = Math.max(0, Math.min(parseFloat(req.body.refund_percent) || 0, 100));
       refund = Math.round(mission.price * pct / 100 * 100) / 100;
       if (refund > 0) {
