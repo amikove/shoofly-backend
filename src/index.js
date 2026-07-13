@@ -2,7 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
@@ -31,16 +30,19 @@ const userRoutes    = require('./routes/users');
 const reportRoutes = require('./routes/reports');
 const ticketRoutes = require('./routes/tickets');
 
+// ── CORS — liste blanche unique, source de vérité partagée par Express et Socket.IO ──
+const productionOrigins = ['https://shoofly.netlify.app', 'https://shoofly-react.vercel.app'];
+const devOrigins = ['http://localhost:5173', 'http://127.0.0.1:5173'];
+const allowedOrigins = [...productionOrigins, ...devOrigins];
+
 const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server, {
-  
- cors: { 
-  origin: ['https://shoofly.netlify.app', 'https://shoofly-react.vercel.app'],
-  credentials: true,
-  methods: ['GET', 'POST']
-}
-
+  cors: {
+    origin: allowedOrigins,
+    credentials: true,
+    methods: ['GET', 'POST']
+  }
 });
 
 // ── Expose io to routes ───────────────────────────────────
@@ -53,11 +55,10 @@ app.use(helmet({
   crossOriginOpenerPolicy: false,
 }))
 app.use((req, res, next) => {
-  const allowedOrigins = ['https://shoofly.netlify.app', 'https://shoofly-react.vercel.app']
-const origin = req.headers.origin
-if (allowedOrigins.includes(origin)) {
-  res.header('Access-Control-Allow-Origin', origin)
-}
+  const origin = req.headers.origin
+  if (allowedOrigins.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin)
+  }
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
   res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization')
   res.header('Access-Control-Allow-Credentials', 'true')
