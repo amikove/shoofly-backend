@@ -296,6 +296,11 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
       ${wc}
     `, params);
 
+  missions.forEach(m => {
+    if (!(req.user.role === 'admin' || m.oeil_id === req.user.id)) {
+      m.client_phone = null;
+    }
+  });
   res.json({ missions, total, page: +page, pages: Math.ceil(total / limit) });
 }));
 
@@ -457,7 +462,12 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
     if (mission.is_new_oeil) mission.oeil_rating = null;
   }
 
-  res.json({ mission, media, messages, report: report||null, rating: rating||null });
+  if (!(req.user.role === 'admin' || mission.oeil_id === req.user.id)) {
+      mission.client_phone = null;
+      mission.client_email = null;
+    }
+
+    res.json({ mission, media, messages, report: report||null, rating: rating||null });
 }));
 
 // ── POST /missions/:id/accept ──────────────────────────────
