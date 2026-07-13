@@ -1161,7 +1161,7 @@ router.get('/admin/claims', authenticate, requireRole('admin'), requirePermissio
 }));
 
 // ── Admin : résoudre une réclamation ───────────────────────
-router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { decision } = req.body;
   if (!['oeil','client'].includes(decision)) return res.status(400).json({ error: 'Décision invalide' });
@@ -1218,7 +1218,7 @@ router.get('/admin/withdrawals', authenticate, requireRole('admin'), requirePerm
   res.json({ withdrawals: rows });
 }));
 
-router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   const { status } = req.body;
@@ -1419,7 +1419,7 @@ router.get('/oeil/earnings', authenticate, requireRole('oeil'), asyncHandler(asy
 }));
 
 // ── GET /users/admin/finance/oeils — admin liste les Œils avec solde pour paiement ──
-router.get('/admin/finance/oeils', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.get('/admin/finance/oeils', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT u.id, u.first_name, u.last_name, u.email, u.city,
@@ -1433,7 +1433,7 @@ router.get('/admin/finance/oeils', authenticate, requireRole('admin'), asyncHand
 }));
 
 // ── POST /users/admin/finance/:oeilId/wire-transfer — admin enregistre un virement ──
-router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { amount } = req.body;
 
