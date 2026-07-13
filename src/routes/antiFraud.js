@@ -452,7 +452,7 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
 }));
 
 // ── POST /anti-fraud/hold-withdrawal/:id ─────────────────
-router.post('/hold-withdrawal/:id', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.post('/hold-withdrawal/:id', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   await db.query(`UPDATE withdrawals SET status='pending', processed_by=NULL WHERE id=$1`, [req.params.id]);
   res.json({ message: 'Virement mis en attente de vérification' });
