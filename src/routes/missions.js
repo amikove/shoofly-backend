@@ -423,6 +423,42 @@ router.get('/my-reports', authenticate, asyncHandler(async (req, res) => {
   res.json({ reports: rows });
 }));
 
+// ── GET /missions/actions-required — 3 listes d'actions en attente pour le client ──
+// IMPORTANT : cette route doit rester déclarée AVANT /:id, sinon Express interprète "actions-required" comme un id de mission
+router.get('/actions-required', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const clientId = req.user.id;
+
+  const { rows: to_validate } = await db.query(`
+    SELECT id, title, completed_by_oeil_at,
+      completed_by_oeil_at + INTERVAL '12 hours' AS deadline
+    FROM missions
+    WHERE client_id=$1 AND status='completed' AND validated_at IS NULL
+    ORDER BY completed_by_oeil_at ASC
+  `, [clientId]);
+
+  const { rows: to_rate } = await db.query(`
+    SELECT m.id, m.title, m.validated_at,
+      o.first_name||' '||o.last_name AS oeil_name
+    FROM missions m
+    LEFT JOIN users o ON o.id = m.oeil_id
+    WHERE m.client_id=$1 AND m.validated_at IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM ratings r WHERE r.mission_id = m.id)
+    ORDER BY m.validated_at DESC
+  `, [clientId]);
+
+  const { rows: to_choose_replacement } = await db.query(`
+    SELECT id, title, candidate_window_ends_at
+    FROM missions
+    WHERE client_id=$1 AND replacement_preference='choose'
+      AND candidate_window_ends_at IS NOT NULL AND candidate_window_ends_at > NOW()
+      AND oeil_id IS NULL
+    ORDER BY candidate_window_ends_at ASC
+  `, [clientId]);
+
+  res.json({ to_validate, to_rate, to_choose_replacement });
+}));
+
 // ── GET /missions/:id ──────────────────────────────────
 router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
