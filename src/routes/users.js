@@ -1094,9 +1094,9 @@ router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), asyncHa
   res.json({ message: 'Œil vérifié' });
 }));
 
-router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requirePermission('users'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { rows: [u] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 RETURNING is_active`, [req.params.id]);
+  const { rows: [u] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 AND role != 'admin' RETURNING is_active`, [req.params.id]);
   if (!u) return res.status(404).json({ error: 'Introuvable' });
   res.json({ is_active: u.is_active });
 }));
