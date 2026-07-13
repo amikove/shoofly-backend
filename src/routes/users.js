@@ -390,7 +390,8 @@ router.get('/client/stats', authenticate, requireRole('client'), asyncHandler(as
       COUNT(*) FILTER (WHERE status='completed')::int AS completed,
       COUNT(*) FILTER (WHERE status='cancelled')::int AS cancelled,
       COALESCE(SUM(price) FILTER (WHERE status='completed' AND validated_at IS NOT NULL), 0)::numeric AS total_spent,
-      COALESCE(SUM(price) FILTER (WHERE status IN ('pending','assigned','en_route','active')), 0)::numeric AS budget_en_cours
+      COALESCE(SUM(price) FILTER (WHERE status IN ('pending','assigned','en_route','active')), 0)::numeric AS budget_en_cours,
+      COALESCE(SUM(duration_est + 45) FILTER (WHERE status='completed' AND validated_at IS NOT NULL AND duration_est IS NOT NULL), 0)::int AS time_saved_minutes
     FROM missions
     WHERE client_id = $1
   `, [userId]);
