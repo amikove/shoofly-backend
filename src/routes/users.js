@@ -618,7 +618,28 @@ router.get('/admin/dashboard/funnel', authenticate, requireRole('admin'), requir
     { key: 'revient',   label: 'Client revenu (2e mission)', value: revient.n },
   ];
 
-  res.json({ steps });
+  // Temps moyen avant la première candidature d'un Œil (missions créées sur la période, ayant reçu au moins 1 candidature)
+  const { rows: [premiereCandidature] } = await db.query(`
+    SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (fi.first_interest_at - m.created_at))/60),0)::numeric(8,1) AS avg_minutes
+    FROM missions m
+    JOIN (SELECT mission_id, MIN(created_at) AS first_interest_at FROM mission_interests GROUP BY mission_id) fi
+      ON fi.mission_id = m.id
+    WHERE m.created_at BETWEEN $1 AND $2
+  `, [date_from, date_to]);
+
+  // Temps moyen jusqu'à la sélection d'un Œil (missions créées sur la période, assignées)
+  const { rows: [selectionOeil] } = await db.query(`
+    SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at))/60),0)::numeric(8,1) AS avg_minutes
+    FROM missions
+    WHERE assigned_at IS NOT NULL AND created_at BETWEEN $1 AND $2
+  `, [date_from, date_to]);
+
+  const kpis = {
+    temps_moyen_premiere_candidature: parseFloat(premiereCandidature.avg_minutes),
+    temps_moyen_selection_oeil: parseFloat(selectionOeil.avg_minutes),
+  };
+
+  res.json({ steps, kpis });
 }));
 
 // ── GET /users/admin/dashboard/geo — stats par ville ──
