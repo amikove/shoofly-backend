@@ -8,6 +8,7 @@ const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
+const { isValidSubcategory } = require('../constants/missionCategories');
 
 
 async function getCommissionRate(db) {
@@ -338,6 +339,9 @@ router.post('/', authenticate, requireRole('client'), [
   if (quartier) {
     canonicalQuartier = resolveQuartier(canonicalCity, quartier);
     if (!canonicalQuartier) return res.status(400).json({ error: 'Quartier invalide pour cette ville' });
+  }
+  if (subcategory && !isValidSubcategory(type, subcategory)) {
+    return res.status(400).json({ error: 'Sous-catégorie invalide pour ce type de mission' });
   }
 
 const id = uuidv4();
