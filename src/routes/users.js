@@ -687,7 +687,59 @@ router.get('/admin/dashboard/geo', authenticate, requireRole('admin'), requirePe
     comparison = await computeGeoStats(compare_from, compare_to);
   }
 
-  res.json({ current, comparison });
+  // ── Taux de réutilisation clients, par ville/quartier du CLIENT (pas de la mission) ──
+  const { rows: reuseRows } = await db.query(`
+    WITH client_zone AS (
+      SELECT u.id, u.city, u.quartier, COUNT(m.id)::int AS mission_count
+      FROM users u
+      JOIN missions m ON m.client_id = u.id AND m.created_at BETWEEN $1 AND $2
+      WHERE u.role='client'
+      GROUP BY u.id, u.city, u.quartier
+    )
+    SELECT
+      city, quartier,
+      COUNT(*)::int AS total_clients,
+      COUNT(*) FILTER (WHERE mission_count >= 2)::int AS clients_multi
+    FROM client_zone
+    WHERE city IS NOT NULL
+    GROUP BY city, quartier
+  `, [date_from, date_to]);
+
+  // ── Candidatures moyennes par mission, par ville/quartier de la MISSION ──
+  const { rows: candidaturesRows } = await db.query(`
+    SELECT
+      m.city, m.quartier,
+      COUNT(*)::int AS total_missions,
+      COALESCE(AVG(COALESCE(mi.interest_count,0)),0)::numeric(5,2) AS avg_candidatures
+    FROM missions m
+    LEFT JOIN (
+      SELECT mission_id, COUNT(*)::int AS interest_count FROM mission_interests GROUP BY mission_id
+    ) mi ON mi.mission_id = m.id
+    WHERE m.created_at BETWEEN $1 AND $2 AND m.city IS NOT NULL
+    GROUP BY m.city, m.quartier
+  `, [date_from, date_to]);
+
+  // Fusion des deux ventilations (client / mission) en une seule liste par zone (ville+quartier),
+  // car les deux métriques ne partagent pas forcément le même dénominateur géographique.
+  const zoneKey = (city, quartier) => `${city}::${quartier || ''}`;
+  const zonesMap = new Map();
+  for (const r of reuseRows) {
+    zonesMap.set(zoneKey(r.city, r.quartier), {
+      city: r.city,
+      quartier: r.quartier,
+      taux_reutilisation_clients: r.total_clients > 0 ? Math.round((r.clients_multi / r.total_clients) * 1000) / 10 : 0,
+      candidatures_moyennes_par_mission: null,
+    });
+  }
+  for (const r of candidaturesRows) {
+    const key = zoneKey(r.city, r.quartier);
+    const existing = zonesMap.get(key) || { city: r.city, quartier: r.quartier, taux_reutilisation_clients: null };
+    existing.candidatures_moyennes_par_mission = parseFloat(r.avg_candidatures);
+    zonesMap.set(key, existing);
+  }
+  const zones = Array.from(zonesMap.values()).sort((a, b) => a.city.localeCompare(b.city) || (a.quartier || '').localeCompare(b.quartier || ''));
+
+  res.json({ current, comparison, zones });
 }));
 
 // ── GET /users/admin/dashboard/oeils — KPIs, classement, alertes Œils ──
