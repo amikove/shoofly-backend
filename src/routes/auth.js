@@ -6,6 +6,7 @@ const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
+const { resolveCity, resolveQuartier } = require('../constants/villes');
 
 const makeToken = (user) => jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
 const safe = ({ password, ...u }) => u;
@@ -27,6 +28,19 @@ router.post('/register', [
           acquisition_source, acquisition_medium, acquisition_campaign } = req.body;
     const { rows: existing } = await db.query('SELECT id FROM users WHERE email=$1', [email]);
     if (existing.length) return res.status(409).json({ error: 'Email déjà utilisé' });
+
+    let canonicalCity = null;
+    if (city) {
+      canonicalCity = resolveCity(city);
+      if (!canonicalCity) return res.status(400).json({ error: 'Ville invalide' });
+    }
+    let canonicalQuartier = null;
+    if (quartier) {
+      if (!canonicalCity) return res.status(400).json({ error: 'Quartier fourni sans ville valide' });
+      canonicalQuartier = resolveQuartier(canonicalCity, quartier);
+      if (!canonicalQuartier) return res.status(400).json({ error: 'Quartier invalide pour cette ville' });
+    }
+
     const id = uuidv4();
     const { rows: [user] } = await db.query(
     `INSERT INTO users (id,email,password,role,first_name,last_name,phone,city,quartier,
@@ -34,7 +48,7 @@ router.post('/register', [
       acquisition_source,acquisition_medium,acquisition_campaign)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`,
     [id, email, bcrypt.hashSync(password, 10), role, first_name, last_name,
-     phone||null, city||null, quartier||null, birth_date||null,
+     phone||null, canonicalCity, canonicalQuartier, birth_date||null,
      profil||null, usage_reason||null, usage_frequency||null, villes_cibles||null,
      situation||null, disponibilite||null, motivation||null,
      acquisition_source||null, acquisition_medium||null, acquisition_campaign||null]
@@ -116,6 +130,13 @@ router.get('/me', authenticate, asyncHandler(async (req, res) => {
 router.put('/me', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { first_name, last_name, phone, city, bio, coverage_zone, disponibilites } = req.body;
+
+  let canonicalCity = null;
+  if (city) {
+    canonicalCity = resolveCity(city);
+    if (!canonicalCity) return res.status(400).json({ error: 'Ville invalide' });
+  }
+
   const { rows: [user] } = await db.query(
     `UPDATE users SET
       first_name=COALESCE($1,first_name),
@@ -125,7 +146,7 @@ router.put('/me', authenticate, asyncHandler(async (req, res) => {
       disponibilites=COALESCE($5,disponibilites),
       updated_at=NOW()
      WHERE id=$6 RETURNING *`,
-    [first_name||null, last_name||null, phone||null, city||null,
+    [first_name||null, last_name||null, phone||null, canonicalCity,
      disponibilites ? JSON.stringify(disponibilites) : null,
      req.user.id]
   );

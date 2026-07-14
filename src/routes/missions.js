@@ -7,6 +7,7 @@ const { logReliabilityEvent, computeLatePenalty, isNewOeil } = require('../utils
 const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const asyncHandler = require('../middleware/asyncHandler');
+const { resolveCity, resolveQuartier } = require('../constants/villes');
 
 
 async function getCommissionRate(db) {
@@ -331,6 +332,14 @@ router.post('/', authenticate, requireRole('client'), [
     replacement_preference,
   } = req.body;
 
+  const canonicalCity = resolveCity(city);
+  if (!canonicalCity) return res.status(400).json({ error: 'Ville invalide' });
+  let canonicalQuartier = null;
+  if (quartier) {
+    canonicalQuartier = resolveQuartier(canonicalCity, quartier);
+    if (!canonicalQuartier) return res.status(400).json({ error: 'Quartier invalide pour cette ville' });
+  }
+
 const id = uuidv4();
   let { commission, oeil_earning } = await pricing(+original_price || +price, db);
 
@@ -351,7 +360,7 @@ const { rows: [mission] } = await db.query(`
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
   RETURNING *
 `, [
-  id, req.user.id, type, subcategory||null, status, title, description||null, address, city, quartier||null,
+  id, req.user.id, type, subcategory||null, status, title, description||null, address, canonicalCity, canonicalQuartier,
   new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
   !!is_urgent, property_type||null, visit_type||null, !!video_call,
   institution||null, purpose||null, company_name||null, audit_type||null,
@@ -393,8 +402,8 @@ await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
   );
   for (const o of oeils) {
     await notify(db, o.id, `Nouvelle mission${is_urgent?' 🚨 URGENTE':''}`,
-      `${title} — ${city} · ${price} MAD`, 'mission', id, emitToUser, null,
-      is_urgent ? 'newMissionUrgentTitle' : 'newMissionAvailableTitle', 'newMissionBody', {missionTitle: title, city, price});
+      `${title} — ${canonicalCity} · ${price} MAD`, 'mission', id, emitToUser, null,
+      is_urgent ? 'newMissionUrgentTitle' : 'newMissionAvailableTitle', 'newMissionBody', {missionTitle: title, city: canonicalCity, price});
   }
 
   // Broadcast to admin room
