@@ -1290,7 +1290,7 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
   }));
 
 // ── Admin : paramètres ─────────────────────────────────────
-router.get('/admin/settings', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.get('/admin/settings', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query('SELECT * FROM settings');
   const settings = {}
@@ -1298,7 +1298,7 @@ router.get('/admin/settings', authenticate, requireRole('admin'), asyncHandler(a
   res.json({ settings })
 }))
 
-router.put('/admin/settings', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.put('/admin/settings', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { commission, min_price, urgency_fee, accept_delay, five_star_bonus_active, five_star_bonus_percent } = req.body
   const updates = { commission, min_price, urgency_fee, accept_delay, five_star_bonus_active, five_star_bonus_percent }
