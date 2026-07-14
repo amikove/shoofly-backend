@@ -752,7 +752,7 @@ router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), require
   }
 
   async function computeKpis(from, to) {
-    const [totals, interests, avgAssignTime] = await Promise.all([
+    const [totals, interests, avgAssignTime, multiMissions] = await Promise.all([
       db.query(`
         SELECT
           COUNT(*)::int AS total,
@@ -773,10 +773,21 @@ router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), require
         FROM missions
         WHERE oeil_id IS NOT NULL AND assigned_at IS NOT NULL AND created_at BETWEEN $1 AND $2
       `, [from, to]),
+      db.query(`
+        SELECT
+          COUNT(*)::int AS total_verified,
+          COUNT(*) FILTER (WHERE p.total_missions >= 2)::int AS multi
+        FROM users u JOIN oeil_profiles p ON p.user_id = u.id
+        WHERE u.role='oeil' AND p.is_verified=true
+      `),
     ]);
 
     const acceptanceRate = interests.rows[0].total_interests > 0
       ? Math.round((interests.rows[0].hired / interests.rows[0].total_interests) * 1000) / 10
+      : 0;
+
+    const tauxOeilsMultiMissions = multiMissions.rows[0].total_verified > 0
+      ? Math.round((multiMissions.rows[0].multi / multiMissions.rows[0].total_verified) * 1000) / 10
       : 0;
 
     return {
@@ -785,6 +796,7 @@ router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), require
       inactifs: totals.rows[0].inactifs,
       acceptance_rate: acceptanceRate,
       avg_assignment_hours: parseFloat(avgAssignTime.rows[0].avg_hours),
+      taux_oeils_multi_missions: tauxOeilsMultiMissions,
     };
   }
 
