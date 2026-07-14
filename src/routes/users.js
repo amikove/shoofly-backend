@@ -1152,6 +1152,90 @@ router.get('/admin/dashboard/financier', authenticate, requireRole('admin'), req
   res.json({ current, comparison });
 }));
 
+// ── GET /users/admin/dashboard/experience-utilisateur — NPS (4 dimensions) + tickets de support ──
+router.get('/admin/dashboard/experience-utilisateur', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { date_from, date_to, compare_from, compare_to } = req.query;
+
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: 'date_from et date_to requis' });
+  }
+
+  async function computeNps(from, to) {
+    const { rows: [nps] } = await db.query(`
+      SELECT
+        COALESCE(AVG(nps_facilite),0)::numeric(3,2) AS avg_facilite,
+        COALESCE(AVG(nps_reactivite),0)::numeric(3,2) AS avg_reactivite,
+        COALESCE(AVG(nps_utilite),0)::numeric(3,2) AS avg_utilite,
+        COALESCE(AVG(nps_recommandation),0)::numeric(3,2) AS avg_recommandation,
+        COUNT(*) FILTER (
+          WHERE nps_facilite IS NOT NULL OR nps_reactivite IS NOT NULL
+             OR nps_utilite IS NOT NULL OR nps_recommandation IS NOT NULL
+        )::int AS nb_evaluations
+      FROM ratings
+      WHERE created_at BETWEEN $1 AND $2
+    `, [from, to]);
+    return {
+      avg_facilite: parseFloat(nps.avg_facilite),
+      avg_reactivite: parseFloat(nps.avg_reactivite),
+      avg_utilite: parseFloat(nps.avg_utilite),
+      avg_recommandation: parseFloat(nps.avg_recommandation),
+      nb_evaluations: nps.nb_evaluations,
+    };
+  }
+
+  async function computeTicketStats(from, to) {
+    const { rows: [resolution] } = await db.query(`
+      SELECT
+        COALESCE(AVG(EXTRACT(EPOCH FROM (resolved_at - created_at))/3600) FILTER (WHERE status='resolved'),0)::numeric(6,1) AS avg_resolution_hours,
+        COUNT(*) FILTER (WHERE status='resolved')::int AS total_resolved,
+        COUNT(*) FILTER (WHERE status='resolved' AND resolved_by IS NULL)::int AS auto_resolved
+      FROM support_tickets
+      WHERE created_at BETWEEN $1 AND $2
+    `, [from, to]);
+
+    const { rows: byCategory } = await db.query(`
+      SELECT category, COUNT(*)::int AS n
+      FROM support_tickets
+      WHERE created_at BETWEEN $1 AND $2
+      GROUP BY category
+      ORDER BY n DESC
+    `, [from, to]);
+
+    return {
+      temps_moyen_resolution: parseFloat(resolution.avg_resolution_hours),
+      taux_auto_resolution: resolution.total_resolved > 0
+        ? Math.round((resolution.auto_resolved / resolution.total_resolved) * 1000) / 10
+        : 0,
+      total_resolved: resolution.total_resolved,
+      par_categorie: byCategory,
+    };
+  }
+
+  const nps = await computeNps(date_from, date_to);
+  const npsComparison = (compare_from && compare_to) ? await computeNps(compare_from, compare_to) : null;
+
+  const tickets = await computeTicketStats(date_from, date_to);
+  const ticketsComparison = (compare_from && compare_to) ? await computeTicketStats(compare_from, compare_to) : null;
+
+  // Instantané, indépendant de la période : tickets encore ouverts/en cours actuellement
+  const { rows: [openSnapshot] } = await db.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE status='open')::int AS open,
+      COUNT(*) FILTER (WHERE status='in_progress')::int AS in_progress
+    FROM support_tickets
+  `);
+
+  res.json({
+    nps: { current: nps, comparison: npsComparison },
+    tickets: { current: tickets, comparison: ticketsComparison },
+    tickets_ouverts_actuellement: {
+      open: openSnapshot.open,
+      in_progress: openSnapshot.in_progress,
+    },
+  });
+}));
+
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
