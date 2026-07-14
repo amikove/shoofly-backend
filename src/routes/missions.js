@@ -595,9 +595,10 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
        JOIN users u ON u.id = mi.oeil_id
        LEFT JOIN oeil_profiles p ON p.user_id = mi.oeil_id
        WHERE mi.mission_id = $1
-       ORDER BY mi.created_at ASC`,
-      [req.params.id]
-    );
+          AND mi.oeil_id IS DISTINCT FROM $2
+        ORDER BY mi.created_at ASC`,
+        [req.params.id, mission.transferred_from]
+      );
 
     // Le client voit des tiers (Œils candidats) : masque la note d'un débutant
     // (< 10 missions) pour ne pas afficher un signal peu significatif.
