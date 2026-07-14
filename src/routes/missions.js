@@ -459,6 +459,20 @@ router.get('/actions-required', authenticate, requireRole('client'), asyncHandle
   res.json({ to_validate, to_rate, to_choose_replacement });
 }));
 
+// ── GET /missions/campaign/five-star-bonus ── Statut campagne bonus qualité ──
+router.get('/campaign/five-star-bonus', authenticate, asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(
+    `SELECT key, value FROM settings WHERE key IN ('five_star_bonus_active','five_star_bonus_percent')`
+  );
+  const s = {};
+  rows.forEach(r => s[r.key] = r.value);
+  res.json({
+    active: s.five_star_bonus_active === 'true',
+    percent: parseFloat(s.five_star_bonus_percent || '10'),
+  });
+}));
+
 // ── GET /missions/:id ──────────────────────────────────
 router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
@@ -1042,6 +1056,28 @@ await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${
   else if (score === 3) { points = 5; reason = `Mission complétée, note 3/5`; }
   else { points = 0; reason = `Mission complétée, note ${score}/5 — insatisfaisant`; }
   await logReliabilityEvent(db, mission.oeil_id, mission.id, points, reason, score <= 2);
+
+  // Bonus qualité "5 étoiles" — campagne marketing activable, indépendante du score de fiabilité ci-dessus.
+  if (score === 5) {
+    const { rows: bonusSettings } = await db.query(
+      `SELECT key, value FROM settings WHERE key IN ('five_star_bonus_active','five_star_bonus_percent')`
+    );
+    const bs = {};
+    bonusSettings.forEach(r => bs[r.key] = r.value);
+    if (bs.five_star_bonus_active === 'true') {
+      const percent = parseFloat(bs.five_star_bonus_percent || '10');
+      const bonus = Math.round(parseFloat(mission.oeil_earning) * (percent / 100) * 100) / 100;
+      if (bonus > 0) {
+        await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [bonus, mission.oeil_id]);
+        await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Bonus qualité — note 5 étoiles',$3)`, [mission.oeil_id, bonus, mission.id]);
+        await db.query(
+          `INSERT INTO expenses (amount, category, description, expense_date, created_by) VALUES ($1, $2, $3, $4, $5)`,
+          [bonus, 'Marketing', `[Généré automatiquement] Bonus qualité 5 étoiles — mission "${mission.title}"`, new Date().toISOString().slice(0, 10), null]
+        );
+        await notify(db, mission.oeil_id, `Bonus qualité 5 étoiles 🎁`, `+${bonus} MAD de bonus pour "${mission.title}" — merci pour votre excellent travail !`, 'bonus', mission.id, emitToUser, null, 'fiveStarBonusTitle', 'fiveStarBonusBody', { amount: bonus, missionTitle: mission.title });
+      }
+    }
+  }
 
   res.status(201).json({
     rating_avg: is_new_oeil ? null : avg.a,
