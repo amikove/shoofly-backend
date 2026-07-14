@@ -26,12 +26,16 @@ async function computeAvgResponseMinutesBulk(db, oeilIds) {
        JOIN missions m ON m.id = mm.mission_id
        WHERE mm.type = 'text' AND m.oeil_id = ANY($1::text[])
      ),
+     lagged AS (
+       SELECT *,
+         LAG(direction) OVER (PARTITION BY target_oeil, mission_id ORDER BY created_at) AS prev_direction
+       FROM msgs
+     ),
      runs AS (
        SELECT *,
-         SUM(CASE WHEN direction = LAG(direction) OVER (PARTITION BY target_oeil, mission_id ORDER BY created_at)
-                  THEN 0 ELSE 1 END)
+         SUM(CASE WHEN direction = prev_direction THEN 0 ELSE 1 END)
            OVER (PARTITION BY target_oeil, mission_id ORDER BY created_at) AS run_id
-       FROM msgs
+       FROM lagged
      ),
      run_bounds AS (
        SELECT target_oeil, mission_id, run_id, direction, MIN(created_at) AS run_start
