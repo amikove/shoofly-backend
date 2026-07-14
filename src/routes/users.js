@@ -540,7 +540,9 @@ router.get('/admin/dashboard/services', authenticate, requireRole('admin'), requ
         COALESCE(SUM(m.commission) FILTER (WHERE m.status='completed'),0)::numeric AS commission,
         (SELECT COALESCE(AVG(r.score),0)::numeric(3,1) FROM ratings r
           JOIN missions mm ON mm.id=r.mission_id
-          WHERE mm.type=m.type AND mm.created_at BETWEEN $1 AND $2) AS avg_rating
+          WHERE mm.type=m.type AND mm.created_at BETWEEN $1 AND $2) AS avg_rating,
+        COALESCE(AVG(EXTRACT(EPOCH FROM (m.validated_at - m.completed_by_oeil_at))/3600)
+          FILTER (WHERE m.status='completed' AND m.validated_at IS NOT NULL AND m.completed_by_oeil_at IS NOT NULL),0)::numeric(6,1) AS delai_moyen_validation
       FROM missions m
       WHERE m.created_at BETWEEN $1 AND $2
       GROUP BY m.type
