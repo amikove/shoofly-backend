@@ -1300,8 +1300,8 @@ router.get('/admin/settings', authenticate, requireRole('admin'), asyncHandler(a
 
 router.put('/admin/settings', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { commission, min_price, urgency_fee, accept_delay } = req.body
-  const updates = { commission, min_price, urgency_fee, accept_delay }
+  const { commission, min_price, urgency_fee, accept_delay, five_star_bonus_active, five_star_bonus_percent } = req.body
+  const updates = { commission, min_price, urgency_fee, accept_delay, five_star_bonus_active, five_star_bonus_percent }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
       await db.query(
