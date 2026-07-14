@@ -509,9 +509,21 @@ router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requi
         COUNT(*) FILTER (WHERE status='cancelled')::int AS cancelled
       FROM missions WHERE created_at BETWEEN $1 AND $2
     `, [from, to]);
+    const { rows: [abandonStats] } = await db.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE transfer_type='before')::int AS abandon_avant,
+        COUNT(*) FILTER (WHERE started_at IS NOT NULL)::int AS actives,
+        COUNT(*) FILTER (WHERE transfer_type='during')::int AS abandon_pendant
+      FROM missions WHERE created_at BETWEEN $1 AND $2
+    `, [from, to]);
     return {
       transfer_failures: transferFails.n,
       cancellation_rate: cancelRate.total > 0 ? Math.round((cancelRate.cancelled / cancelRate.total) * 1000) / 10 : 0,
+      // Abandon "avant" : mission transférée avant tout début de travail (rapporté au total des missions créées).
+      taux_abandon_avant: abandonStats.total > 0 ? Math.round((abandonStats.abandon_avant / abandonStats.total) * 1000) / 10 : 0,
+      // Abandon "pendant" : mission transférée en cours de travail (rapporté aux missions ayant atteint le statut 'active').
+      taux_abandon_pendant: abandonStats.actives > 0 ? Math.round((abandonStats.abandon_pendant / abandonStats.actives) * 1000) / 10 : 0,
     };
   }
 
