@@ -6,6 +6,7 @@ const { requirePermission } = require('../middleware/permissions');
 const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const { isNewOeil } = require('../utils/reliabilityScore');
+const { computeAvgResponseMinutes } = require('../utils/responseTime');
 const asyncHandler = require('../middleware/asyncHandler');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
@@ -134,6 +135,10 @@ router.get('/oeils/:id', authenticate, asyncHandler(async (req, res) => {
     oeil.rating_avg = null;
     oeil.rating_count = null;
   }
+
+  // Temps de réponse moyen : métrique indépendante du statut "débutant" —
+  // masquée uniquement si l'Œil n'a pas encore assez de tours de conversation.
+  oeil.avg_response_minutes = await computeAvgResponseMinutes(db, oeil.id);
 
   res.json({ oeil, reviews });
 }));

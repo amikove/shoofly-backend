@@ -4,6 +4,7 @@ const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { logReliabilityEvent, computeLatePenalty, isNewOeil } = require('../utils/reliabilityScore');
+const { computeAvgResponseMinutesBulk } = require('../utils/responseTime');
 const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -630,12 +631,16 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
     // Le client voit des tiers (Œils candidats) : masque la note d'un débutant
     // (< 10 missions) pour ne pas afficher un signal peu significatif.
     // L'admin, qui peut aussi consulter cette liste, garde la vraie valeur.
+    // Le temps de réponse moyen est calculé en une seule requête groupée pour
+    // tous les candidats (voir computeAvgResponseMinutesBulk) plutôt qu'en boucle.
+    const avgResponseByOeil = await computeAvgResponseMinutesBulk(db, rows.map(o => o.id));
     const interests = rows.map(o => {
       const is_new_oeil = isNewOeil(o.total_missions);
+      const avg_response_minutes = avgResponseByOeil[o.id] ?? null;
       if (req.user.role === 'client' && is_new_oeil) {
-        return { ...o, is_new_oeil, rating_avg: null, rating_count: null };
+        return { ...o, is_new_oeil, rating_avg: null, rating_count: null, avg_response_minutes };
       }
-      return { ...o, is_new_oeil };
+      return { ...o, is_new_oeil, avg_response_minutes };
     });
 
     res.json({ interests });
