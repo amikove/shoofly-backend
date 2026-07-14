@@ -496,6 +496,44 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- Nécessaire pour réutiliser le pattern "marquer comme lu" de mission_messages
     -- (voir GET /tickets/:id) — absent du schéma minimal initial de l'étape 1.
     ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN NOT NULL DEFAULT FALSE;
+
+    -- Champs à choix fermé (<select>) du formulaire d'inscription — jamais validés côté
+    -- serveur jusqu'ici (même trou que city/quartier, corrigé séparément). NOT VALID : on
+    -- protège tous les nouveaux inserts/updates immédiatement sans forcer un scan bloquant
+    -- des lignes existantes au démarrage (une valeur historique hors liste ne doit pas
+    -- empêcher l'appli de démarrer) ; VALIDATE CONSTRAINT pourra être lancé plus tard à part.
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_profil_check;
+    ALTER TABLE users ADD CONSTRAINT users_profil_check CHECK (profil IN (
+      'Particulier','Entrepreneur / Chef d''entreprise','Professionnel / Salarié',
+      'Expatrié / Non-résident (MRE)','Étudiant','Investisseur immobilier',
+      'Profession libérale (avocat, médecin, architecte...)','Autre'
+    )) NOT VALID;
+
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_situation_check;
+    ALTER TABLE users ADD CONSTRAINT users_situation_check CHECK (situation IN (
+      'Étudiant','Salarié','Freelance','Auto-entrepreneur','En recherche d''emploi','Retraité','Autre'
+    )) NOT VALID;
+
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_motivation_check;
+    ALTER TABLE users ADD CONSTRAINT users_motivation_check CHECK (motivation IN (
+      'Revenu complémentaire','Revenu principal','Expérience professionnelle','Flexibilité','Autre'
+    )) NOT VALID;
+
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_usage_reason_check;
+    ALTER TABLE users ADD CONSTRAINT users_usage_reason_check CHECK (usage_reason IN (
+      'Gagner du temps','Éviter un déplacement','Vérifier avant un achat',
+      'Gérer une démarche administrative','Superviser une activité à distance','Autre'
+    )) NOT VALID;
+
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_usage_frequency_check;
+    ALTER TABLE users ADD CONSTRAINT users_usage_frequency_check CHECK (usage_frequency IN (
+      'Une seule fois','Quelques fois par an','Une fois par mois','Plusieurs fois par mois','Chaque semaine'
+    )) NOT VALID;
+
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_disponibilite_check;
+    ALTER TABLE users ADD CONSTRAINT users_disponibilite_check CHECK (disponibilite IN (
+      'En semaine','Soirs','Week-ends','Temps plein'
+    )) NOT VALID;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

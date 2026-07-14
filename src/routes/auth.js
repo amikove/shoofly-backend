@@ -7,6 +7,10 @@ const { getDb } = require('../db/schema');
 const { authenticate } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
+const {
+  PROFIL_OPTIONS, SITUATION_OPTIONS, MOTIVATION_OPTIONS,
+  USAGE_REASON_OPTIONS, USAGE_FREQUENCY_OPTIONS, DISPONIBILITE_OPTIONS,
+} = require('../constants/registrationOptions');
 
 const makeToken = (user) => jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
 const safe = ({ password, ...u }) => u;
@@ -17,6 +21,15 @@ router.post('/register', [
   body('first_name').trim().notEmpty(),
   body('last_name').trim().notEmpty(),
   body('role').isIn(['client','oeil']),
+  // checkFalsy : le formulaire envoie systématiquement les champs des DEUX rôles (client
+  // et oeil), ceux non pertinents pour le rôle choisi arrivant en chaîne vide '' plutôt
+  // qu'absents — checkFalsy traite '' comme "non fourni" au lieu de le rejeter.
+  body('profil').optional({ checkFalsy: true }).isIn(PROFIL_OPTIONS),
+  body('situation').optional({ checkFalsy: true }).isIn(SITUATION_OPTIONS),
+  body('motivation').optional({ checkFalsy: true }).isIn(MOTIVATION_OPTIONS),
+  body('usage_reason').optional({ checkFalsy: true }).isIn(USAGE_REASON_OPTIONS),
+  body('usage_frequency').optional({ checkFalsy: true }).isIn(USAGE_FREQUENCY_OPTIONS),
+  body('disponibilite').optional({ checkFalsy: true }).isIn(DISPONIBILITE_OPTIONS),
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
