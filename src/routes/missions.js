@@ -400,10 +400,12 @@ await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
     }
   }
 
-  // Notify verified available oeils
+  // Notify verified available oeils, restreint aux Œils de la même ville que la mission
   const { rows: oeils } = await db.query(
     `SELECT u.id FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-     WHERE u.role='oeil' AND u.is_active=true AND p.is_verified=true AND p.is_available=true`
+     WHERE u.role='oeil' AND u.is_active=true AND p.is_verified=true AND p.is_available=true
+       AND u.city=$1`,
+    [canonicalCity]
   );
   for (const o of oeils) {
     await notify(db, o.id, `Nouvelle mission${is_urgent?' 🚨 URGENTE':''}`,
