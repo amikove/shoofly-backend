@@ -47,7 +47,7 @@ async function sendWhatsAppTemplate(templateName, phone, variables) {
     const data = await response.json().catch(() => null);
 
     if (!response.ok) {
-      console.error(`[wasel] Échec envoi template "${templateName}" — HTTP ${response.status}`, data);
+      console.error(`[wasel] Échec envoi template "${templateName}" — HTTP ${response.status}`, JSON.stringify(data, null, 2));
       return false;
     }
 
