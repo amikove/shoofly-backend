@@ -7,6 +7,7 @@ const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
+const { getDebugResults: getWaselDebugResults } = require('../services/wasel');
 const asyncHandler = require('../middleware/asyncHandler');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
@@ -228,6 +229,11 @@ router.post('/oeil/withdraw', authenticate, requireRole('oeil'), asyncHandler(as
 }));
 
 // ══ ADMIN ══════════════════════════════════════════════════
+// TEMP — audit technique Wasel en cours, à retirer une fois la vérification terminée.
+router.get('/admin/_wasel-debug', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  res.json({ results: getWaselDebugResults() });
+}));
+
 router.get('/admin/all', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { role, is_active } = req.query;
