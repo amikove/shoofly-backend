@@ -7,6 +7,7 @@ const { logReliabilityEvent, computeLatePenalty, isNewOeil } = require('../utils
 const { computeAvgResponseMinutesBulk } = require('../utils/responseTime');
 const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
+const { sendWhatsAppTemplate } = require('../services/wasel');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const { isValidSubcategory } = require('../constants/missionCategories');
@@ -862,6 +863,17 @@ const { status, cancel_reason } = req.body;
     );
     await notify(db, mission.client_id, 'Mission terminée ✅', `"${mission.title}" est terminée. Vous avez 12h pour réclamer si nécessaire.`, 'mission', mission.id, emitToUser, null, 'missionCompletedClientTitle', 'missionCompletedClientBody', {missionTitle: mission.title});
     await notify(db, mission.oeil_id, 'Mission terminée', `"${mission.title}" marquée comme terminée. Paiement en attente de validation.`, 'mission', mission.id, emitToUser, null, 'missionCompletedOeilTitle', 'missionCompletedOeilBody', {missionTitle: mission.title});
+
+    // Test technique API Wasel (WhatsApp) — envoie sur le numéro personnel du client.
+    // Variables {{1}}, {{2}} : nom de l'Œil et titre de la mission (contexte le plus pertinent pour le client à ce stade).
+    const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+    if (clientContact?.phone) {
+      const { rows: [oeilContact] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [mission.oeil_id]);
+      const oeilName = oeilContact ? `${oeilContact.first_name} ${oeilContact.last_name}`.trim() : 'Œil';
+      await sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, [oeilName, mission.title]);
+    } else {
+      console.warn(`[wasel] Client ${mission.client_id} sans téléphone renseigné — envoi ignoré (completed)`);
+    }
   }
   
 
@@ -1495,6 +1507,17 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
 
   // Notifier l'Œil embauché
   await notify(db, oeilId, oeilNotifTitle, oeilNotifBody, 'hired', mission.id, emitToUser, null, oeilNotifTitleKey, oeilNotifBodyKey, oeilNotifParams);
+
+  // Test technique API Wasel (WhatsApp) — envoie sur le numéro personnel de l'Œil embauché.
+  // Variable {{1}} : nom du client qui l'a choisi (info la plus pertinente pour l'Œil à ce stade).
+  const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [oeilId]);
+  if (oeilContact?.phone) {
+    const { rows: [clientContact] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [mission.client_id]);
+    const clientName = clientContact ? `${clientContact.first_name} ${clientContact.last_name}`.trim() : 'Client';
+    await sendWhatsAppTemplate('nouvelle_verification_identite', oeilContact.phone, [clientName]);
+  } else {
+    console.warn(`[wasel] Œil ${oeilId} sans téléphone renseigné — envoi ignoré (hire)`);
+  }
 
   // Notifier les Œils non retenus
   const { rows: others } = await db.query(
