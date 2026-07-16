@@ -1155,10 +1155,15 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
   );
 
   const emitToUser = req.app.get('emitToUser');
-  const notifBody = `Un Œil est intéressé par votre mission : ${mission.title}`
-  await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser, 'interests_modal', 'newOeilInterestTitle', 'newOeilInterestBody', {missionTitle: mission.title});
-
-  res.status(201).json({ ok: true });
+    const notifBody = `Un Œil est intéressé par votre mission : ${mission.title}`
+    await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser, 'interests_modal', 'newOeilInterestTitle', 'newOeilInterestBody', {missionTitle: mission.title});
+    // Notifie aussi le client par WhatsApp — gratuit s'il a lui-même initié la conversation
+    // (bouton wa.me proposé à la création de sa mission).
+    const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+    if (clientContact?.phone) {
+      sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, ['Un Œil', mission.title]);
+    }
+    res.status(201).json({ ok: true });
 }));
 
 
