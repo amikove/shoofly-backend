@@ -8,6 +8,7 @@ const { computeAvgResponseMinutesBulk } = require('../utils/responseTime');
 const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const { sendWhatsAppTemplate } = require('../services/wasel');
+const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const { isValidSubcategory } = require('../constants/missionCategories');
@@ -557,7 +558,7 @@ router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req,
     // (edit_request_pending) est préparé dans src/config/waselTemplates.js pour un remplacement futur.
     const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.oeil_id]);
     if (oeilContact?.phone) {
-      await sendWhatsAppTemplate('ticket_urgent_ouvert', oeilContact.phone, [mission.title, 'Modification proposée par le client']);
+      await sendWhatsAppTemplate(waselTemplates.edit_proposed_to_oeil.template_name, oeilContact.phone, [mission.title, 'Modification proposée par le client']);
     } else {
       console.warn(`[wasel] Œil ${mission.oeil_id} sans téléphone renseigné — envoi ignoré (edit-request)`);
     }
@@ -604,7 +605,7 @@ router.post('/edit-requests/:id/approve', authenticate, requireRole('oeil'), asy
 
   const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
   if (clientContact?.phone) {
-    await sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, [mission.title, 'Modification acceptée par l\'Œil']);
+    await sendWhatsAppTemplate(waselTemplates.edit_request_approved.template_name, clientContact.phone, [mission.title, 'Modification acceptée par l\'Œil']);
   }
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: updated.status });
@@ -652,7 +653,7 @@ router.post('/edit-requests/:id/reject', authenticate, requireRole('oeil'), asyn
 
   const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
   if (clientContact?.phone) {
-    await sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, [mission.title, 'Mission remise en recherche']);
+    await sendWhatsAppTemplate(waselTemplates.edit_request_rejected.template_name, clientContact.phone, [mission.title, 'Mission remise en recherche']);
   }
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
@@ -1112,7 +1113,7 @@ const { status, cancel_reason } = req.body;
     if (clientContact?.phone) {
       const { rows: [oeilContact] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [mission.oeil_id]);
       const oeilName = oeilContact ? `${oeilContact.first_name} ${oeilContact.last_name}`.trim() : 'Œil';
-      await sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, [oeilName, mission.title]);
+      await sendWhatsAppTemplate(waselTemplates.mission_completed_client.template_name, clientContact.phone, [oeilName, mission.title]);
     } else {
       console.warn(`[wasel] Client ${mission.client_id} sans téléphone renseigné — envoi ignoré (completed)`);
     }
@@ -1403,7 +1404,7 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
     // (bouton wa.me proposé à la création de sa mission).
     const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
     if (clientContact?.phone) {
-      sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, ['Un Œil', mission.title]);
+      sendWhatsAppTemplate(waselTemplates.oeil_applied.template_name, clientContact.phone, ['Un Œil', mission.title]);
     }
     res.status(201).json({ ok: true });
 }));
@@ -1761,7 +1762,7 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   if (oeilContact?.phone) {
     const { rows: [clientContact] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [mission.client_id]);
     const clientName = clientContact ? `${clientContact.first_name} ${clientContact.last_name}`.trim() : 'Client';
-    await sendWhatsAppTemplate('nouvelle_verification_identite', oeilContact.phone, [clientName]);
+    await sendWhatsAppTemplate(waselTemplates.oeil_hired.template_name, oeilContact.phone, [clientName]);
   } else {
     console.warn(`[wasel] Œil ${oeilId} sans téléphone renseigné — envoi ignoré (hire)`);
   }
@@ -2024,7 +2025,7 @@ async function checkMissionEditRequestExpiry(db, emitToUser) {
 
     const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
     if (clientContact?.phone) {
-      await sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, [mission.title, 'Mission remise en recherche']);
+      await sendWhatsAppTemplate(waselTemplates.edit_request_expired.template_name, clientContact.phone, [mission.title, 'Mission remise en recherche']);
     }
   }
 }
