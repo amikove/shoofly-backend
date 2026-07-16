@@ -534,6 +534,22 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE users ADD CONSTRAINT users_disponibilite_check CHECK (disponibilite IN (
       'En semaine','Soirs','Week-ends','Temps plein'
     )) NOT VALID;
+
+    -- Demandes de modification de mission après création, quand la mission est déjà assignée
+    -- (approbation requise de l'Œil concerné avant application des changements proposés).
+    -- Statut 'pending' : mission encore modifiable directement, pas de ligne créée ici.
+    CREATE TABLE IF NOT EXISTS mission_edit_requests (
+      id                SERIAL PRIMARY KEY,
+      mission_id        TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      requested_by      TEXT NOT NULL REFERENCES users(id),
+      proposed_changes  JSONB NOT NULL,
+      status            TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','expired')),
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at        TIMESTAMPTZ NOT NULL,
+      resolved_at       TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_mission_edit_requests_mission ON mission_edit_requests(mission_id);
+    CREATE INDEX IF NOT EXISTS idx_mission_edit_requests_status ON mission_edit_requests(status, expires_at);
   `);
   console.log('✅ PostgreSQL schema ready');
 }

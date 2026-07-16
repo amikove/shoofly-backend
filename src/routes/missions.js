@@ -420,8 +420,242 @@ await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
   res.status(201).json({ mission });
 }));
 
+// ── PUT /missions/:id ── Client modifie sa mission après création ──────────
+// Champs modifiables : title, description, address, city, quartier, scheduled_at,
+// duration_est, replacement_preference — jamais price/type/subcategory (rejetés en 400
+// s'ils sont présents dans le payload, même à valeur identique).
+const FORBIDDEN_EDIT_FIELDS = ['price', 'type', 'subcategory'];
 
+// Valide et normalise les champs envoyés pour une modification de mission — réutilise
+// resolveCity/resolveQuartier (mêmes règles qu'à la création, voir POST /missions).
+// `mission` sert de repli pour résoudre le quartier quand seul le quartier change
+// (proposed_changes ne contient que les champs réellement modifiés, pas un patch complet).
+function validateMissionEditFields(body, mission) {
+  const changes = {};
 
+  if ('title' in body) {
+    const title = String(body.title || '').trim();
+    if (title.length < 6 || title.length > 200) return { error: 'Titre invalide (6 à 200 caractères)' };
+    changes.title = title;
+  }
+  if ('description' in body) {
+    changes.description = body.description ? String(body.description) : null;
+  }
+  if ('address' in body) {
+    const address = String(body.address || '').trim();
+    if (!address) return { error: 'Adresse requise' };
+    changes.address = address;
+  }
+  if ('city' in body) {
+    const canonicalCity = resolveCity(body.city);
+    if (!canonicalCity) return { error: 'Ville invalide' };
+    changes.city = canonicalCity;
+  }
+  if ('quartier' in body) {
+    if (body.quartier) {
+      const cityForQuartier = changes.city || mission.city;
+      const canonicalQuartier = resolveQuartier(cityForQuartier, body.quartier);
+      if (!canonicalQuartier) return { error: 'Quartier invalide pour cette ville' };
+      changes.quartier = canonicalQuartier;
+    } else {
+      changes.quartier = null;
+    }
+  }
+  if ('scheduled_at' in body) {
+    const date = new Date(body.scheduled_at);
+    if (isNaN(date.getTime())) return { error: 'Date/heure invalide' };
+    changes.scheduled_at = date;
+  }
+  if ('duration_est' in body) {
+    const duration = body.duration_est === null || body.duration_est === '' ? null : parseInt(body.duration_est, 10);
+    if (duration !== null && (isNaN(duration) || duration < 0)) return { error: 'Durée estimée invalide' };
+    changes.duration_est = duration;
+  }
+  if ('replacement_preference' in body) {
+    if (!['fast', 'choose'].includes(body.replacement_preference)) return { error: 'Préférence de remplacement invalide' };
+    changes.replacement_preference = body.replacement_preference;
+  }
+
+  return { changes };
+}
+
+// Applique un objet de changements validés sur la mission — réutilisé par l'application
+// directe (mission pending) et par l'approbation d'une demande de modification (mission assigned).
+async function applyMissionEditChanges(db, missionId, changes) {
+  const keys = Object.keys(changes);
+  const setClauses = keys.map((k, i) => `${k}=$${i + 1}`);
+  const values = keys.map(k => changes[k]);
+  const { rows: [updated] } = await db.query(
+    `UPDATE missions SET ${setClauses.join(', ')}, updated_at=NOW() WHERE id=$${values.length + 1} RETURNING *`,
+    [...values, missionId]
+  );
+  return updated;
+}
+
+router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+
+  const forbidden = FORBIDDEN_EDIT_FIELDS.filter(f => f in req.body);
+  if (forbidden.length > 0) {
+    return res.status(400).json({ error: `Champs non modifiables après création : ${forbidden.join(', ')}` });
+  }
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+
+  const { error, changes } = validateMissionEditFields(req.body, mission);
+  if (error) return res.status(400).json({ error });
+  if (Object.keys(changes).length === 0) return res.status(400).json({ error: 'Aucun champ à modifier' });
+
+  if (mission.status === 'pending') {
+    const { rows: [updated] } = await db.query(
+      `UPDATE missions SET ${Object.keys(changes).map((k, i) => `${k}=$${i + 1}`).join(', ')}, updated_at=NOW()
+       WHERE id=$${Object.keys(changes).length + 1} AND status='pending' RETURNING *`,
+      [...Object.values(changes), mission.id]
+    );
+    if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+    return res.json({ mission: updated, applied: true });
+  }
+
+  if (mission.status === 'assigned') {
+    const { rows: [pendingRequest] } = await db.query(
+      `SELECT id FROM mission_edit_requests WHERE mission_id=$1 AND status='pending'`,
+      [mission.id]
+    );
+    if (pendingRequest) {
+      return res.status(409).json({ error: "Une demande de modification est déjà en attente de réponse de l'Œil. Merci d'attendre sa résolution avant d'en soumettre une nouvelle." });
+    }
+
+    // Délai réduit à 30 min si la mission est prévue dans moins de 4h, 2h sinon.
+    const hoursUntilMission = (new Date(mission.scheduled_at).getTime() - Date.now()) / 3600000;
+    const delayMinutes = hoursUntilMission < 4 ? 30 : 120;
+    const expiresAt = new Date(Date.now() + delayMinutes * 60 * 1000);
+
+    const { rows: [editRequest] } = await db.query(
+      `INSERT INTO mission_edit_requests (mission_id, requested_by, proposed_changes, status, expires_at)
+       VALUES ($1,$2,$3,'pending',$4) RETURNING *`,
+      [mission.id, req.user.id, JSON.stringify(changes), expiresAt]
+    );
+
+    const delayLabel = delayMinutes >= 60 ? `${delayMinutes / 60}h` : `${delayMinutes}min`;
+
+    await notify(db, mission.oeil_id,
+      '✏️ Modification proposée',
+      `Le client propose une modification sur "${mission.title}". Vous avez ${delayLabel} pour répondre.`,
+      'mission', mission.id, emitToUser, 'mission_view', 'editRequestPendingOeilTitle', 'editRequestPendingOeilBody',
+      { missionTitle: mission.title, delayLabel }
+    );
+
+    // Test technique API Wasel (WhatsApp) — réutilise le template de test déjà validé ailleurs
+    // sur ce projet (seule la réception compte ici, pas le contenu exact). Un vrai template dédié
+    // (edit_request_pending) est préparé dans src/config/waselTemplates.js pour un remplacement futur.
+    const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.oeil_id]);
+    if (oeilContact?.phone) {
+      await sendWhatsAppTemplate('ticket_urgent_ouvert', oeilContact.phone, [mission.title, 'Modification proposée par le client']);
+    } else {
+      console.warn(`[wasel] Œil ${mission.oeil_id} sans téléphone renseigné — envoi ignoré (edit-request)`);
+    }
+
+    return res.status(202).json({
+      edit_request: editRequest,
+      message: `Votre demande de modification a été envoyée à l'Œil, en attente de réponse (délai : ${delayLabel}).`,
+    });
+  }
+
+  return res.status(400).json({ error: `Modification impossible pour une mission au statut "${mission.status}"` });
+}));
+
+// ── POST /missions/edit-requests/:id/approve ── Œil accepte la modification proposée ──
+router.post('/edit-requests/:id/approve', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+
+  const { rows: [editRequest] } = await db.query('SELECT * FROM mission_edit_requests WHERE id=$1', [req.params.id]);
+  if (!editRequest) return res.status(404).json({ error: 'Demande de modification introuvable' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [editRequest.mission_id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+
+  if (editRequest.status !== 'pending') return res.status(400).json({ error: 'Cette demande a déjà été traitée' });
+  if (new Date(editRequest.expires_at) < new Date()) return res.status(400).json({ error: 'Le délai de réponse à cette demande est expiré' });
+
+  const { rowCount } = await db.query(
+    `UPDATE mission_edit_requests SET status='approved', resolved_at=NOW() WHERE id=$1 AND status='pending'`,
+    [editRequest.id]
+  );
+  if (rowCount === 0) return res.status(409).json({ error: 'Cette demande a changé de statut entre-temps, veuillez rafraîchir.' });
+
+  const updated = await applyMissionEditChanges(db, mission.id, editRequest.proposed_changes);
+
+  await notify(db, mission.client_id,
+    '✅ Modification acceptée',
+    `L'Œil a accepté votre demande de modification sur "${mission.title}".`,
+    'mission', mission.id, emitToUser, 'mission_view', 'editRequestApprovedClientTitle', 'editRequestApprovedClientBody',
+    { missionTitle: mission.title }
+  );
+
+  const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+  if (clientContact?.phone) {
+    await sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, [mission.title, 'Modification acceptée par l\'Œil']);
+  }
+
+  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: updated.status });
+  io.to('room:admin').emit('mission_updated', updated);
+
+  res.json({ mission: updated, edit_request: { ...editRequest, status: 'approved' } });
+}));
+
+// ── POST /missions/edit-requests/:id/reject ── Œil refuse la modification proposée ──
+// Remise en recherche SANS pénalité : ni logReliabilityEvent, ni remboursement — ce n'est
+// ni une annulation ni un abandon, juste un désaccord sur les nouvelles conditions proposées.
+router.post('/edit-requests/:id/reject', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+
+  const { rows: [editRequest] } = await db.query('SELECT * FROM mission_edit_requests WHERE id=$1', [req.params.id]);
+  if (!editRequest) return res.status(404).json({ error: 'Demande de modification introuvable' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [editRequest.mission_id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+
+  if (editRequest.status !== 'pending') return res.status(400).json({ error: 'Cette demande a déjà été traitée' });
+
+  const { rowCount } = await db.query(
+    `UPDATE mission_edit_requests SET status='rejected', resolved_at=NOW() WHERE id=$1 AND status='pending'`,
+    [editRequest.id]
+  );
+  if (rowCount === 0) return res.status(409).json({ error: 'Cette demande a changé de statut entre-temps, veuillez rafraîchir.' });
+
+  const { rows: [updatedMission] } = await db.query(
+    `UPDATE missions SET status='pending', oeil_id=NULL, is_priority=true, transfer_deadline=NULL, updated_at=NOW()
+     WHERE id=$1 AND status='assigned' RETURNING *`,
+    [mission.id]
+  );
+  if (!updatedMission) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+
+  await notify(db, mission.client_id,
+    'Mission remise en recherche',
+    `L'Œil n'a pas pu donner suite à votre demande de modification sur "${mission.title}". Nous recherchons un nouvel Œil, sans frais ni pénalité pour vous.`,
+    'mission', mission.id, emitToUser, 'mission_view', 'editRequestRejectedClientTitle', 'editRequestRejectedClientBody',
+    { missionTitle: mission.title }
+  );
+
+  const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+  if (clientContact?.phone) {
+    await sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, [mission.title, 'Mission remise en recherche']);
+  }
+
+  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
+  io.to('room:admin').emit('mission_updated', updatedMission);
+
+  res.json({ mission: updatedMission, edit_request: { ...editRequest, status: 'rejected' } });
+}));
 
 
 // ── GET /missions/my-reports — le rapporteur consulte l'historique de ses signalements ──
@@ -1744,7 +1978,51 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandl
 }));
 
 
+// ── Cron : expirer les demandes de modification sans réponse de l'Œil ─────
+// (appelé depuis index.js via cron) — même logique que POST /edit-requests/:id/reject,
+// SANS pénalité, juste avec status='expired' plutôt que 'rejected' et un message
+// client différent ("l'Œil n'a pas répondu à temps" plutôt que "a refusé").
+async function checkMissionEditRequestExpiry(db, emitToUser) {
+  const { rows: expired } = await db.query(`
+    SELECT * FROM mission_edit_requests WHERE status='pending' AND expires_at <= NOW()
+  `);
+
+  for (const editRequest of expired) {
+    const { rowCount } = await db.query(
+      `UPDATE mission_edit_requests SET status='expired', resolved_at=NOW() WHERE id=$1 AND status='pending'`,
+      [editRequest.id]
+    );
+    if (rowCount === 0) continue; // déjà traitée entre-temps (approve/reject manuel)
+
+    const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [editRequest.mission_id]);
+    if (!mission) continue;
+
+    const { rows: [updatedMission] } = await db.query(
+      `UPDATE missions SET status='pending', oeil_id=NULL, is_priority=true, transfer_deadline=NULL, updated_at=NOW()
+       WHERE id=$1 AND status='assigned' RETURNING *`,
+      [mission.id]
+    );
+    if (!updatedMission) {
+      console.log(`ℹ️ checkMissionEditRequestExpiry: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
+      continue;
+    }
+
+    await notify(db, mission.client_id,
+      'Mission remise en recherche',
+      `L'Œil n'a pas répondu à temps à votre demande de modification sur "${mission.title}". Nous recherchons un nouvel Œil, sans frais ni pénalité pour vous.`,
+      'mission', mission.id, emitToUser, 'mission_view', 'editRequestExpiredClientTitle', 'editRequestExpiredClientBody',
+      { missionTitle: mission.title }
+    );
+
+    const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+    if (clientContact?.phone) {
+      await sendWhatsAppTemplate('ticket_urgent_ouvert', clientContact.phone, [mission.title, 'Mission remise en recherche']);
+    }
+  }
+}
+
 router.checkTransferDeadlines = checkTransferDeadlines;
+router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
 router.hireOeilCore = hireOeilCore;
 router.notify = notify;
 module.exports = router;

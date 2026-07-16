@@ -23,6 +23,7 @@ const promoRoutes   = require('./routes/promo');
 const missionRoutes = require('./routes/missions');
 const missionRoutesModule = require('./routes/missions');
 const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
+const checkMissionEditRequestExpiry = missionRoutesModule.checkMissionEditRequestExpiry;
 const hireOeilCore = missionRoutesModule.hireOeilCore;
 const notify = missionRoutesModule.notify;
 const mediaRoutes   = require('./routes/media');
@@ -245,6 +246,7 @@ initDb().then(() => {
   let cronExpiredMissionsRunning = false;
   let cronPreMissionRemindersRunning = false;
   let cronTransferDeadlineRunning = false;
+  let cronMissionEditExpiryRunning = false;
   let cronAutoValidateRunning = false;
   let cronStaleMissionsRunning = false;
   let cronCandidateWindowRunning = false;
@@ -581,6 +583,18 @@ initDb().then(() => {
       await checkTransferDeadlines(db, emitToUser);
     } catch (e) { console.error('❌ Transfer deadline cron error:', e.message); }
     finally { cronTransferDeadlineRunning = false; }
+  });
+
+  // Expirer les demandes de modification de mission sans réponse de l'Œil toutes les 5 minutes
+  cron.schedule('*/5 * * * *', async () => {
+    if (cronMissionEditExpiryRunning) { console.warn('⏭️ Cron expiration demandes de modification déjà en cours, tick ignoré'); return; }
+    cronMissionEditExpiryRunning = true;
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+      await checkMissionEditRequestExpiry(db, emitToUser);
+    } catch (e) { console.error('❌ Mission edit request expiry cron error:', e.message); }
+    finally { cronMissionEditExpiryRunning = false; }
   });
 
   // ── Cron toutes les 2 min — Sélection automatique de candidat à expiration
