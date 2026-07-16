@@ -280,7 +280,11 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
         (SELECT COUNT(*) FROM mission_messages WHERE mission_id=m.id)::int AS message_count,
         (SELECT COUNT(*) FROM mission_interests WHERE mission_id=m.id AND oeil_id='${req.user.id}')::int > 0 AS has_interested,
         (SELECT score FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_score,
-        (SELECT comment FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_comment
+        (SELECT comment FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_comment,
+        (SELECT row_to_json(er) FROM (
+          SELECT id, proposed_changes, expires_at, created_at FROM mission_edit_requests
+          WHERE mission_id=m.id AND status='pending' LIMIT 1
+        ) er) AS pending_edit_request
       FROM missions m
       LEFT JOIN users c ON c.id=m.client_id
       LEFT JOIN users o ON o.id=m.oeil_id
@@ -731,7 +735,11 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
     SELECT m.*,
       c.first_name||' '||c.last_name AS client_name, c.phone AS client_phone, c.email AS client_email,
       o.first_name||' '||o.last_name AS oeil_name,   o.phone AS oeil_phone,
-      p.rating_avg AS oeil_rating, p.total_missions AS oeil_total_missions
+      p.rating_avg AS oeil_rating, p.total_missions AS oeil_total_missions,
+      (SELECT row_to_json(er) FROM (
+        SELECT id, proposed_changes, expires_at, created_at FROM mission_edit_requests
+        WHERE mission_id=m.id AND status='pending' LIMIT 1
+      ) er) AS pending_edit_request
     FROM missions m
     LEFT JOIN users c ON c.id=m.client_id
     LEFT JOIN users o ON o.id=m.oeil_id
