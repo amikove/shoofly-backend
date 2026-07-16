@@ -41,6 +41,10 @@ router.post('/register', [
           acquisition_source, acquisition_medium, acquisition_campaign } = req.body;
     const { rows: existing } = await db.query('SELECT id FROM users WHERE email=$1', [email]);
     if (existing.length) return res.status(409).json({ error: 'Email déjà utilisé' });
+    if (phone) {
+      const { rows: existingPhone } = await db.query('SELECT id FROM users WHERE phone=$1', [phone]);
+      if (existingPhone.length) return res.status(409).json({ error: 'Numéro de téléphone déjà utilisé' });
+    }
 
     let canonicalCity = null;
     if (city) {
@@ -141,14 +145,17 @@ router.get('/me', authenticate, asyncHandler(async (req, res) => {
     }));
 
 router.put('/me', authenticate, asyncHandler(async (req, res) => {
-  const db = getDb();
-  const { first_name, last_name, phone, city, bio, coverage_zone, disponibilites } = req.body;
-
-  let canonicalCity = null;
-  if (city) {
-    canonicalCity = resolveCity(city);
-    if (!canonicalCity) return res.status(400).json({ error: 'Ville invalide' });
-  }
+    const db = getDb();
+    const { first_name, last_name, phone, city, bio, coverage_zone, disponibilites } = req.body;
+    if (phone) {
+      const { rows: existingPhone } = await db.query('SELECT id FROM users WHERE phone=$1 AND id != $2', [phone, req.user.id]);
+      if (existingPhone.length) return res.status(409).json({ error: 'Numéro de téléphone déjà utilisé' });
+    }
+    let canonicalCity = null;
+    if (city) {
+      canonicalCity = resolveCity(city);
+      if (!canonicalCity) return res.status(400).json({ error: 'Ville invalide' });
+    }
 
   const { rows: [user] } = await db.query(
     `UPDATE users SET
