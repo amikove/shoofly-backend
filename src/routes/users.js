@@ -7,6 +7,7 @@ const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
+const { sendWhatsAppTemplate } = require('../services/wasel');
 const asyncHandler = require('../middleware/asyncHandler');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
@@ -1305,8 +1306,8 @@ router.get('/admin/settings', authenticate, requireRole('admin'), requirePermiss
 
 router.put('/admin/settings', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { commission, min_price, urgency_fee, accept_delay, five_star_bonus_active, five_star_bonus_percent } = req.body
-  const updates = { commission, min_price, urgency_fee, accept_delay, five_star_bonus_active, five_star_bonus_percent }
+const { commission, min_price, five_star_bonus_active, five_star_bonus_percent } = req.body
+  const updates = { commission, min_price, five_star_bonus_active, five_star_bonus_percent }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
       await db.query(
@@ -1507,12 +1508,22 @@ router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('a
     [doc.user_id]
   );
 
-  // Notification in-app
-  await db.query(
-    `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-     VALUES ($1, '✅ Identité vérifiée', 'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.', 'success', 'none', $2, $3, $4)`,
-    [doc.user_id, 'identityVerifiedTitle', 'identityVerifiedBody', null]
-  );
+ // Notification in-app
+    await db.query(
+      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
+       VALUES ($1, '✅ Identité vérifiée', 'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.', 'success', 'none', $2, $3, $4)`,
+      [doc.user_id, 'identityVerifiedTitle', 'identityVerifiedBody', null]
+    );
+    // Test technique API Wasel — même bouton, aucune étape supplémentaire pour l'admin.
+    // Réutilise nouvelle_verification_identite (contenu sans rapport avec l'approbation,
+    // assumé pour ce test de plomberie, en attendant un vrai template "approuvé" chez Wasel).
+    const { rows: [oeilContact] } = await db.query('SELECT phone, first_name, last_name FROM users WHERE id=$1', [doc.user_id]);
+    if (oeilContact?.phone) {
+      const oeilName = `${oeilContact.first_name} ${oeilContact.last_name}`.trim();
+      sendWhatsAppTemplate('nouvelle_verification_identite', oeilContact.phone, [oeilName]);
+    } else {
+      console.warn(`[wasel] Œil ${doc.user_id} sans téléphone renseigné — envoi ignoré (identity approved)`);
+    }
 
   res.json({ message: 'Identité approuvée', user_id: doc.user_id });
 }));
