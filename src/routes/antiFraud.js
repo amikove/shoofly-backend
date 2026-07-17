@@ -2,6 +2,7 @@ const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
+const { getSetting } = require('../utils/settings');
 const asyncHandler = require('../middleware/asyncHandler');
 const { logStatus } = require('../utils/missionHistory');
 
@@ -421,9 +422,11 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
     `SELECT * FROM missions WHERE oeil_id=$1 AND status IN ('assigned','en_route','active')`,
     [req.params.userId]
   );
+  const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+  const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
   for (const mission of strandedMissions) {
     const transferType = mission.status === 'assigned' ? 'before' : 'during';
-    const graceMinutes = mission.type === 'file_attente' ? 45 : 60;
+    const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
     const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
 
     const { rowCount } = await db.query(

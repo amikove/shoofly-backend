@@ -1,3 +1,5 @@
+const { getSetting } = require('./settings');
+
 // Remboursement client suite à l'annulation d'une mission.
 //
 // La règle de timing (100% avant assignation, 50% si annulation >2h avant la
@@ -16,12 +18,14 @@ async function refundOnCancellation(db, mission, initiatedByClient, reasonOverri
       refund = mission.price;
       reason = 'Remboursement annulation avant assignation';
     } else {
+      const partialThresholdHours = await getSetting(db, 'refund_partial_threshold_hours', 2);
+      const partialRate = await getSetting(db, 'refund_partial_rate', 0.5);
       const hoursBeforeMission = (new Date(mission.scheduled_at).getTime() - Date.now()) / 3600000;
-      if (hoursBeforeMission > 2) {
-        refund = Math.round(mission.price * 0.5 * 100) / 100;
-        reason = 'Remboursement annulation (50%)';
+      if (hoursBeforeMission > partialThresholdHours) {
+        refund = Math.round(mission.price * partialRate * 100) / 100;
+        reason = `Remboursement annulation (${Math.round(partialRate * 100)}%)`;
       }
-      // < 2h avant la mission : aucun remboursement
+      // < seuil avant la mission : aucun remboursement
     }
   } else {
     // Annulation non imputable au client (Œil, système/cron, admin) → remboursement intégral systématique

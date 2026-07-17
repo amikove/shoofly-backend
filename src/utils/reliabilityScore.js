@@ -106,8 +106,8 @@ async function checkAndUpdateSuspension(db, oeilId) {
 // utilisé par les routes exposant un Œil à un client ou un autre Œil pour
 // remplacer le score par un badge "Nouveau" plutôt qu'un chiffre trompeur.
 const NEW_OEIL_MISSION_THRESHOLD = 10;
-function isNewOeil(totalMissions) {
-  return (totalMissions || 0) < NEW_OEIL_MISSION_THRESHOLD;
+function isNewOeil(totalMissions, threshold = NEW_OEIL_MISSION_THRESHOLD) {
+  return (totalMissions || 0) < threshold;
 }
 
 // ── Niveaux et badges ──────────────────────────────────────

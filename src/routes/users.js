@@ -7,6 +7,7 @@ const { refundOnCancellation } = require('../utils/refund');
 const { logStatus } = require('../utils/missionHistory');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
+const { getSetting, invalidateSettingsCache } = require('../utils/settings');
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const asyncHandler = require('../middleware/asyncHandler');
 const multer = require('multer');
@@ -96,8 +97,9 @@ router.get('/oeils', authenticate, asyncHandler(async (req, res) => {
     const { rows: [{ n: total }] } = await db.query(`
       SELECT COUNT(*)::int AS n FROM users u JOIN oeil_profiles p ON p.user_id=u.id WHERE ${where.join(' AND ')}
     `, params);
+    const newOeilThreshold = await getSetting(db, 'new_oeil_mission_threshold', 10);
     const oeils = rows.map(o => {
-      const is_new_oeil = isNewOeil(o.total_missions);
+      const is_new_oeil = isNewOeil(o.total_missions, newOeilThreshold);
       // Un admin ou l'Œil consultant sa propre fiche voit toujours la vraie note ;
       // seul un tiers (client ou autre Œil) reçoit la valeur masquée.
       const showRealScore = req.user.role === 'admin' || o.id === req.user.id;
@@ -130,7 +132,8 @@ router.get('/oeils/:id', authenticate, asyncHandler(async (req, res) => {
   // les valeurs brutes plutôt que de compter sur le frontend pour respecter le flag.
   // L'admin et l'Œil consultant sa propre fiche voient toujours le vrai score.
   const showRealScore = req.user.role === 'admin' || oeil.id === req.user.id;
-  oeil.is_new_oeil = isNewOeil(oeil.total_missions);
+  const newOeilThreshold = await getSetting(db, 'new_oeil_mission_threshold', 10);
+  oeil.is_new_oeil = isNewOeil(oeil.total_missions, newOeilThreshold);
   if (!showRealScore && oeil.is_new_oeil) {
     oeil.reliability_score = null;
     oeil.rating_avg = null;
@@ -197,8 +200,9 @@ router.get('/favorites', authenticate, requireRole('client'), asyncHandler(async
     FROM favorites f JOIN users u ON u.id=f.oeil_id JOIN oeil_profiles p ON p.user_id=u.id
     WHERE f.client_id=$1 ORDER BY f.created_at DESC
   `, [req.user.id]);
+  const newOeilThreshold = await getSetting(db, 'new_oeil_mission_threshold', 10);
   const favorites = rows.map(f => {
-    const is_new_oeil = isNewOeil(f.total_missions);
+    const is_new_oeil = isNewOeil(f.total_missions, newOeilThreshold);
     return { ...f, is_new_oeil, rating_avg: is_new_oeil ? null : f.rating_avg };
   });
   res.json({ favorites });
@@ -482,14 +486,16 @@ router.get('/admin/dashboard/executif', authenticate, requireRole('admin'), requ
 router.get('/admin/dashboard/alertes', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { date_from, date_to, compare_from, compare_to } = req.query;
+  const stuckPendingHours = await getSetting(db, 'dashboard_stuck_pending_hours', 24);
+  const lowReliabilityThreshold = await getSetting(db, 'dashboard_low_reliability_threshold', 70);
 
   // ── Section instantanée (indépendante de la période) ──
   const [suspended, surveillance, stuckPending, expiredDeadline, lowReliability, avgScore] = await Promise.all([
     db.query(`SELECT COUNT(*)::int AS n FROM users WHERE role='oeil' AND is_suspended=true`),
     db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE under_surveillance=true`),
-    db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE status='pending' AND created_at < NOW() - INTERVAL '24 hours'`),
+    db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE status='pending' AND created_at < NOW() - INTERVAL '1 hour' * $1::numeric`, [stuckPendingHours]),
     db.query(`SELECT COUNT(*)::int AS n FROM missions WHERE status='pending' AND transfer_deadline IS NOT NULL AND transfer_deadline < NOW()`),
-    db.query(`SELECT COUNT(*)::int AS n FROM users WHERE role='oeil' AND reliability_score < 70`),
+    db.query(`SELECT COUNT(*)::int AS n FROM users WHERE role='oeil' AND reliability_score < $1::numeric`, [lowReliabilityThreshold]),
     db.query(`SELECT COALESCE(AVG(reliability_score),0)::numeric(5,1) AS avg FROM users WHERE role='oeil'`),
   ]);
 
@@ -1306,8 +1312,34 @@ router.get('/admin/settings', authenticate, requireRole('admin'), requirePermiss
 
 router.put('/admin/settings', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
-const { commission, min_price, five_star_bonus_active, five_star_bonus_percent } = req.body
-  const updates = { commission, min_price, five_star_bonus_active, five_star_bonus_percent }
+const {
+  commission, min_price, five_star_bonus_active, five_star_bonus_percent,
+  transfer_grace_minutes_queue, transfer_grace_minutes_other,
+  candidate_window_minutes_fast, candidate_window_minutes_choose_queue, candidate_window_minutes_choose_other,
+  mission_edit_approval_minutes, mission_edit_approval_minutes_urgent, mission_edit_urgent_threshold_hours,
+  client_validation_hours, schedule_conflict_window_hours, transfer_cooldown_hours,
+  abandon_during_mission_cooldown_hours, stale_mission_hours, stale_mission_min_lead_hours,
+  mission_overdue_verification_hours, late_start_alert_window_minutes, late_start_auto_transfer_minutes,
+  reminder_before_mission_minutes_early, reminder_before_mission_minutes_late,
+  refund_partial_threshold_hours, refund_partial_rate,
+  new_oeil_mission_threshold, reactivation_default_score, ticket_auto_resolve_hours,
+  response_time_max_valid_minutes, response_time_min_turns,
+  dashboard_stuck_pending_hours, dashboard_low_reliability_threshold,
+} = req.body
+  const updates = {
+    commission, min_price, five_star_bonus_active, five_star_bonus_percent,
+    transfer_grace_minutes_queue, transfer_grace_minutes_other,
+    candidate_window_minutes_fast, candidate_window_minutes_choose_queue, candidate_window_minutes_choose_other,
+    mission_edit_approval_minutes, mission_edit_approval_minutes_urgent, mission_edit_urgent_threshold_hours,
+    client_validation_hours, schedule_conflict_window_hours, transfer_cooldown_hours,
+    abandon_during_mission_cooldown_hours, stale_mission_hours, stale_mission_min_lead_hours,
+    mission_overdue_verification_hours, late_start_alert_window_minutes, late_start_auto_transfer_minutes,
+    reminder_before_mission_minutes_early, reminder_before_mission_minutes_late,
+    refund_partial_threshold_hours, refund_partial_rate,
+    new_oeil_mission_threshold, reactivation_default_score, ticket_auto_resolve_hours,
+    response_time_max_valid_minutes, response_time_min_turns,
+    dashboard_stuck_pending_hours, dashboard_low_reliability_threshold,
+  }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
       await db.query(
@@ -1316,6 +1348,7 @@ const { commission, min_price, five_star_bonus_active, five_star_bonus_percent }
       )
     }
   }
+  invalidateSettingsCache()
   res.json({ ok: true })
 }))
 

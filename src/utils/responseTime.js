@@ -4,6 +4,8 @@
 // tous types de mission confondus. Seuls les messages type='text' comptent —
 // les messages système (changements de statut...) et de localisation (pings
 // GPS automatiques) ne reflètent pas une réactivité humaine.
+const { getSetting } = require('./settings');
+
 const MAX_VALID_DELAY_MINUTES = 24 * 60;
 const MIN_VALID_TURNS = 3;
 
@@ -17,6 +19,9 @@ async function computeAvgResponseMinutesBulk(db, oeilIds) {
   const ids = [...new Set((oeilIds || []).filter(Boolean))];
   const result = {};
   if (ids.length === 0) return result;
+
+  const maxValidDelayMinutes = await getSetting(db, 'response_time_max_valid_minutes', MAX_VALID_DELAY_MINUTES);
+  const minValidTurns = await getSetting(db, 'response_time_min_turns', MIN_VALID_TURNS);
 
   const { rows } = await db.query(
     `WITH msgs AS (
@@ -58,12 +63,12 @@ async function computeAvgResponseMinutesBulk(db, oeilIds) {
      FROM turns
      WHERE delay_minutes <= $2
      GROUP BY target_oeil`,
-    [ids, MAX_VALID_DELAY_MINUTES]
+    [ids, maxValidDelayMinutes]
   );
 
   for (const row of rows) {
     const turnCount = Number(row.turn_count);
-    result[row.target_oeil] = turnCount >= MIN_VALID_TURNS ? Math.round(Number(row.avg_minutes)) : null;
+    result[row.target_oeil] = turnCount >= minValidTurns ? Math.round(Number(row.avg_minutes)) : null;
   }
   for (const id of ids) {
     if (!(id in result)) result[id] = null;
