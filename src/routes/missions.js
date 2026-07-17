@@ -6,6 +6,7 @@ const { authenticate, requireRole } = require('../middleware/auth');
 const { logReliabilityEvent, computeLatePenalty, isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutesBulk } = require('../utils/responseTime');
 const { refundOnCancellation } = require('../utils/refund');
+const { getSetting } = require('../utils/settings');
 const { logStatus } = require('../utils/missionHistory');
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
@@ -102,8 +103,9 @@ router.post('/:id/claim', authenticate, asyncHandler(async (req, res) => {
   if (mission.validated_at) return res.status(400).json({ error: 'Cette mission a déjà été validée, aucune réclamation n\'est plus possible.' });
   if (mission.status !== 'completed') return res.status(400).json({ error: 'Mission non terminée' });
 
+  const clientValidationHours = await getSetting(db, 'client_validation_hours', 12);
   const hoursSinceCompletion = (Date.now() - new Date(mission.completed_by_oeil_at).getTime()) / 3600000;
-  if (hoursSinceCompletion > 12) return res.status(400).json({ error: 'Délai de réclamation dépassé (12h)' });
+  if (hoursSinceCompletion > clientValidationHours) return res.status(400).json({ error: `Délai de réclamation dépassé (${clientValidationHours}h)` });
 
   const emitToUser = req.app.get('emitToUser');
 
@@ -533,9 +535,12 @@ router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req,
       return res.status(409).json({ error: "Une demande de modification est déjà en attente de réponse de l'Œil. Merci d'attendre sa résolution avant d'en soumettre une nouvelle." });
     }
 
-    // Délai réduit à 30 min si la mission est prévue dans moins de 4h, 2h sinon.
+    // Délai réduit si la mission est prévue dans moins de mission_edit_urgent_threshold_hours.
+    const editApprovalMinutes = await getSetting(db, 'mission_edit_approval_minutes', 120);
+    const editApprovalMinutesUrgent = await getSetting(db, 'mission_edit_approval_minutes_urgent', 30);
+    const editUrgentThresholdHours = await getSetting(db, 'mission_edit_urgent_threshold_hours', 4);
     const hoursUntilMission = (new Date(mission.scheduled_at).getTime() - Date.now()) / 3600000;
-    const delayMinutes = hoursUntilMission < 4 ? 30 : 120;
+    const delayMinutes = hoursUntilMission < editUrgentThresholdHours ? editApprovalMinutesUrgent : editApprovalMinutes;
     const expiresAt = new Date(Date.now() + delayMinutes * 60 * 1000);
 
     const { rows: [editRequest] } = await db.query(
@@ -684,14 +689,15 @@ router.get('/my-reports', authenticate, asyncHandler(async (req, res) => {
 router.get('/actions-required', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
   const clientId = req.user.id;
+  const clientValidationHours = await getSetting(db, 'client_validation_hours', 12);
 
   const { rows: to_validate } = await db.query(`
     SELECT id, title, completed_by_oeil_at,
-      completed_by_oeil_at + INTERVAL '12 hours' AS deadline
+      completed_by_oeil_at + INTERVAL '1 hour' * $1::numeric AS deadline
     FROM missions
-    WHERE client_id=$1 AND status='completed' AND validated_at IS NULL
+    WHERE client_id=$2 AND status='completed' AND validated_at IS NULL
     ORDER BY completed_by_oeil_at ASC
-  `, [clientId]);
+  `, [clientValidationHours, clientId]);
 
   const { rows: to_rate } = await db.query(`
     SELECT m.id, m.title, m.validated_at,
@@ -768,7 +774,8 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   // n'a pas assez d'historique pour qu'une note affichée soit significative.
   // L'Œil consultant sa propre mission et l'admin gardent la vraie valeur.
   if (req.user.role === 'client' && mission.oeil_id) {
-    mission.is_new_oeil = isNewOeil(mission.oeil_total_missions);
+    const newOeilThreshold = await getSetting(db, 'new_oeil_mission_threshold', 10);
+    mission.is_new_oeil = isNewOeil(mission.oeil_total_missions, newOeilThreshold);
     if (mission.is_new_oeil) mission.oeil_rating = null;
   }
 
@@ -880,8 +887,9 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
     // Le temps de réponse moyen est calculé en une seule requête groupée pour
     // tous les candidats (voir computeAvgResponseMinutesBulk) plutôt qu'en boucle.
     const avgResponseByOeil = await computeAvgResponseMinutesBulk(db, rows.map(o => o.id));
+    const newOeilThreshold = await getSetting(db, 'new_oeil_mission_threshold', 10);
     const interests = rows.map(o => {
-      const is_new_oeil = isNewOeil(o.total_missions);
+      const is_new_oeil = isNewOeil(o.total_missions, newOeilThreshold);
       const avg_response_minutes = avgResponseByOeil[o.id] ?? null;
       if (req.user.role === 'client' && is_new_oeil) {
         return { ...o, is_new_oeil, rating_avg: null, rating_count: null, avg_response_minutes };
@@ -917,10 +925,11 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async
       // Pénalité de fiabilité proportionnelle au délai avant la mission
       const { points: penaltyPoints, reason: penaltyReason, isGrave } = computeLatePenalty(mission.scheduled_at, 'assignée refusée par l\'Œil');
         await logReliabilityEvent(db, req.user.id, mission.id, penaltyPoints, penaltyReason, isGrave);
-        // Cooldown de 4h : empêche l'Œil d'accepter immédiatement une autre mission après avoir abandonné celle-ci
+        // Cooldown : empêche l'Œil d'accepter immédiatement une autre mission après avoir abandonné celle-ci
+        const transferCooldownHours = await getSetting(db, 'transfer_cooldown_hours', 4);
         await db.query(
-          `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '4 hours' WHERE id=$1`,
-          [req.user.id]
+          `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $1::numeric WHERE id=$2`,
+          [transferCooldownHours, req.user.id]
         );
         res.json({ mission });
   } catch (err) {
@@ -1320,7 +1329,8 @@ router.post('/:id/rate', authenticate, requireRole('client'), [
   await db.query('UPDATE oeil_profiles SET rating_avg=$1, rating_count=$2 WHERE user_id=$3', [avg.a, avg.c, mission.oeil_id]);
 
   const { rows: [oeilProfile] } = await db.query('SELECT total_missions FROM oeil_profiles WHERE user_id=$1', [mission.oeil_id]);
-  const is_new_oeil = isNewOeil(oeilProfile?.total_missions);
+  const newOeilThreshold = await getSetting(db, 'new_oeil_mission_threshold', 10);
+  const is_new_oeil = isNewOeil(oeilProfile?.total_missions, newOeilThreshold);
 
 await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${mission.title}" notée par un client.`, 'rating', mission.id, emitToUser, null, 'newRatingTitle', 'newRatingBody', {score: req.body.score, missionTitle: mission.title});
 
@@ -1380,12 +1390,13 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
     if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission non disponible' });
 
   // Vérifier les conflits de créneau
+  const scheduleConflictWindowHours = await getSetting(db, 'schedule_conflict_window_hours', 4);
   const { rows: conflicts } = await db.query(`
     SELECT m.id, m.title, m.scheduled_at FROM missions m
     WHERE m.oeil_id = $1
       AND m.status IN ('assigned','en_route','active')
-      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $2)) / 3600) < 4
-  `, [req.user.id, mission.scheduled_at])
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $2)) / 3600) < $3::numeric
+  `, [req.user.id, mission.scheduled_at, scheduleConflictWindowHours])
 
   if (conflicts.length > 0) {
     return res.status(400).json({ error: 'Vous avez déjà une mission dans le même créneau.' })
@@ -1431,15 +1442,20 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   const transferType = mission.status === 'assigned' ? 'before' : 'during';
 
   // Délai de grâce selon type de mission
-  const graceMinutes = mission.type === 'file_attente' ? 45 : 60;
+  const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+  const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+  const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
   const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
 
-  // Fenêtre de candidature : durée fixe de 10 min en "fast" (peu importe le type),
-  // 5 min (file_attente) ou 10 min (autres types) en "choose" — indépendante du
+  // Fenêtre de candidature : durée fixe en "fast" (peu importe le type),
+  // ou selon le type en "choose" — indépendante du
   // délai de grâce (transfer_deadline) ci-dessus, qui continue de courir en toile de fond.
+  const candidateWindowMinutesFast = await getSetting(db, 'candidate_window_minutes_fast', 10);
+  const candidateWindowMinutesChooseQueue = await getSetting(db, 'candidate_window_minutes_choose_queue', 5);
+  const candidateWindowMinutesChooseOther = await getSetting(db, 'candidate_window_minutes_choose_other', 10);
   const candidateWindowMinutes = mission.replacement_preference === 'choose'
-    ? (mission.type === 'file_attente' ? 5 : 10)
-    : 10;
+    ? (mission.type === 'file_attente' ? candidateWindowMinutesChooseQueue : candidateWindowMinutesChooseOther)
+    : candidateWindowMinutesFast;
   const candidateWindowEndsAt = new Date(Date.now() + candidateWindowMinutes * 60 * 1000);
 
   // Remettre la mission en pending avec flag priorité — vérifié et appliqué
@@ -1469,11 +1485,12 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
         [mission.id]
       );
     }
-    // Cooldown 4h si transfert pendant mission
+    // Cooldown si transfert pendant mission
     if (transferType === 'during') {
+      const transferCooldownHours = await getSetting(db, 'transfer_cooldown_hours', 4);
       await db.query(
-        `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '4 hours', transfer_count=transfer_count+1 WHERE id=$1`,
-        [req.user.id]
+        `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $2::numeric, transfer_count=transfer_count+1 WHERE id=$1`,
+        [req.user.id, transferCooldownHours]
       );
     } else {
     await db.query(
@@ -1539,13 +1556,14 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     }
 
   // Vérifier les conflits de créneau (même requête que POST /:id/hire/:oeilId)
+  const scheduleConflictWindowHoursAdmin = await getSetting(db, 'schedule_conflict_window_hours', 4);
   const { rows: creneauConflicts } = await db.query(`
     SELECT m.id FROM missions m
     WHERE m.oeil_id = $1
       AND m.status IN ('assigned','en_route','active')
       AND m.id != $2
-      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
-  `, [oeil_id, mission.id, mission.scheduled_at])
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < $4::numeric
+  `, [oeil_id, mission.id, mission.scheduled_at, scheduleConflictWindowHoursAdmin])
 
   if (creneauConflicts.length > 0) {
     return res.status(400).json({ error: 'Cet Œil a déjà une mission dans le même créneau.' })
@@ -1623,12 +1641,13 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
           `UPDATE oeil_profiles SET balance=GREATEST(0, balance-100) WHERE user_id=$1`,
           [mission.transferred_from]
         );
+        const abandonCooldownHours = await getSetting(db, 'abandon_during_mission_cooldown_hours', 48);
         await db.query(`
           UPDATE users SET
             transfer_no_replacement_count=transfer_no_replacement_count+1,
-            transfer_cooldown_until=NOW() + INTERVAL '48 hours'
+            transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $2::numeric
           WHERE id=$1
-        `, [mission.transferred_from]);
+        `, [mission.transferred_from, abandonCooldownHours]);
         await logReliabilityEvent(db, mission.transferred_from, mission.id, -70, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
         await db.query(
           `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',$2,'Pénalité — aucun remplaçant trouvé',$3)`,
@@ -1698,13 +1717,14 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   if (!interest) return { ok: false, status: 400, error: "Cet Œil n'a pas exprimé son intérêt" };
 
   // Vérifier le créneau avant assignation (doit précéder toute mutation de la mission)
+  const scheduleConflictWindowHours = await getSetting(db, 'schedule_conflict_window_hours', 4);
   const { rows: creneauConflicts } = await db.query(`
     SELECT m.id FROM missions m
     WHERE m.oeil_id = $1
       AND m.status IN ('assigned','en_route','active')
       AND m.id != $2
-      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
-  `, [oeilId, mission.id, mission.scheduled_at])
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < $4::numeric
+  `, [oeilId, mission.id, mission.scheduled_at, scheduleConflictWindowHours])
 
   if (creneauConflicts.length > 0) {
     return { ok: false, status: 400, error: 'Cet Œil a déjà une mission dans le même créneau.' };
@@ -1743,8 +1763,8 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
     WHERE mi.oeil_id = $1
       AND mi.mission_id != $2
       AND m.status = 'pending'
-      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < 4
-  `, [oeilId, mission.id, mission.scheduled_at])
+      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < $4::numeric
+  `, [oeilId, mission.id, mission.scheduled_at, scheduleConflictWindowHours])
 
   for (const ci of conflictInterests) {
     await db.query(
