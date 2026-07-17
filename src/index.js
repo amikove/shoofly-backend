@@ -437,7 +437,12 @@ initDb().then(() => {
            WHERE id = $2`,
           [transferCooldownHours, m.oeil_id]
         );
-      await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',100,'Pénalité — mission non démarrée à l''heure',$2)`, [m.oeil_id, m.id]);
+        // Le débit journalisé doit être plafonné au solde réel de l'Œil — sinon la ligne
+        // wallet_transactions affiche -100 alors que balance (clampée par GREATEST) n'a
+        // baissé que du solde disponible, cassant la réconciliation SUM(wallet_transactions) == balance.
+        const { rows: [oeilBalRow] } = await db.query('SELECT balance FROM oeil_profiles WHERE user_id=$1', [m.oeil_id]);
+        const deducted = Math.min(100, parseFloat(oeilBalRow?.balance || 0));
+        await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',$2,'Pénalité — mission non démarrée à l''heure',$3)`, [m.oeil_id, deducted, m.id]);
         await db.query(`UPDATE oeil_profiles SET balance=GREATEST(0,balance-100) WHERE user_id=$1`, [m.oeil_id]);
         await logReliabilityEvent(db, m.oeil_id, m.id, -20, 'Mission non démarrée à l\'heure (H+30)', true);
 
