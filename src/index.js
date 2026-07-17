@@ -10,6 +10,7 @@ const jwt = require('jsonwebtoken');
 
 const { initDb, getDb } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
+const { getSetting } = require('./utils/settings');
 
 const cron = require('node-cron');
 const xss = require('xss-clean');
@@ -153,9 +154,17 @@ io.on('connection', (socket) => {
   userSockets.get(uid).add(socket.id);
 
   // Auto-join mission rooms this user is part of
-  socket.on('join_mission', (missionId) => {
+  socket.on('join_mission', async (missionId) => {
+  try {
+    const db = getDb();
+    const { rows: [mission] } = await db.query('SELECT client_id, oeil_id FROM missions WHERE id=$1', [missionId]);
+    if (!mission) return;
+    const { rows: [user] } = await db.query('SELECT role FROM users WHERE id=$1', [uid]);
+    const isParty = mission.client_id === uid || mission.oeil_id === uid || user?.role === 'admin';
+    if (!isParty) return;
     socket.join(`mission:${missionId}`);
-  });
+  } catch (e) { console.error('WS join_mission error:', e.message); }
+});
 
   socket.on('leave_mission', (missionId) => {
     socket.leave(`mission:${missionId}`);
@@ -212,10 +221,8 @@ io.on('connection', (socket) => {
     } catch (e) { console.error('WS location error:', e.message); }
   });
 
-  // Admin or system broadcasts mission status change
-  socket.on('mission_status_changed', ({ missionId, status }) => {
-    io.to(`mission:${missionId}`).emit('mission_status_changed', { missionId, status });
-  });
+  // mission_status_changed n'est plus écouté depuis le client — uniquement émis
+    // côté serveur (routes/missions.js), pour empêcher un client de falsifier un statut.
 
   socket.on('disconnect', () => {
     userSockets.get(uid)?.delete(socket.id);
@@ -367,6 +374,8 @@ initDb().then(() => {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
       const now = new Date();
+      const alertWindowMinutes = await getSetting(db, 'late_start_alert_window_minutes', 30);
+      const autoTransferMinutes = await getSetting(db, 'late_start_auto_transfer_minutes', 60);
 
       // Missions qui auraient dû démarrer il y a 0-30 min (H)
       const { rows: lateH } = await db.query(`
@@ -374,9 +383,9 @@ initDb().then(() => {
         FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status = 'assigned'
-        AND m.scheduled_at BETWEEN NOW() - INTERVAL '30 minutes' AND NOW()
+        AND m.scheduled_at BETWEEN NOW() - INTERVAL '1 minute' * $1::numeric AND NOW()
         AND m.oeil_id IS NOT NULL
-      `);
+      `, [alertWindowMinutes]);
 
       for (const m of lateH) {
         // Alerte Œil
@@ -412,27 +421,30 @@ initDb().then(() => {
         FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status = 'assigned'
-        AND m.scheduled_at BETWEEN NOW() - INTERVAL '60 minutes' AND NOW() - INTERVAL '30 minutes'
+        AND m.scheduled_at BETWEEN NOW() - INTERVAL '1 minute' * $1::numeric AND NOW() - INTERVAL '1 minute' * $2::numeric
         AND m.oeil_id IS NOT NULL
         AND m.is_priority = false
-      `);
+      `, [autoTransferMinutes, alertWindowMinutes]);
 
+      const transferCooldownHours = await getSetting(db, 'transfer_cooldown_hours', 4);
       for (const m of lateH30) {
         // Pénalité fiabilité — le score est entièrement recalculé par logReliabilityEvent ci-dessous,
         // pas besoin de le décrémenter manuellement ici (ancien code mort, toujours écrasé après coup).
         await db.query(
           `UPDATE users SET
-            transfer_cooldown_until = NOW() + INTERVAL '4 hours',
+            transfer_cooldown_until = NOW() + INTERVAL '1 hour' * $1::numeric,
             transfer_count = transfer_count + 1
-           WHERE id = $1`,
-          [m.oeil_id]
+           WHERE id = $2`,
+          [transferCooldownHours, m.oeil_id]
         );
       await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',100,'Pénalité — mission non démarrée à l''heure',$2)`, [m.oeil_id, m.id]);
         await db.query(`UPDATE oeil_profiles SET balance=GREATEST(0,balance-100) WHERE user_id=$1`, [m.oeil_id]);
         await logReliabilityEvent(db, m.oeil_id, m.id, -20, 'Mission non démarrée à l\'heure (H+30)', true);
 
         // Transfert automatique
-        const graceMinutes = m.type === 'file_attente' ? 45 : 60;
+        const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+        const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+        const graceMinutes = m.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
         const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
         await db.query(`
           UPDATE missions SET
@@ -480,6 +492,7 @@ initDb().then(() => {
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
+      const overdueVerificationHours = await getSetting(db, 'mission_overdue_verification_hours', 24);
 
       // Missions active/en_route depuis plus de 24h après scheduled_at
       const { rows: expired } = await db.query(`
@@ -487,9 +500,9 @@ initDb().then(() => {
         FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status IN ('active', 'en_route')
-        AND m.scheduled_at < NOW() - INTERVAL '24 hours'
+        AND m.scheduled_at < NOW() - INTERVAL '1 hour' * $1::numeric
         AND m.oeil_id IS NOT NULL
-      `);
+      `, [overdueVerificationHours]);
 
       for (const m of expired) {
         const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
@@ -515,14 +528,16 @@ initDb().then(() => {
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
+      const reminderEarlyMinutes = await getSetting(db, 'reminder_before_mission_minutes_early', 120);
+      const reminderLateMinutes = await getSetting(db, 'reminder_before_mission_minutes_late', 30);
 
-      // H-2h
+      // H-2h (marge ±10min, dimensionnée pour la fréquence du cron */30 * * * *)
       const { rows: missions2h } = await db.query(`
         SELECT m.* FROM missions m
         WHERE m.status = 'assigned'
-        AND m.scheduled_at BETWEEN NOW() + INTERVAL '1h50m' AND NOW() + INTERVAL '2h10m'
+        AND m.scheduled_at BETWEEN NOW() + INTERVAL '1 minute' * $1::numeric AND NOW() + INTERVAL '1 minute' * $2::numeric
         AND m.oeil_id IS NOT NULL
-      `);
+      `, [reminderEarlyMinutes - 10, reminderEarlyMinutes + 10]);
       for (const m of missions2h) {
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -538,13 +553,13 @@ initDb().then(() => {
         });
       }
 
-      // H-30min
+      // H-30min (marge ±10min)
       const { rows: missions30 } = await db.query(`
         SELECT m.* FROM missions m
         WHERE m.status = 'assigned'
-        AND m.scheduled_at BETWEEN NOW() + INTERVAL '20m' AND NOW() + INTERVAL '40m'
+        AND m.scheduled_at BETWEEN NOW() + INTERVAL '1 minute' * $1::numeric AND NOW() + INTERVAL '1 minute' * $2::numeric
         AND m.oeil_id IS NOT NULL
-      `);
+      `, [reminderLateMinutes - 10, reminderLateMinutes + 10]);
       for (const m of missions30) {
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -661,13 +676,14 @@ initDb().then(() => {
     cronAutoValidateRunning = true;
     try {
       const db = getDb();
+      const clientValidationHours = await getSetting(db, 'client_validation_hours', 12);
       const { rows: missions } = await db.query(`
         SELECT * FROM missions
         WHERE status='completed'
           AND completed_by_oeil_at IS NOT NULL
-          AND completed_by_oeil_at < NOW() - INTERVAL '12 hours'
+          AND completed_by_oeil_at < NOW() - INTERVAL '1 hour' * $1::numeric
           AND validated_at IS NULL
-      `);
+      `, [clientValidationHours]);
       for (const mission of missions) {
         // Le statut a pu changer entre le SELECT et ici (ex: réclamation déposée
         // entre-temps) — la garde sur le WHERE évite de payer une mission qui n'est
@@ -694,15 +710,17 @@ initDb().then(() => {
     cronStaleMissionsRunning = true;
     try {
       const db = getDb();
+      const staleMissionHours = await getSetting(db, 'stale_mission_hours', 12);
+      const staleMissionMinLeadHours = await getSetting(db, 'stale_mission_min_lead_hours', 4);
 
       const { rows: staleMissions } = await db.query(`
         SELECT * FROM missions
         WHERE status = 'pending'
           AND oeil_id IS NULL
-          AND created_at <= NOW() - INTERVAL '12 hours'
-          AND scheduled_at >= NOW() + INTERVAL '4 hours'
+          AND created_at <= NOW() - INTERVAL '1 hour' * $1::numeric
+          AND scheduled_at >= NOW() + INTERVAL '1 hour' * $2::numeric
           AND stale_notified_at IS NULL
-      `);
+      `, [staleMissionHours, staleMissionMinLeadHours]);
 
       for (const m of staleMissions) {
           // Notification admin uniquement — la suggestion client (augmenter le budget) a été retirée :
@@ -734,6 +752,7 @@ initDb().then(() => {
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
+      const ticketAutoResolveHours = await getSetting(db, 'ticket_auto_resolve_hours', 72);
 
       const { rows: tickets } = await db.query(`
         SELECT * FROM support_tickets
@@ -741,8 +760,8 @@ initDb().then(() => {
           AND is_urgent = false
           AND last_admin_message_at IS NOT NULL
           AND last_admin_message_at > COALESCE(last_user_message_at, '1970-01-01')
-          AND last_admin_message_at <= NOW() - INTERVAL '72 hours'
-      `);
+          AND last_admin_message_at <= NOW() - INTERVAL '1 hour' * $1::numeric
+      `, [ticketAutoResolveHours]);
 
       // ticket_messages.sender_id référence users(id) sans exception "système" — on
       // attribue donc le message automatique à un admin actif (peu importe lequel : le
