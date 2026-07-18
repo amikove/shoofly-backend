@@ -1,4 +1,5 @@
 const { getSetting } = require('./settings');
+const walletService = require('../services/walletService');
 
 // Remboursement client suite à l'annulation d'une mission.
 //
@@ -33,12 +34,11 @@ async function refundOnCancellation(db, mission, initiatedByClient, reasonOverri
     reason = 'Remboursement intégral — annulation non imputable au client';
   }
 
+  // db : pool ou client déjà en transaction (walletService.credit s'appuie
+  // uniquement sur .query(), donc composable dans une transaction plus large
+  // par l'appelant — voir walletService.withTransaction).
   if (refund > 0) {
-    await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [refund, mission.client_id]);
-    await db.query(
-      `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,$3,$4)`,
-      [mission.client_id, refund, reasonOverride || reason, mission.id]
-    );
+    await walletService.credit(db, mission.client_id, 'client', refund, reasonOverride || reason, mission.id);
   }
 
   return refund;
