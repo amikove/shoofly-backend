@@ -1629,13 +1629,18 @@ async function checkTransferDeadlines(db, emitToUser) {
     // entre-temps acceptée/embauchée (sortie de pending/is_priority) entre le
     // SELECT ci-dessus et cette itération, on ne rejoue pas la pénalité et le
     // remboursement dessus.
-    const { rowCount: cancelRowCount } = await db.query(
-      `UPDATE missions SET status='cancelled', cancelled_at=NOW(), cancel_reason='Aucun remplaçant trouvé avant expiration du délai', is_priority=false, transfer_deadline=NULL, updated_at=NOW() WHERE id=$1 AND status='pending' AND is_priority=true`,
-      [mission.id]
-    );
-    if (cancelRowCount === 0) {
-      console.log(`ℹ️ checkTransferDeadlines: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
-      continue;
+    try {
+      await transitionMission(db, mission.id, 'pending', 'cancelled', null, {
+        extraFields: { cancelled_at: 'NOW()', cancel_reason: 'Aucun remplaçant trouvé avant expiration du délai', is_priority: false, transfer_deadline: null },
+        extraGuards: { is_priority: true },
+        note: 'Expiration du délai de transfert sans remplaçant',
+      });
+    } catch (e) {
+      if (e instanceof MissionTransitionError) {
+        console.log(`ℹ️ checkTransferDeadlines: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
+        continue;
+      }
+      throw e;
     }
 
     // Pénalité aggravée sur l'Œil 1 si pendant mission
