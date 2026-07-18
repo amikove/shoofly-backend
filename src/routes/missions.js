@@ -969,16 +969,22 @@ router.post('/:id/status', authenticate, [
   if (req.user.role === 'oeil' && mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
   if (req.user.role === 'client' && mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
 
-  const transitions = {
-  pending:  ['cancelled'],
-  assigned: ['en_route', 'cancelled'],
-  en_route: ['active',   'cancelled'],
-  active:   ['completed','cancelled'],
-};
+  // Filtre PROPRE À CETTE ROUTE (distinct de la table centrale de missionStateMachine.js) :
+  // limite volontairement le périmètre de cet endpoint générique aux 4 statuts de
+  // progression normale. En particulier, exclut sous_reclamation même si la table
+  // centrale autorise sous_reclamation -> completed/cancelled ailleurs (via
+  // PUT /admin/claims/:missionId/resolve, qui a sa propre logique d'arbitrage et de
+  // crédit wallet) — sans ce filtre, un Œil pourrait clôturer lui-même une mission
+  // contestée en contournant la résolution admin.
+  const allowedFromThisRoute = {
+    pending:  ['cancelled'],
+    assigned: ['en_route', 'cancelled'],
+    en_route: ['active',   'cancelled'],
+    active:   ['completed','cancelled'],
+  };
 
-
-const { status, cancel_reason } = req.body;
-  if (!transitions[mission.status]?.includes(status))
+  const { status, cancel_reason } = req.body;
+  if (!allowedFromThisRoute[mission.status]?.includes(status))
     return res.status(400).json({ error: `Transition invalide: ${mission.status} → ${status}` });
 
   // Seul l'Œil assigné fait progresser la mission dans le sens normal — le client
@@ -1013,18 +1019,37 @@ const { status, cancel_reason } = req.body;
     }
   }
 
-  const { rows: [updated] } = await db.query(`
-    UPDATE missions SET
-      status=$1,
-        completed_at = CASE WHEN $1='completed' THEN NOW() ELSE completed_at END,
-        cancelled_at = CASE WHEN $1='cancelled' THEN NOW() ELSE cancelled_at END,
-        cancel_reason= CASE WHEN $1='cancelled' THEN $2 ELSE cancel_reason END,
-        started_at   = CASE WHEN $1='active'    THEN NOW() ELSE started_at END,
-        is_priority  = CASE WHEN $1 IN ('cancelled','completed') THEN false ELSE is_priority END,
-        updated_at   = NOW()
-      WHERE id=$3 AND status=$4 RETURNING *
-  `, [status, cancel_reason||null, mission.id, mission.status]);
-  if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+  // Champs conditionnels recalculés en JS (transitionMission ne prend que des valeurs
+  // statiques par écriture, pas d'expression SQL type CASE WHEN) — équivalent exact
+  // du CASE WHEN $1=... précédent, un seul statut cible possible par appel.
+  const extraFields = { updated_at: 'NOW()' };
+  if (status === 'completed') { extraFields.completed_at = 'NOW()'; extraFields.completed_by_oeil_at = 'NOW()'; }
+  if (status === 'cancelled') { extraFields.cancelled_at = 'NOW()'; extraFields.cancel_reason = cancel_reason || null; }
+  if (status === 'active') extraFields.started_at = 'NOW()';
+  if (['cancelled', 'completed'].includes(status)) extraFields.is_priority = false;
+  delete extraFields.updated_at; // déjà géré systématiquement par transitionMission
+
+  // Garde de propriété atomique pour les transitions réservées à l'Œil assigné (le
+  // statut seul suffisait jusqu'ici car aucune autre route ne change oeil_id sans
+  // changer aussi status — cf. audit ME-002 sur cette fragilité implicite).
+  const extraGuards = ['en_route', 'active', 'completed'].includes(status) ? { oeil_id: req.user.id } : {};
+
+  const completedNote = status === 'completed' ? 'Mission terminée par l\'Œil' : null;
+
+  let updated;
+  try {
+    updated = await transitionMission(db, mission.id, mission.status, status, req.user.id, {
+      extraFields,
+      extraGuards,
+      note: completedNote,
+    });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) {
+      const httpStatus = e.code === 'INVALID_TRANSITION' ? 400 : 409;
+      return res.status(httpStatus).json({ error: e.message });
+    }
+    throw e;
+  }
 
   // Démarrage réel de la mission : on ouvre la première ligne de la chaîne de transferts,
   // point de départ indispensable pour calculer un split correct si la mission est transférée
@@ -1043,11 +1068,6 @@ const { status, cancel_reason } = req.body;
         [updated.id, updated.oeil_id]
       );
     }
-  }
-
-  // Logger le changement de statut (sauf completed géré plus bas)
-  if (status !== 'completed') {
-    await logStatus(db, mission.id, status, req.user.id, null);
   }
 
   // Remboursement en cas d'annulation — dépend de QUI est à l'origine de l'annulation,
@@ -1115,11 +1135,6 @@ const { status, cancel_reason } = req.body;
 // Oeil marque terminée → démarrer le délai de 12h pour réclamation
 
   if (status === 'completed' && mission.oeil_id) {
-    await db.query(
-      `UPDATE missions SET completed_by_oeil_at=NOW() WHERE id=$1`,
-      [mission.id]
-    );
-    await logStatus(db, mission.id, 'completed', req.user.id, 'Mission terminée par l\'Œil');
     await db.query(
       `UPDATE oeil_profiles SET total_missions=total_missions+1 WHERE user_id=$1`,
       [mission.oeil_id]
