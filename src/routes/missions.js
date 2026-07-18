@@ -1582,19 +1582,15 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
 
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [oeil_id]);
 
-  const { rowCount: assignRowCount } = await db.query(`
-      UPDATE missions SET
-        oeil_id=$1,
-        status='assigned',
-        assigned_at=NOW(),
-        is_priority=false,
-        transfer_deadline=NULL,
-        updated_at=NOW()
-      WHERE id=$2 AND status='pending'
-    `, [oeil_id, mission.id]);
-  if (assignRowCount === 0) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
-
-  await logStatus(db, mission.id, 'assigned', req.user.id, 'Affectation manuelle par admin');
+  try {
+    await transitionMission(db, mission.id, 'pending', 'assigned', req.user.id, {
+      extraFields: { oeil_id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null },
+      note: 'Affectation manuelle par admin',
+    });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+    throw e;
+  }
 
   await notify(db, oeil_id,
     '📋 Mission assignée par admin',
