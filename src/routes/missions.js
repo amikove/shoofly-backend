@@ -112,10 +112,13 @@ router.post('/:id/claim', authenticate, asyncHandler(async (req, res) => {
   const emitToUser = req.app.get('emitToUser');
 
 
-  const { rowCount } = await db.query(`UPDATE missions SET status='sous_reclamation', updated_at=NOW() WHERE id=$1 AND status='completed'`, [req.params.id]);
-  if (rowCount === 0) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+  try {
+    await transitionMission(db, mission.id, 'completed', 'sous_reclamation', req.user.id, { note: 'Réclamation client' });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+    throw e;
+  }
   await db.query(`INSERT INTO claims (mission_id, client_id, comment) VALUES ($1, $2, $3)`, [req.params.id, req.user.id, comment.trim()]);
-  await logStatus(db, mission.id, 'sous_reclamation', req.user.id, 'Réclamation client');
   
 
   // Notifier les admins
