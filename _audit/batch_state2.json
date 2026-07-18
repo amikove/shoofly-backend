@@ -1,0 +1,42 @@
+{
+  "s27": {
+    "missionId": "28dfcc5b-086b-4b73-9449-9f6b23de6432",
+    "oeilId": "84c4b848-1469-4e7f-b8fe-c8d1768fd58d",
+    "price": 320,
+    "balanceBefore": 0
+  },
+  "s29": {
+    "missionId": "6787c56f-d3b7-44bd-9502-a771928636cf",
+    "oeilId": "f6452886-d44e-4bdc-b3f7-ea7829e71084",
+    "price": 280,
+    "balanceBefore": 0
+  },
+  "s31": {
+    "missionId": "61c6c597-a27a-44e9-8f09-35c854bb83c0",
+    "bestOeilId": "a8c54b0e-6a50-4b59-8633-5d865b8ea789",
+    "worstOeilId": "bb859e44-f086-454a-b734-36ab83f6e4aa",
+    "originalOeilId": "51e4a558-9c92-4d7a-8baa-3a70c86117c0"
+  },
+  "s32": {
+    "missionId": "4111090c-1ec1-48b2-9e2c-5c75fc2040f6",
+    "chosenOeilId": "be87cb72-55a2-407f-a5f6-b86593369b8b",
+    "statusAfterHire": "assigned",
+    "windowClearedImmediately": true
+  },
+  "s33": {
+    "missionId": "53ddf458-141f-436f-ab7f-236a1e68a028",
+    "onlyCandidateId": "b744d95c-932f-4602-bb90-ab14a10f3f9a",
+    "originalOeilId": "93401d1e-4261-4b88-81f8-485b75a0704d"
+  },
+  "s34": {
+    "missionId": "42c40218-ca81-445c-8426-e7d46a439e2d",
+    "acceptStatus": 400,
+    "acceptError": "Cette mission est en phase de sélection de remplaçant, merci de manifester votre intérêt via le bouton dédié plutôt que d'accepter directement."
+  },
+  "s44": {
+    "missionId": "3ba3673a-1830-4c5c-a920-5a1185ff711f",
+    "oeilId": "4522022a-8aff-469e-96b8-60c43b1b2fb0",
+    "editRequestId": 22,
+    "originalTitle": "Batch2 — jo6axl"
+  }
+}

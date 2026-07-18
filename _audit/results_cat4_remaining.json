@@ -1,0 +1,32 @@
+[
+  {
+    "scenario": "4.1 — Mission pending, client modifie → application immédiate",
+    "expected": "HTTP 200, applied=true, titre/adresse mis à jour immédiatement, pas de mission_edit_requests créée",
+    "observed": "HTTP 200, applied=true, titre=\"Titre modifié immédiatement — 4.1\"",
+    "ok": true
+  },
+  {
+    "scenario": "4.2 — Mission assigned, client modifie, Œil APPROUVE → changements appliqués, AUCUNE pénalité, AUCUN mouvement financier",
+    "expected": "titre appliqué=\"Titre modifié après approbation — 4.2\", status reste assigned, reliability_events count inchangé (1), wallet_transactions count inchangé (54)",
+    "observed": "HTTP approve=200, titre=\"Titre modifié après approbation — 4.2\", status=assigned, oeil_id inchangé=true, reliability_events=1, wallet_transactions=54",
+    "ok": true
+  },
+  {
+    "scenario": "4.3 — Mission assigned, client modifie, Œil REFUSE → repasse pending/oeil_id=NULL (même id), aucune pénalité",
+    "expected": "même id mission (20ed143a-ec4e-4bbe-bb93-6c6d34b12ede), status=pending, oeil_id=NULL, titre INCHANGÉ (proposition rejetée, pas appliquée), reliability_events inchangé (1)",
+    "observed": "HTTP reject=200, id=20ed143a-ec4e-4bbe-bb93-6c6d34b12ede, status=pending, oeil_id=null, titre=\"Cat4 — nrgoag\", reliability_events=1",
+    "ok": true
+  },
+  {
+    "scenario": "4.5 — Tentative de modifier price/type/subcategory → rejeté 400",
+    "expected": "HTTP 400 pour les 3 tentatives, \"Champs non modifiables après création\"",
+    "observed": "price: HTTP 400 (Champs non modifiables après création : price), type: HTTP 400, subcategory: HTTP 400",
+    "ok": true
+  },
+  {
+    "scenario": "4.6 — Tentative de 2e demande de modification pendant qu'une est en attente → rejeté 409",
+    "expected": "HTTP 202 (1ère), puis HTTP 409 \"Une demande de modification est déjà en attente\" (2e)",
+    "observed": "1ère: HTTP 202, 2e: HTTP 409 (Une demande de modification est déjà en attente de réponse de l'Œil. Merci d'attendre sa résolution avant d'en soumettre une nouvelle.)",
+    "ok": true
+  }
+]

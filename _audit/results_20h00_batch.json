@@ -1,0 +1,32 @@
+[
+  {
+    "scenario": "1.2 — Auto-validation cron (client ne valide pas) : paiement identique au cas manuel",
+    "expected": "validated_at renseigné, credit 208.00 exact, reason=\"Validation automatique après délai\"",
+    "observed": "validated_at=renseigné, wallet: credit 208.00 (Validation automatique après délai), delta balance=+208",
+    "ok": true
+  },
+  {
+    "scenario": "7.1 — Ticket normal, auto-résolution après délai configuré",
+    "expected": "status=resolved, resolved_by=NULL, message système ajouté",
+    "observed": "status=resolved, resolved_by=null, dernier message=\"Ticket résolu automatiquement après 72h sans réponse de votre part.\" (is_system=true)",
+    "ok": true
+  },
+  {
+    "scenario": "7.2 — Ticket urgent (is_urgent=true) : NE DOIT JAMAIS auto-résoudre",
+    "expected": "status reste in_progress malgré le délai dépassé",
+    "observed": "status=in_progress, is_urgent=true",
+    "ok": true
+  },
+  {
+    "scenario": "6.2 — Rappels à délai (mission sans Œil 12h) : absence de réaction ne bloque PAS le cron pour les autres missions",
+    "expected": "les 2 missions orphelines reçoivent CHACUNE leur notification (aucune ne bloque le traitement de l'autre), stale_notified_at renseigné pour les 2",
+    "observed": "notifications par mission: [{\"mission_id\":\"2e367c06-0890-4778-96e6-e587a642be84\",\"n\":4},{\"mission_id\":\"89d7b320-2159-4a13-a7aa-62cfbb0a02d7\",\"n\":4}], stale_notified_at: m0=oui, m1=oui",
+    "ok": true
+  },
+  {
+    "scenario": "6.1 (complément) — edit_request_expired : expiration auto déclenche bien sendWhatsAppTemplate au bon moment",
+    "expected": "edit_request.status=expired, mission repasse pending/oeil_id=NULL (déclenche le WhatsApp au client)",
+    "observed": "edit_request.status=expired, mission.status=pending, oeil_id=null",
+    "ok": true
+  }
+]

@@ -1,0 +1,35 @@
+[
+  {
+    "event": "oeil_applied",
+    "trigger": "Œil s6_oeil0_1784401132911_9677@test.local postule sur mission fefd0c7c-4c58-4989-872e-d91ece9b8e3b",
+    "httpStatus": 201,
+    "ok": true
+  },
+  {
+    "event": "edit_request_approved",
+    "trigger": "Œil s6_oeil1_1784401132911_4069@test.local approuve la modification sur be9bd012-1ad0-4e37-ab59-42cdb82e591f",
+    "httpStatus": 200,
+    "ok": true
+  },
+  {
+    "event": "edit_request_rejected",
+    "trigger": "Œil s6_oeil2_1784401132911_8081@test.local refuse la modification sur 45ef619a-dba1-4935-96e8-f266afe68c1f",
+    "httpStatus": 200,
+    "ok": true
+  },
+  {
+    "event": "mission_completed_client",
+    "trigger": "Œil s6_oeil3_1784401132911_4168@test.local termine la mission 1fb69c2b-0689-4f66-8e2d-9c2a0704b1ee",
+    "httpStatus": 200,
+    "ok": true
+  },
+  {
+    "event": "edit_request_expired",
+    "trigger": "edit_request 28 sur 5ec20ddb-4a8f-453f-8283-5cdd4031c3bf (attente cron */5min)",
+    "httpStatus": 202,
+    "ok": true,
+    "pending": true,
+    "editRequestId": 28,
+    "missionId": "5ec20ddb-4a8f-453f-8283-5cdd4031c3bf"
+  }
+]

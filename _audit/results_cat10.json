@@ -1,0 +1,21 @@
+[
+  {
+    "scenario": "10.1 — Double-clic (2 appels /validate strictement concurrents) → une seule action effective",
+    "expected": "exactement 1 des 2 réussit (HTTP 200), l'autre échoue proprement (409/400), 1 SEULE ligne wallet_transactions, delta balance = oeil_earning exact (240.00), PAS le double",
+    "observed": "r1=HTTP 200, r2=HTTP 400, lignes wallet=1, delta balance=+240",
+    "ok": true
+  },
+  {
+    "scenario": "10.2 — Deux admins simultanés sur la même mission (l'un annule, l'autre assigne) → pas d'état incohérent",
+    "expected": "état final cohérent : SOIT cancelled (oeil_id=NULL), SOIT assigned (oeil_id défini, cancelled_at=NULL) — jamais les deux à la fois",
+    "observed": "cancel=HTTP 200, assign=HTTP 409, état final: status=cancelled, oeil_id=null, cancelled_at=Sat Jul 18 2026 19:44:19 GMT+0100 (UTC+01:00)",
+    "ok": true
+  },
+  {
+    "scenario": "10.3 — Œil désactivé (is_active=false) alors qu'une mission est EN COURS (active) : réaffectation automatique et absence de pénalité",
+    "expected": "un mécanisme réaffecte automatiquement la mission à un autre Œil, sans pénalité pour celui désactivé",
+    "observed": "toggle HTTP 200 (is_active=false), Œil bloqué par auth (tentative status→completed): HTTP 401 \"Compte introuvable ou suspendu\", mission INCHANGÉE: status=active oeil_id=(toujours le même Œil, mission non réaffectée), événements fiabilité=0, débit wallet=0",
+    "ok": false,
+    "diagnostic": "Aucun cron ni route ne surveille les missions actives dont l'Œil assigné a is_active=false. La mission reste bloquée indéfiniment (l'Œil ne peut plus agir dessus, aucune autre logique ne la reprend) jusqu'à intervention manuelle d'un admin. Le cron H+30 (late-start) existe mais ne couvre QUE les missions encore au statut 'assigned' (pas encore démarrées) et applique une pénalité de -100 MAD + -20 fiabilité à l'Œil — ce qui contredirait 'aucune pénalité pour lui' si l'Œil avait simplement été désactivé sans faute de sa part. Absence de fonctionnalité plutôt que bug d'une fonctionnalité existante — signalé pour décision produit plutôt que corrigé unilatéralement dans ce passage."
+  }
+]
