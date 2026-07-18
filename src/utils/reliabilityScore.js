@@ -43,18 +43,24 @@ async function computeReliabilityScore(db, oeilId) {
   if (totalMissions === 0) return 90; // score de départ
 
   // Score historique complet
-    // Chaque événement est plafonné à ±10 dans ce calcul : la formule suppose une échelle -10/+10,
-    // donc une pénalité plus sévère (ex: -15, -25...) ne doit pas faire s'effondrer le score de façon
-    // disproportionnée avec un petit historique — le barème réel reste inchangé en base (reliability_events).
+    // Chaque événement "normal" est plafonné à ±10 dans ce calcul : la formule suppose une
+    // échelle -10/+10, donc une pénalité plus sévère (ex: -15, -25...) ne doit pas faire
+    // s'effondrer le score de façon disproportionnée avec un petit historique — le barème réel
+    // reste inchangé en base (reliability_events). L'événement de reset (réintégration) est
+    // différent par nature : son `points` stocke directement le pourcentage cible exact (0-100),
+    // pas un delta ±10 — le traiter comme un événement normal (÷10 puis ×10 lors de l'arrondi
+    // en points entiers) perdait jusqu'à 5 points de précision (ex: cible 65% → 70% obtenu,
+    // constaté empiriquement, audit scénario 5.3a). pctContribution() unifie les deux cas sur
+    // une échelle 0-100 commune ; mathématiquement équivalent à l'ancienne formule pour tout
+    // événement normal (clamp(points)*10 / totalMissions == clamp(points)/(totalMissions*10)*100).
     const clamp = (v) => Math.max(-10, Math.min(10, v));
-    const sumAll = allEvents.reduce((s, e) => s + clamp(e.points), 0);
-    const maxAll = totalMissions * 10;
-    const scoreHistorique = maxAll > 0 ? (sumAll / maxAll) * 100 : 90;
+    const pctContribution = (e) => e.is_reset ? e.points : clamp(e.points) * 10;
+    const sumAll = allEvents.reduce((s, e) => s + pctContribution(e), 0);
+    const scoreHistorique = totalMissions > 0 ? sumAll / totalMissions : 90;
     // Score sur les 20 dernières missions
     const last20 = allEvents.slice(-20);
-    const sum20 = last20.reduce((s, e) => s + clamp(e.points), 0);
-    const max20 = last20.length * 10;
-    const score20 = max20 > 0 ? (sum20 / max20) * 100 : 90;
+    const sum20 = last20.reduce((s, e) => s + pctContribution(e), 0);
+    const score20 = last20.length > 0 ? sum20 / last20.length : 90;
 
   // Pondération : 70% récent, 30% historique
   let finalScore = (0.7 * score20) + (0.3 * scoreHistorique);
@@ -125,9 +131,10 @@ function getReliabilityLevel(score) {
 // plutôt que d'écraser reliability_score directement (ce qui serait effacé au prochain événement).
 async function reactivateWithCorrectiveEvent(db, oeilId, targetScore, adminId) {
   // Événement de "reset" : le calcul du score ignorera tout l'historique avant ce point.
-  // Le point de l'événement (targetScore/10, entre 0 et 10) reste dans les bornes du clamp ±10,
-  // donc il compte pour sa pleine valeur au recalcul — pas de plafonnement qui viendrait l'annuler.
-  const resetPoints = Math.round(Math.max(0, Math.min(100, targetScore)) / 10);
+  // Son `points` stocke directement le pourcentage cible (0-100), lu tel quel par
+  // computeReliabilityScore (pctContribution) — jamais divisé par 10 puis remultiplié, ce qui
+  // limitait auparavant les cibles exactement atteignables aux seuls multiples de 10.
+  const resetPoints = Math.round(Math.max(0, Math.min(100, targetScore)));
   await db.query(
     `INSERT INTO reliability_events (oeil_id, mission_id, points, reason, is_grave, is_reset)
      VALUES ($1, NULL, $2, $3, false, true)`,
