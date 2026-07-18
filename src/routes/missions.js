@@ -383,10 +383,39 @@ router.post('/', authenticate, requireRole('client'), [
 const id = uuidv4();
   let { commission, oeil_earning } = await pricing(+original_price || +price, db);
 
-  // Si code promo gratuit — Shoofly paie l'Œil
-  if (promo_code && +price === 0 && platform_amount) {
-    oeil_earning = parseFloat(platform_amount);
-    commission   = 0;
+  // Code promo gratuit — Shoofly paie l'Œil de sa poche. Le code doit être réel, actif,
+  // de type 'free', non expiré et pas déjà épuisé par ce client : ne jamais faire confiance
+  // au platform_amount envoyé par le client. Avant ce correctif, un client pouvait soumettre
+  // n'importe quel promo_code inexistant + price=0 + platform_amount arbitraire et obtenir
+  // une dépense réelle fabriquée (constaté empiriquement : 99999 MAD avec un code fictif —
+  // audit scénario 9.2). Le montant utilisé est désormais TOUJOURS celui stocké côté serveur
+  // sur promo_codes.platform_amount, jamais celui du corps de la requête.
+  let freePromo = null;
+  if (promo_code && +price === 0) {
+    const { rows: [p] } = await db.query(
+      `SELECT * FROM promo_codes WHERE UPPER(code)=UPPER($1) AND is_active=true`, [promo_code]
+    );
+    if (!p || p.type !== 'free') {
+      return res.status(400).json({ error: 'Code promo invalide pour une mission gratuite' });
+    }
+    if (p.expires_at && new Date(p.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Code promo expiré' });
+    }
+    if (p.max_uses && p.used_count >= p.max_uses) {
+      return res.status(400).json({ error: 'Code promo épuisé' });
+    }
+    const { rows: [usage] } = await db.query(
+      `SELECT COUNT(*)::int AS n FROM promo_uses WHERE promo_id=$1 AND user_id=$2`, [p.id, req.user.id]
+    );
+    if (usage.n >= p.max_uses_per_user) {
+      return res.status(400).json({ error: 'Vous avez déjà utilisé ce code' });
+    }
+    if (!p.platform_amount) {
+      return res.status(400).json({ error: "Ce code promo n'a pas de montant configuré" });
+    }
+    freePromo = p;
+    oeil_earning = parseFloat(p.platform_amount);
+    commission = 0;
   }
 
 const status = oeil_id ? 'assigned' : 'pending';
@@ -409,10 +438,11 @@ const { rows: [mission] } = await db.query(`
 
 // Mission offerte via code promo gratuit : Shoofly paie l'Œil de sa poche, sans commission générée.
 // On enregistre ce coût comme une dépense pour qu'il reste visible dans le Dashboard Financier.
-if (promo_code && +price === 0 && platform_amount) {
+// Montant = freePromo.platform_amount (validé côté serveur ci-dessus), jamais une valeur cliente.
+if (freePromo) {
   await db.query(
     `INSERT INTO expenses (amount, category, description, expense_date, created_by) VALUES ($1, $2, $3, $4, $5)`,
-    [parseFloat(platform_amount), 'Promotions', `[Généré automatiquement] Mission offerte "${title}" — code promo ${promo_code}`, new Date().toISOString().slice(0, 10), null]
+    [freePromo.platform_amount, 'Promotions', `[Généré automatiquement] Mission offerte "${title}" — code promo ${freePromo.code}`, new Date().toISOString().slice(0, 10), null]
   );
 }
 
@@ -1531,6 +1561,14 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
     if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
     throw e;
   }
+
+  // Supprime la propre candidature de l'Œil sur cette mission — sans ça, sa ligne
+  // mission_interests (posée avant son embauche initiale) reste éligible et le cron de
+  // sélection automatique (index.js, */2min) peut le réassigner lui-même à la mission
+  // qu'il vient de signaler ne pas pouvoir honorer. Pour un transfert 'during', le cooldown
+  // posé plus bas masque l'effet par accident ; pour 'before' (aucun cooldown posé), rien
+  // d'autre ne l'empêchait — bug constaté empiriquement (audit scénario 2.9).
+  await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, req.user.id]);
 
 // Transfert pendant mission : ferme la ligne active de la chaîne (le nouvel Œil n'est pas
     // encore connu à ce stade — la nouvelle ligne sera ouverte au moment où quelqu'un accepte
