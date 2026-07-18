@@ -13,10 +13,15 @@
 const { logStatus } = require('./missionHistory');
 
 const TRANSITIONS = {
+  // pending -> assigned : embauche (hireOeilCore, self-accept, affectation admin)
+  // pending -> cancelled : expiration sans remplaçant, annulation depuis la file d'attente
   pending:          ['assigned', 'cancelled'],
+  // assigned -> pending : refus, transfert avant démarrage, edit-request refusée/expirée
   assigned:         ['pending', 'en_route', 'cancelled'],
-  en_route:         ['active', 'cancelled'],
-  active:           ['completed', 'cancelled'],
+  // en_route/active -> pending : transfert signalé en cours de route ou en cours de mission
+  // (POST /:id/transfer autorise le transfert depuis ces 2 statuts, pas seulement 'assigned')
+  en_route:         ['pending', 'active', 'cancelled'],
+  active:           ['pending', 'completed', 'cancelled'],
   completed:        ['sous_reclamation'],
   sous_reclamation: ['completed', 'cancelled'],
   cancelled:        [],

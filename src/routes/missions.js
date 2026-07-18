@@ -1472,20 +1472,24 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   // Remettre la mission en pending avec flag priorité — vérifié et appliqué
   // avant de toucher au compte de l'Œil, pour ne pas lui imputer un cooldown
   // si la mission a en fait déjà changé de statut entre-temps.
-  const { rowCount: transferRowCount } = await db.query(`
-    UPDATE missions SET
-      status='pending',
-      is_priority=true,
-      transfer_type=$1,
-      transferred_from=$2,
-      transfer_reason=$3,
-      transfer_deadline=$4,
-      candidate_window_ends_at=$5,
-      oeil_id=NULL,
-      updated_at=NOW()
-    WHERE id=$6 AND status=$7
-  `, [transferType, req.user.id, reason, deadline, candidateWindowEndsAt, mission.id, mission.status]);
-  if (transferRowCount === 0) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+  try {
+    await transitionMission(db, mission.id, mission.status, 'pending', req.user.id, {
+      extraFields: {
+        is_priority: true,
+        transfer_type: transferType,
+        transferred_from: req.user.id,
+        transfer_reason: reason,
+        transfer_deadline: deadline,
+        candidate_window_ends_at: candidateWindowEndsAt,
+        oeil_id: null,
+      },
+      extraGuards: { oeil_id: req.user.id },
+      note: `Empêchement signalé par l'Œil (${transferType === 'before' ? 'avant démarrage' : 'en cours de mission'})`,
+    });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+    throw e;
+  }
 
 // Transfert pendant mission : ferme la ligne active de la chaîne (le nouvel Œil n'est pas
     // encore connu à ce stade — la nouvelle ligne sera ouverte au moment où quelqu'un accepte
