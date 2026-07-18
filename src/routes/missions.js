@@ -1740,12 +1740,16 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   // candidate_window_ends_at remis à NULL ici (même en dehors du cron) pour qu'une
   // sélection manuelle par le client n'importe quand pendant la fenêtre "choose"
   // empêche définitivement le cron de rejouer une sélection automatique ensuite.
-  const { rows: [updated] } = await db.query(
-    `UPDATE missions SET oeil_id=$1, status='assigned', assigned_at=NOW(), is_priority=false, transfer_deadline=NULL, candidate_window_ends_at=NULL, updated_at=NOW()
-     WHERE id=$2 AND status='pending' RETURNING *`,
-    [oeilId, mission.id]
-  );
-  if (!updated) return { ok: false, status: 409, error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' };
+  let updated;
+  try {
+    updated = await transitionMission(db, mission.id, 'pending', 'assigned', changedById, {
+      extraFields: { oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null },
+      note: historyNote,
+    });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) return { ok: false, status: 409, error: e.message };
+    throw e;
+  }
 
     // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
     // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
@@ -1760,8 +1764,6 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
         [updated.id, updated.oeil_id, nextOrder]
       );
     }
-
-  await logStatus(db, mission.id, 'assigned', changedById, historyNote);
 
   // Supprimer les intérêts en conflit de créneau
   const { rows: conflictInterests } = await db.query(`
