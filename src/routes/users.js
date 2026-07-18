@@ -1721,25 +1721,33 @@ router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('a
     return res.status(400).json({ error: 'Montant invalide' });
   }
 
-  const { rows: [profile] } = await db.query(
-    `SELECT balance FROM oeil_profiles WHERE user_id=$1`, [req.params.oeilId]
-  );
-  if (!profile) return res.status(404).json({ error: 'Œil introuvable' });
-  if (parseFloat(profile.balance) < amount) {
-    return res.status(400).json({ error: 'Solde insuffisant pour ce montant' });
+  // Même défaut que l'ancien bug withdraw (commit f6e7376) : lecture du solde puis
+  // update séparés, sans verrou — deux virements admin simultanés sur le même Œil
+  // pouvaient tous deux passer la vérification avant que le premier ne soit committé.
+  // walletService.debit() fait SELECT ... FOR UPDATE + vérification + update + ledger
+  // dans une seule transaction.
+  let transaction;
+  try {
+    await walletService.withTransaction(db, async (client) => {
+      const { rows: [profile] } = await client.query(
+        `SELECT 1 FROM oeil_profiles WHERE user_id=$1`, [req.params.oeilId]
+      );
+      if (!profile) { const err = new Error('Œil introuvable'); err.code = 'NOT_FOUND'; throw err; }
+
+      await walletService.debit(client, req.params.oeilId, 'oeil', amount, 'Virement bancaire');
+      const { rows: [row] } = await client.query(
+        `SELECT * FROM wallet_transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,
+        [req.params.oeilId]
+      );
+      transaction = row;
+    });
+  } catch (e) {
+    if (e.code === 'NOT_FOUND') return res.status(404).json({ error: e.message });
+    if (e.code === 'INSUFFICIENT_BALANCE') return res.status(400).json({ error: 'Solde insuffisant pour ce montant' });
+    throw e;
   }
 
-  await db.query(
-    `UPDATE oeil_profiles SET balance=balance-$1 WHERE user_id=$2`,
-    [amount, req.params.oeilId]
-  );
-
-  const { rows: [transaction] } = await db.query(
-    `INSERT INTO wallet_transactions (user_id, type, amount, reason)
-     VALUES ($1, 'debit', $2, 'Virement bancaire') RETURNING *`,
-    [req.params.oeilId, amount]
-  );
-
+  // Notification APRÈS le commit (règle de périmètre des transactions).
   await db.query(
     `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
      VALUES ($1, '💰 Virement effectué', $2, 'success', 'gains_page', $3, $4, $5)`,
