@@ -813,19 +813,20 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
   if (!profile?.is_verified) return res.status(403).json({ error: 'Profil non vérifié' });
 
   
-  const { rows: [updated] } = await db.query(
-  `UPDATE missions SET
-          oeil_id=$1,
-          oeil2_id=CASE WHEN is_priority=true AND transferred_from IS NOT NULL THEN $1 ELSE oeil2_id END,
-          status='assigned',
-          assigned_at=NOW(),
-          is_priority=false,
-          transfer_deadline=NULL,
-          updated_at=NOW()
-        WHERE id=$2 AND status='pending' RETURNING *`,
-      [req.user.id, req.params.id]
-    );
-    if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+    // Valeur calculée ici (dépend de is_priority/transferred_from lus juste au-dessus)
+    // car transitionMission ne prend que des valeurs statiques, pas des expressions SQL.
+    const oeil2Id = (mission.is_priority === true && mission.transferred_from !== null) ? req.user.id : mission.oeil2_id;
+
+    let updated;
+    try {
+      updated = await transitionMission(db, req.params.id, 'pending', 'assigned', req.user.id, {
+        extraFields: { oeil_id: req.user.id, oeil2_id: oeil2Id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null },
+        note: 'Acceptée directement par l\'Œil',
+      });
+    } catch (e) {
+      if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+      throw e;
+    }
 
     // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
     // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
@@ -840,8 +841,6 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
         [updated.id, req.user.id, nextOrder]
       );
     }
-
-  await logStatus(db, req.params.id, 'assigned', req.user.id, 'Œil sélectionné par le client');
 
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [req.user.id]);
   const oeilName = `${oeil.first_name} ${oeil.last_name}`;
