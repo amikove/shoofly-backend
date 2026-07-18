@@ -1404,12 +1404,13 @@ await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${
       const percent = parseFloat(bs.five_star_bonus_percent || '10');
       const bonus = Math.round(parseFloat(mission.oeil_earning) * (percent / 100) * 100) / 100;
       if (bonus > 0) {
-        await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [bonus, mission.oeil_id]);
-        await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Bonus qualité — note 5 étoiles',$3)`, [mission.oeil_id, bonus, mission.id]);
-        await db.query(
-          `INSERT INTO expenses (amount, category, description, expense_date, created_by) VALUES ($1, $2, $3, $4, $5)`,
-          [bonus, 'Marketing', `[Généré automatiquement] Bonus qualité 5 étoiles — mission "${mission.title}"`, new Date().toISOString().slice(0, 10), null]
-        );
+        await walletService.withTransaction(db, async (client) => {
+          await walletService.credit(client, mission.oeil_id, 'oeil', bonus, 'Bonus qualité — note 5 étoiles', mission.id);
+          await client.query(
+            `INSERT INTO expenses (amount, category, description, expense_date, created_by) VALUES ($1, $2, $3, $4, $5)`,
+            [bonus, 'Marketing', `[Généré automatiquement] Bonus qualité 5 étoiles — mission "${mission.title}"`, new Date().toISOString().slice(0, 10), null]
+          );
+        });
         await notify(db, mission.oeil_id, `Bonus qualité 5 étoiles 🎁`, `+${bonus} MAD de bonus pour "${mission.title}" — merci pour votre excellent travail !`, 'bonus', mission.id, emitToUser, null, 'fiveStarBonusTitle', 'fiveStarBonusBody', { amount: bonus, missionTitle: mission.title });
       }
     }
