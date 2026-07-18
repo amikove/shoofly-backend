@@ -4,7 +4,8 @@ const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const { refundOnCancellation } = require('../utils/refund');
-const { logStatus } = require('../utils/missionHistory');
+const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
+const walletService = require('../services/walletService');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
 const { getSetting, invalidateSettingsCache } = require('../utils/settings');
@@ -1418,6 +1419,45 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
   if (mission.status !== 'sous_reclamation') return res.status(409).json({ error: 'Cette réclamation a déjà été traitée' });
 
+  // Écritures DB interdépendantes (statut, solde, ledger, claims) dans une seule
+  // transaction — la garde optimiste de transitionMission (WHERE status=$X) protège
+  // contre deux admins résolvant la même réclamation simultanément (la 2e requête
+  // reçoit STALE_STATE -> 409, aucune double écriture possible).
+  let refund;
+  try {
+    await walletService.withTransaction(db, async (client) => {
+      if (decision === 'oeil') {
+        await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Mission validée après réclamation', mission.id);
+        await transitionMission(client, mission.id, 'sous_reclamation', 'completed', req.user.id, {
+          extraFields: { validated_at: 'NOW()', is_priority: false },
+          note: 'Réclamation résolue en faveur de l\'Œil',
+        });
+        await client.query(`UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
+      } else {
+        // Réclamation gagnée par le client, non imputable à lui : remboursement intégral
+        refund = await refundOnCancellation(client, mission, false, 'Remboursement suite à réclamation');
+        await transitionMission(client, mission.id, 'sous_reclamation', 'cancelled', req.user.id, {
+          extraFields: { is_priority: false },
+          note: 'Réclamation résolue en faveur du client',
+        });
+        await client.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
+        // Fermer automatiquement tout signalement encore ouvert lié à cette mission —
+        // la mission étant annulée, le problème signalé est désormais sans objet.
+        await client.query(
+          `UPDATE mission_problem_reports SET status='resolved', admin_note=COALESCE(admin_note, 'Résolu automatiquement suite à l''annulation de la mission'), resolved_by=$1, resolved_at=NOW()
+             WHERE mission_id=$2 AND status IN ('open','in_progress')`,
+          [req.user.id, mission.id]
+        );
+        await client.query(`UPDATE missions SET under_surveillance=false WHERE id=$1`, [mission.id]);
+      }
+    });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+    throw e;
+  }
+
+  // Notifications APRÈS le commit — jamais dans la transaction (règle de périmètre :
+  // pas d'appel réseau/lent pendant qu'une connexion DB est retenue).
   const emitToUser = req.app.get('emitToUser');
   const notify = async (userId, title, body, titleKey = null, bodyKey = null, params = null) => {
     await db.query(
@@ -1428,27 +1468,9 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   }
 
   if (decision === 'oeil') {
-    await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
-    await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Mission validée après réclamation',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
-    await db.query(`UPDATE missions SET status='completed', validated_at=NOW(), is_priority=false, updated_at=NOW() WHERE id=$1`, [mission.id]);
-    await db.query(`UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
-    await logStatus(db, mission.id, 'completed', req.user.id, 'Réclamation résolue en faveur de l\'Œil');
     await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.', 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
     await notify(mission.client_id, 'Réclamation résolue', 'Résolue en faveur de l\'Œil.', 'claimResolvedClientLoseTitle', 'claimResolvedClientLoseBody', null);
   } else {
-    // Réclamation gagnée par le client, non imputable à lui : remboursement intégral
-    const refund = await refundOnCancellation(db, mission, false, 'Remboursement suite à réclamation');
-    await db.query(`UPDATE missions SET status='cancelled', is_priority=false, updated_at=NOW() WHERE id=$1`, [mission.id]);
-    await db.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
-    await logStatus(db, mission.id, 'cancelled', req.user.id, 'Réclamation résolue en faveur du client');
-    // Fermer automatiquement tout signalement encore ouvert lié à cette mission —
-    // la mission étant annulée, le problème signalé est désormais sans objet.
-    await db.query(
-      `UPDATE mission_problem_reports SET status='resolved', admin_note=COALESCE(admin_note, 'Résolu automatiquement suite à l''annulation de la mission'), resolved_by=$1, resolved_at=NOW()
-         WHERE mission_id=$2 AND status IN ('open','in_progress')`,
-      [req.user.id, mission.id]
-    );
-    await db.query(`UPDATE missions SET under_surveillance=false WHERE id=$1`, [mission.id]);
     await notify(mission.client_id, '✅ Réclamation résolue', `${refund} MAD crédités sur votre portefeuille.`, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', { amount: refund });
     await notify(mission.oeil_id, 'Réclamation résolue', 'Résolue en faveur du client.', 'claimResolvedClientLoseTitle', 'claimResolvedOeilLoseBody', null);
   }
