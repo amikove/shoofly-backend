@@ -225,10 +225,31 @@ router.post('/oeil/withdraw', authenticate, requireRole('oeil'), asyncHandler(as
   const db = getDb();
   const { amount, bank_info } = req.body;
   if (!amount || amount < 100) return res.status(400).json({ error: 'Minimum 100 MAD' });
-  const { rows: [p] } = await db.query('SELECT balance FROM oeil_profiles WHERE user_id=$1', [req.user.id]);
-  if (!p || p.balance < amount) return res.status(400).json({ error: 'Solde insuffisant' });
-  await db.query('UPDATE oeil_profiles SET balance=balance-$1 WHERE user_id=$2', [amount, req.user.id]);
-  await db.query('INSERT INTO withdrawals (oeil_id,amount,bank_info) VALUES ($1,$2,$3)', [req.user.id, amount, JSON.stringify(bank_info)]);
+
+  // Transaction + verrou de ligne : évite que deux retraits simultanés passent
+  // tous les deux la vérification de solde avant que le premier ne soit committé.
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [p] } = await client.query('SELECT balance FROM oeil_profiles WHERE user_id=$1 FOR UPDATE', [req.user.id]);
+    if (!p || p.balance < amount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Solde insuffisant' });
+    }
+    await client.query('UPDATE oeil_profiles SET balance=balance-$1 WHERE user_id=$2', [amount, req.user.id]);
+    await client.query('INSERT INTO withdrawals (oeil_id,amount,bank_info) VALUES ($1,$2,$3)', [req.user.id, amount, JSON.stringify(bank_info)]);
+    await client.query(
+      `INSERT INTO wallet_transactions (user_id, type, amount, reason) VALUES ($1, 'debit', $2, 'Retrait bancaire')`,
+      [req.user.id, amount]
+    );
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+
   res.status(201).json({ message: `Virement de ${amount} MAD soumis. Traitement sous 48h.` });
 }));
 

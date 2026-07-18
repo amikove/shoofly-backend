@@ -578,6 +578,11 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
     CREATE INDEX IF NOT EXISTS idx_mission_edit_requests_mission ON mission_edit_requests(mission_id);
     CREATE INDEX IF NOT EXISTS idx_mission_edit_requests_status ON mission_edit_requests(status, expires_at);
+
+    -- Filet de sécurité contre un solde négatif (ex: retraits concurrents non sérialisés) :
+    -- vérifié en amont (aucune ligne existante hors limite), donc validation immédiate sûre au démarrage.
+    ALTER TABLE oeil_profiles DROP CONSTRAINT IF EXISTS oeil_profiles_balance_check;
+    ALTER TABLE oeil_profiles ADD CONSTRAINT oeil_profiles_balance_check CHECK(balance >= 0);
   `);
   console.log('✅ PostgreSQL schema ready');
 }
