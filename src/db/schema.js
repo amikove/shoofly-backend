@@ -583,6 +583,11 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- vérifié en amont (aucune ligne existante hors limite), donc validation immédiate sûre au démarrage.
     ALTER TABLE oeil_profiles DROP CONSTRAINT IF EXISTS oeil_profiles_balance_check;
     ALTER TABLE oeil_profiles ADD CONSTRAINT oeil_profiles_balance_check CHECK(balance >= 0);
+
+    -- Même filet côté client (users.balance, crédité par les remboursements) : même
+    -- vérification préalable faite (aucune ligne négative), même validation immédiate.
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_balance_check;
+    ALTER TABLE users ADD CONSTRAINT users_balance_check CHECK(balance >= 0);
   `);
   console.log('✅ PostgreSQL schema ready');
 }

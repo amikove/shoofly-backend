@@ -8,6 +8,8 @@ const { computeAvgResponseMinutesBulk } = require('../utils/responseTime');
 const { refundOnCancellation } = require('../utils/refund');
 const { getSetting } = require('../utils/settings');
 const { logStatus } = require('../utils/missionHistory');
+const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
+const walletService = require('../services/walletService');
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -916,11 +918,17 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async
       return res.json({ ok: true });
     }
     // Mission assignée — refuser
-      const { rows: [mission] } = await db.query(
-        `UPDATE missions SET status='pending', oeil_id=NULL, updated_at=NOW() WHERE id=$1 AND oeil_id=$2 AND status='assigned' RETURNING *`,
-        [req.params.id, req.user.id]
-      );
-      if (!mission) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+      let mission;
+      try {
+        mission = await transitionMission(db, req.params.id, 'assigned', 'pending', req.user.id, {
+          extraFields: { oeil_id: null },
+          extraGuards: { oeil_id: req.user.id },
+          note: 'Refusée par l\'Œil',
+        });
+      } catch (e) {
+        if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+        throw e;
+      }
 
       // Pénalité de fiabilité proportionnelle au délai avant la mission
       const { points: penaltyPoints, reason: penaltyReason, isGrave } = computeLatePenalty(mission.scheduled_at, 'assignée refusée par l\'Œil');
