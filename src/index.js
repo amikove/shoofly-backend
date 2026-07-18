@@ -11,6 +11,7 @@ const jwt = require('jsonwebtoken');
 const { initDb, getDb } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
+const { runAutoValidateMissions } = require('./jobs/autoValidateMissions');
 
 const cron = require('node-cron');
 const xss = require('xss-clean');
@@ -680,31 +681,7 @@ initDb().then(() => {
     if (cronAutoValidateRunning) { console.warn('⏭️ Cron auto-validation déjà en cours, tick ignoré'); return; }
     cronAutoValidateRunning = true;
     try {
-      const db = getDb();
-      const clientValidationHours = await getSetting(db, 'client_validation_hours', 12);
-      const { rows: missions } = await db.query(`
-        SELECT * FROM missions
-        WHERE status='completed'
-          AND completed_by_oeil_at IS NOT NULL
-          AND completed_by_oeil_at < NOW() - INTERVAL '1 hour' * $1::numeric
-          AND validated_at IS NULL
-      `, [clientValidationHours]);
-      for (const mission of missions) {
-        // Le statut a pu changer entre le SELECT et ici (ex: réclamation déposée
-        // entre-temps) — la garde sur le WHERE évite de payer une mission qui n'est
-        // plus 'completed'.
-        const { rowCount } = await db.query(
-          `UPDATE missions SET validated_at=NOW(), updated_at=NOW() WHERE id=$1 AND status='completed'`,
-          [mission.id]
-        );
-        if (rowCount === 0) {
-          console.log(`ℹ️ Auto-validation ignorée pour mission ${mission.id} : statut a changé entre-temps`);
-          continue;
-        }
-        await db.query(`UPDATE oeil_profiles SET balance=balance+$1, total_earnings=total_earnings+$1 WHERE user_id=$2`, [mission.oeil_earning, mission.oeil_id]);
-        await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,'Validation automatique après 12h',$3)`, [mission.oeil_id, mission.oeil_earning, mission.id]);
-        console.log(`✅ Auto-validé mission ${mission.id}`);
-      }
+      await runAutoValidateMissions(getDb());
     } catch (e) { console.error('❌ Cron error:', e.message); }
     finally { cronAutoValidateRunning = false; }
   });
