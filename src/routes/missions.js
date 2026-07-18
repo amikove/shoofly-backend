@@ -644,12 +644,16 @@ router.post('/edit-requests/:id/reject', authenticate, requireRole('oeil'), asyn
   );
   if (rowCount === 0) return res.status(409).json({ error: 'Cette demande a changé de statut entre-temps, veuillez rafraîchir.' });
 
-  const { rows: [updatedMission] } = await db.query(
-    `UPDATE missions SET status='pending', oeil_id=NULL, is_priority=true, transfer_deadline=NULL, updated_at=NOW()
-     WHERE id=$1 AND status='assigned' RETURNING *`,
-    [mission.id]
-  );
-  if (!updatedMission) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+  let updatedMission;
+  try {
+    updatedMission = await transitionMission(db, mission.id, 'assigned', 'pending', req.user.id, {
+      extraFields: { oeil_id: null, is_priority: true, transfer_deadline: null },
+      note: 'Demande de modification refusée par l\'Œil',
+    });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+    throw e;
+  }
 
   await notify(db, mission.client_id,
     'Mission remise en recherche',
@@ -2034,14 +2038,18 @@ async function checkMissionEditRequestExpiry(db, emitToUser) {
     const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [editRequest.mission_id]);
     if (!mission) continue;
 
-    const { rows: [updatedMission] } = await db.query(
-      `UPDATE missions SET status='pending', oeil_id=NULL, is_priority=true, transfer_deadline=NULL, updated_at=NOW()
-       WHERE id=$1 AND status='assigned' RETURNING *`,
-      [mission.id]
-    );
-    if (!updatedMission) {
-      console.log(`ℹ️ checkMissionEditRequestExpiry: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
-      continue;
+    let updatedMission;
+    try {
+      updatedMission = await transitionMission(db, mission.id, 'assigned', 'pending', null, {
+        extraFields: { oeil_id: null, is_priority: true, transfer_deadline: null },
+        note: 'Demande de modification expirée (délai dépassé sans réponse de l\'Œil)',
+      });
+    } catch (e) {
+      if (e instanceof MissionTransitionError) {
+        console.log(`ℹ️ checkMissionEditRequestExpiry: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
+        continue;
+      }
+      throw e;
     }
 
     await notify(db, mission.client_id,
