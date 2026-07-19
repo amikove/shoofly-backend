@@ -9,6 +9,7 @@ const walletService = require('../services/walletService');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
 const { getSetting, invalidateSettingsCache } = require('../utils/settings');
+const { isWithinSchedule } = require('../utils/schedule');
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -66,22 +67,6 @@ const uploadAvatar = multer({
     else cb(new Error('Format non supporté. Utilisez JPG ou PNG.'));
   }
 });
-
-function isWithinSchedule(disponibilites) {
-  if (!disponibilites) return true; // pas de créneaux = on se fie au toggle manuel
-  const d = typeof disponibilites === 'string' ? JSON.parse(disponibilites) : disponibilites;
-  if (!Array.isArray(d) || d.length === 0) return true;
-  const now = new Date();
-  const map = { 0:'Dim', 1:'Lun', 2:'Mar', 3:'Mer', 4:'Jeu', 5:'Ven', 6:'Sam' };
-  const aujourdhui = d.find(x => x.jour === map[now.getDay()]);
-  if (!aujourdhui?.actif) return false;
-  const [hd, md] = aujourdhui.debut.split(':').map(Number);
-  const [hf, mf] = aujourdhui.fin.split(':').map(Number);
-  const mins = now.getHours() * 60 + now.getMinutes();
-  return mins >= hd * 60 + md && mins <= hf * 60 + mf;
-}
-
-
 
 // ── Oeils publics ──────────────────────────────────────────
 router.get('/oeils', authenticate, asyncHandler(async (req, res) => {
