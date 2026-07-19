@@ -999,7 +999,6 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async
   const io = req.app.get('io');
   const emitToUser = req.app.get('emitToUser');
   const { ignore } = req.body;
-  try {
     if (ignore) {
       // Mission disponible — juste ignorer
       await db.query(
@@ -1057,10 +1056,6 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async
         await advanceCandidateCascade(db, io, emitToUser, mission, {});
 
         res.json({ mission });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
 }));
 
 
