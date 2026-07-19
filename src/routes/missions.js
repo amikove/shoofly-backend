@@ -1723,6 +1723,10 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
     if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
     if (!['pending'].includes(mission.status)) return res.status(400).json({ error: 'Mission non disponible pour affectation' });
+    // Capturé avant l'écrasement des champs de cascade plus bas (transitionMission + nettoyage
+    // mission_interests) — reflète l'état au moment de l'appel, jamais bloquant (décision produit :
+    // l'admin doit toujours pouvoir écraser une cascade en cours).
+    const cascadeInterrupted = isBatchLive(mission);
     // Vérifier que l'Œil est vérifié et disponible
     const { rows: [profile] } = await db.query(
       `SELECT is_verified, is_available FROM oeil_profiles WHERE user_id=$1`, [oeil_id]
@@ -1796,10 +1800,21 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     [mission.id, req.user.id, `${oeil.first_name} a été assigné par l'admin.`, 'assignedByAdmin', JSON.stringify({ oeilName: oeil.first_name })]
   );
 
-  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'assigned' });
-  io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'assigned' });
+  const cascadeInterruptedMessage = cascadeInterrupted
+    ? 'Une cascade de confirmation était en cours pour cette mission — elle a été automatiquement annulée par cette affectation manuelle.'
+    : null;
 
-  res.json({ ok: true });
+  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'assigned' });
+  io.to('room:admin').emit('mission_updated', {
+    id: mission.id, status: 'assigned',
+    ...(cascadeInterrupted ? { cascade_interrupted: true, cascade_interrupted_message: cascadeInterruptedMessage } : {}),
+  });
+
+  res.json({
+    ok: true,
+    cascade_interrupted: cascadeInterrupted,
+    ...(cascadeInterrupted ? { cascade_interrupted_message: cascadeInterruptedMessage } : {}),
+  });
 }));
 
 // ── Cron : vérifier deadlines transfert expirées ──────────
