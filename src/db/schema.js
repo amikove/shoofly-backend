@@ -186,6 +186,14 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
     -- refuse explicitement la sollicitation de confirmation (advanceCandidateCascade) —
     -- contrairement à un simple timeout (pas de réponse), qui n'exclut pas définitivement.
     ALTER TABLE mission_interests ADD COLUMN IF NOT EXISTS declined BOOLEAN NOT NULL DEFAULT FALSE;
+    -- Cascade de réattribution PAR LOT (voir advanceCandidateCascade, routes/missions.js) :
+    -- solicited_at marque qu'une ligne fait partie du lot actuellement sollicité (posé au
+    -- tirage d'un nouveau lot, remis à NULL avant chaque nouveau tirage pour ne jamais
+    -- laisser fuiter l'appartenance à un cycle précédent résolu-puis-rouvert) ; confirmed_at
+    -- enregistre la confirmation de disponibilité SANS assignation immédiate — l'assignation
+    -- est tranchée par la fenêtre de départage (missions.batch_tiebreak_ends_at ci-dessous).
+    ALTER TABLE mission_interests ADD COLUMN IF NOT EXISTS solicited_at TIMESTAMPTZ;
+    ALTER TABLE mission_interests ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS quartier TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS birth_date DATE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS profil TEXT;
@@ -248,7 +256,9 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('dashboard_low_reliability_threshold', '70'),
         ('candidate_confirmation_minutes', '10'),
         ('presence_confirmation_deadline_minutes', '120'),
-        ('presence_confirmation_deadline_minutes_sameday', '45')
+        ('presence_confirmation_deadline_minutes_sameday', '45'),
+        ('candidate_batch_size', '10'),
+        ('candidate_tiebreak_window_minutes', '5')
       ON CONFLICT (key) DO NOTHING;
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS is_flagged BOOLEAN DEFAULT false;
@@ -331,11 +341,20 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS oeil2_id TEXT REFERENCES users(id);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS replacement_preference TEXT NOT NULL DEFAULT 'fast' CHECK(replacement_preference IN ('fast','choose'));
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS candidate_window_ends_at TIMESTAMPTZ;
-    -- Candidat actuellement sollicité pour confirmation dans la cascade de réattribution
-    -- séquentielle (voir advanceCandidateCascade, routes/missions.js). candidate_window_ends_at
-    -- est réutilisée pour porter la deadline de CE candidat précis (plus la fenêtre fast/choose
-    -- historique, neutralisée — voir replacement_preference ci-dessus, contenu désormais ignoré).
+    -- Candidat le mieux classé du lot actuellement sollicité — à titre indicatif seulement
+    -- depuis le passage à la cascade PAR LOT (candidate_batch_size candidats simultanés, voir
+    -- advanceCandidateCascade et batch_tiebreak_ends_at ci-dessous) : l'autorisation de
+    -- confirmation/refus d'un candidat repose sur mission_interests.solicited_at, pas sur ce
+    -- champ. candidate_window_ends_at porte désormais la deadline du LOT entier (partagée par
+    -- tous ses membres), plus la fenêtre fast/choose historique, neutralisée — voir
+    -- replacement_preference ci-dessus, contenu désormais ignoré).
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS pending_candidate_id TEXT REFERENCES users(id);
+    -- Posée sur la mission dès la PREMIÈRE confirmation reçue dans le lot en cours (SOUS GARDE
+    -- IS NULL — fenêtre fixe depuis la 1ère confirmation, jamais repoussée par les suivantes) ;
+    -- à son expiration, on tranche entre tous les candidats confirmés avant cette échéance
+    -- (reliability_score DESC, rating_avg DESC) via hireOeilCore. Ce traitement est prioritaire
+    -- sur le timeout de lot complet (candidate_window_ends_at) — voir cron dédié dans index.js.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS batch_tiebreak_ends_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_cooldown_until TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS reliability_score INTEGER NOT NULL DEFAULT 90;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_count INTEGER NOT NULL DEFAULT 0;

@@ -1411,6 +1411,7 @@ const {
   dashboard_stuck_pending_hours, dashboard_low_reliability_threshold,
   candidate_confirmation_minutes,
   presence_confirmation_deadline_minutes, presence_confirmation_deadline_minutes_sameday,
+  candidate_batch_size, candidate_tiebreak_window_minutes,
 } = req.body
   const updates = {
     commission, min_price, five_star_bonus_active, five_star_bonus_percent,
@@ -1427,6 +1428,7 @@ const {
     dashboard_stuck_pending_hours, dashboard_low_reliability_threshold,
     candidate_confirmation_minutes,
     presence_confirmation_deadline_minutes, presence_confirmation_deadline_minutes_sameday,
+    candidate_batch_size, candidate_tiebreak_window_minutes,
   }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
