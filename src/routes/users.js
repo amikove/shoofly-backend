@@ -10,7 +10,11 @@ const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
 const { getSetting, invalidateSettingsCache } = require('../utils/settings');
 const { sendWhatsAppTemplate } = require('../services/wasel');
+const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
+// Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
+// de dupliquer la logique de sélection de candidat pour le cas "Œil désactivé avec mission active".
+const missionRoutes = require('./missions');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
@@ -1314,13 +1318,71 @@ router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), asyncHa
 
 router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requirePermission('users'), asyncHandler(async (req, res) => {
     const db = getDb();
+    const emitToUser = req.app.get('emitToUser');
+    const io = req.app.get('io');
     const { rows: [target] } = await db.query('SELECT role FROM users WHERE id=$1', [req.params.id]);
     if (!target) return res.status(404).json({ error: 'Introuvable' });
     if (target.role === 'admin' && !req.user.is_super_admin) {
       return res.status(403).json({ error: 'Seul le Super Admin peut activer/désactiver un compte administrateur.' });
     }
     const { rows: [u] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 RETURNING is_active`, [req.params.id]);
-    res.json({ is_active: u.is_active });
+
+    // Désactivation (pas réactivation) d'un Œil ayant une mission active/en_route/assignée :
+    // réattribution automatique via la cascade de confirmation séquentielle, sans jamais
+    // resolliciter le client. transfer_type est toujours forcé à 'before' (jamais 'during'),
+    // même si la mission était déjà 'active'/'en_route' : contrairement à un abandon volontaire
+    // en cours de mission (qui donne lieu à un split au prorata via mission_transfer_chain),
+    // une désactivation admin ne doit produire AUCUN mouvement financier ni pénalité pour l'Œil
+    // désactivé — le remplaçant touche l'intégralité de oeil_earning.
+    let reassignedCount = 0;
+    if (!u.is_active && target.role === 'oeil') {
+      const { rows: strandedMissions } = await db.query(
+        `SELECT * FROM missions WHERE oeil_id=$1 AND status IN ('assigned','en_route','active')`,
+        [req.params.id]
+      );
+      const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+      const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+      for (const mission of strandedMissions) {
+        const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+        const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+        let updated;
+        try {
+          updated = await transitionMission(db, mission.id, mission.status, 'pending', req.user.id, {
+            extraFields: {
+              is_priority: true,
+              transfer_type: 'before',
+              transferred_from: req.params.id,
+              transfer_reason: 'Compte prestataire désactivé par un administrateur',
+              transfer_deadline: deadline,
+              oeil_id: null,
+            },
+            note: 'Réattribution automatique — Œil désactivé par un admin',
+          });
+        } catch (e) {
+          if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
+          throw e;
+        }
+        reassignedCount++;
+
+        // Retire la propre candidature de l'Œil désactivé sur sa propre mission (même correctif
+        // que POST /:id/transfer, voir bug fantôme audit 2.9) avant de lancer la cascade.
+        await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, req.params.id]);
+
+        await missionRoutes.advanceCandidateCascade(db, io, emitToUser, updated, {});
+
+        const reassignTitle = '📋 Mission réattribuée';
+        const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la désactivation de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`;
+        await missionRoutes.notify(db, req.params.id, reassignTitle, reassignBody,
+          'mission', mission.id, emitToUser, null, 'missionReassignedNoPenaltyTitle', 'missionReassignedNoPenaltyBody', { missionTitle: mission.title });
+
+        const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [req.params.id]);
+        if (oeilContact?.phone) {
+          await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title]);
+        }
+      }
+    }
+
+    res.json({ is_active: u.is_active, reassigned_missions: reassignedCount });
   }));
 
 // ── Admin : paramètres ─────────────────────────────────────
@@ -1347,6 +1409,7 @@ const {
   new_oeil_mission_threshold, reactivation_default_score, ticket_auto_resolve_hours,
   response_time_max_valid_minutes, response_time_min_turns,
   dashboard_stuck_pending_hours, dashboard_low_reliability_threshold,
+  candidate_confirmation_minutes,
 } = req.body
   const updates = {
     commission, min_price, five_star_bonus_active, five_star_bonus_percent,
@@ -1361,6 +1424,7 @@ const {
     new_oeil_mission_threshold, reactivation_default_score, ticket_auto_resolve_hours,
     response_time_max_valid_minutes, response_time_min_turns,
     dashboard_stuck_pending_hours, dashboard_low_reliability_threshold,
+    candidate_confirmation_minutes,
   }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {

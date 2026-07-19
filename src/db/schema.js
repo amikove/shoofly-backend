@@ -182,6 +182,10 @@ CREATE INDEX IF NOT EXISTS idx_missions_client ON missions(client_id);
 );
 
 CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id);
+    -- Exclusion définitive du pool de candidats pour CETTE mission précise, quand l'Œil
+    -- refuse explicitement la sollicitation de confirmation (advanceCandidateCascade) —
+    -- contrairement à un simple timeout (pas de réponse), qui n'exclut pas définitivement.
+    ALTER TABLE mission_interests ADD COLUMN IF NOT EXISTS declined BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS quartier TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS birth_date DATE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS profil TEXT;
@@ -241,7 +245,8 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('response_time_max_valid_minutes', '1440'),
         ('response_time_min_turns', '3'),
         ('dashboard_stuck_pending_hours', '24'),
-        ('dashboard_low_reliability_threshold', '70')
+        ('dashboard_low_reliability_threshold', '70'),
+        ('candidate_confirmation_minutes', '10')
       ON CONFLICT (key) DO NOTHING;
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS is_flagged BOOLEAN DEFAULT false;
@@ -324,6 +329,11 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS oeil2_id TEXT REFERENCES users(id);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS replacement_preference TEXT NOT NULL DEFAULT 'fast' CHECK(replacement_preference IN ('fast','choose'));
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS candidate_window_ends_at TIMESTAMPTZ;
+    -- Candidat actuellement sollicité pour confirmation dans la cascade de réattribution
+    -- séquentielle (voir advanceCandidateCascade, routes/missions.js). candidate_window_ends_at
+    -- est réutilisée pour porter la deadline de CE candidat précis (plus la fenêtre fast/choose
+    -- historique, neutralisée — voir replacement_preference ci-dessus, contenu désormais ignoré).
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS pending_candidate_id TEXT REFERENCES users(id);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_cooldown_until TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS reliability_score INTEGER NOT NULL DEFAULT 90;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_count INTEGER NOT NULL DEFAULT 0;

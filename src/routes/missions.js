@@ -267,11 +267,14 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
         params.push(`%${req.query.quartier}%`);
       }
 
-      // Filtre is_priority
+      // Filtre is_priority — une mission passée is_urgent=true (liste de candidats de la
+      // cascade épuisée, voir advanceCandidateCascade) reste visible dans le fil par défaut
+      // même si is_priority est encore true, exactement comme une mission normale
+      // nouvellement publiée (pas de restriction au pool initial, cf. spec réattribution).
       if (req.query.is_priority === 'true') {
         where.push(`m.is_priority=true`);
       } else {
-        where.push(`m.is_priority=false`);
+        where.push(`(m.is_priority=false OR m.is_urgent=true)`);
       }
 
       // Exclure les missions ignorées
@@ -770,14 +773,12 @@ router.get('/actions-required', authenticate, requireRole('client'), asyncHandle
     ORDER BY m.validated_at DESC
   `, [clientId]);
 
-  const { rows: to_choose_replacement } = await db.query(`
-    SELECT id, title, candidate_window_ends_at
-    FROM missions
-    WHERE client_id=$1 AND replacement_preference='choose'
-      AND candidate_window_ends_at IS NOT NULL AND candidate_window_ends_at > NOW()
-      AND oeil_id IS NULL
-    ORDER BY candidate_window_ends_at ASC
-  `, [clientId]);
+  // Neutralisé : le client n'est plus jamais sollicité pour choisir un remplaçant — la
+  // cascade de confirmation séquentielle (advanceCandidateCascade) gère la réattribution
+  // entièrement en interne, quelle que soit la cause. replacement_preference='choose' n'a
+  // donc plus aucun effet ; la clé de réponse est conservée à [] pour compatibilité avec
+  // le frontend existant (shoofly-react), qui reste à nettoyer côté UI séparément.
+  const to_choose_replacement = [];
 
   res.json({ to_validate, to_rate, to_choose_replacement });
 }));
@@ -965,6 +966,8 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
 // ── POST /missions/:id/refuse ──────────────────────────────
 router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
+  const io = req.app.get('io');
+  const emitToUser = req.app.get('emitToUser');
   const { ignore } = req.body;
   try {
     if (ignore) {
@@ -975,11 +978,31 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async
       );
       return res.json({ ok: true });
     }
-    // Mission assignée — refuser
+    // Mission assignée — refuser. Traitée comme les 3 autres causes de réattribution
+    // (transfert 'before'/'during', désactivation admin) : is_priority + transfer_deadline
+    // (délai de grâce existant, checkTransferDeadlines reste actif en parallèle, inchangé)
+    // + déclenchement de la cascade de confirmation séquentielle. transfer_type='before'
+    // (jamais 'during' ici : la mission n'a par définition pas encore démarré) → paiement
+    // intégral au remplaçant, pas de split.
+      const { rows: [missionBefore] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+      if (!missionBefore) return res.status(404).json({ error: 'Mission introuvable' });
+
+      const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+      const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+      const graceMinutes = missionBefore.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+      const transferDeadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+
       let mission;
       try {
         mission = await transitionMission(db, req.params.id, 'assigned', 'pending', req.user.id, {
-          extraFields: { oeil_id: null },
+          extraFields: {
+            oeil_id: null,
+            is_priority: true,
+            transfer_type: 'before',
+            transferred_from: req.user.id,
+            transfer_reason: 'Refusée par l\'Œil',
+            transfer_deadline: transferDeadline,
+          },
           extraGuards: { oeil_id: req.user.id },
           note: 'Refusée par l\'Œil',
         });
@@ -997,6 +1020,12 @@ router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async
           `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $1::numeric WHERE id=$2`,
           [transferCooldownHours, req.user.id]
         );
+
+        // Retire la propre candidature de l'Œil refusant sur cette mission (même correctif
+        // que POST /:id/transfer, cf. bug fantôme audit 2.9) avant de lancer la cascade.
+        await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, req.user.id]);
+        await advanceCandidateCascade(db, io, emitToUser, mission, {});
+
         res.json({ mission });
   } catch (err) {
     console.error(err);
@@ -1499,6 +1528,16 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
     if (clientContact?.phone) {
       sendWhatsAppTemplate(waselTemplates.oeil_applied.template_name, clientContact.phone, ['Un Œil', mission.title]);
     }
+
+    // Relance la cascade de confirmation séquentielle si cette mission est en recherche
+    // élargie (is_urgent, liste initiale épuisée) et qu'aucun candidat n'est actuellement
+    // sollicité — cette nouvelle candidature réactive le mécanisme (voir point 8 de la
+    // spec réattribution / advanceCandidateCascade).
+    if (mission.is_urgent && !mission.pending_candidate_id) {
+      const io = req.app.get('io');
+      await advanceCandidateCascade(db, io, emitToUser, mission, {});
+    }
+
     res.status(201).json({ ok: true });
 }));
 
@@ -1529,20 +1568,11 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
   const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
 
-  // Fenêtre de candidature : durée fixe en "fast" (peu importe le type),
-  // ou selon le type en "choose" — indépendante du
-  // délai de grâce (transfer_deadline) ci-dessus, qui continue de courir en toile de fond.
-  const candidateWindowMinutesFast = await getSetting(db, 'candidate_window_minutes_fast', 10);
-  const candidateWindowMinutesChooseQueue = await getSetting(db, 'candidate_window_minutes_choose_queue', 5);
-  const candidateWindowMinutesChooseOther = await getSetting(db, 'candidate_window_minutes_choose_other', 10);
-  const candidateWindowMinutes = mission.replacement_preference === 'choose'
-    ? (mission.type === 'file_attente' ? candidateWindowMinutesChooseQueue : candidateWindowMinutesChooseOther)
-    : candidateWindowMinutesFast;
-  const candidateWindowEndsAt = new Date(Date.now() + candidateWindowMinutes * 60 * 1000);
-
   // Remettre la mission en pending avec flag priorité — vérifié et appliqué
   // avant de toucher au compte de l'Œil, pour ne pas lui imputer un cooldown
-  // si la mission a en fait déjà changé de statut entre-temps.
+  // si la mission a en fait déjà changé de statut entre-temps. La sélection du
+  // remplaçant est désormais entièrement gérée par advanceCandidateCascade (appelée
+  // plus bas) — replacement_preference n'est plus lu ici (neutralisé, contenu ignoré).
   try {
     await transitionMission(db, mission.id, mission.status, 'pending', req.user.id, {
       extraFields: {
@@ -1551,7 +1581,6 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
         transferred_from: req.user.id,
         transfer_reason: reason,
         transfer_deadline: deadline,
-        candidate_window_ends_at: candidateWindowEndsAt,
         oeil_id: null,
       },
       extraGuards: { oeil_id: req.user.id },
@@ -1614,6 +1643,10 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
   io.to('room:admin').emit('mission_updated', { id: mission.id, is_priority: true });
+
+  // Lance la cascade de confirmation séquentielle sur le pool actuel de mission_interests
+  // (l'intérêt propre de l'Œil transférant a déjà été supprimé ci-dessus).
+  await advanceCandidateCascade(db, io, emitToUser, mission, {});
 
   res.json({ ok: true, transfer_type: transferType, deadline });
 }));
@@ -1780,10 +1813,11 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
 
 
 // ── Cœur de la logique d'embauche d'un Œil parmi les intéressés — réutilisé
-// par POST /:id/hire/:oeilId (client) et par le cron de sélection automatique
-// de fin de fenêtre de candidature (index.js). Retourne { ok:false, status, error }
-// si une vérification échoue (le cron essaie alors le candidat suivant),
-// ou { ok:true, mission } en cas de succès.
+// par POST /:id/hire/:oeilId (choix initial du client), par POST /:id/candidate-confirm
+// (confirmation d'un candidat sollicité par advanceCandidateCascade, ci-dessous), et
+// historiquement par le cron de sélection automatique fast/choose (remplacé). Retourne
+// { ok:false, status, error } si une vérification échoue, ou { ok:true, mission } en cas
+// de succès.
 async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   const {
     changedById = null,
@@ -1825,13 +1859,14 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
     return { ok: false, status: 400, error: 'Cet Œil a déjà une mission dans le même créneau.' };
   }
 
-  // candidate_window_ends_at remis à NULL ici (même en dehors du cron) pour qu'une
-  // sélection manuelle par le client n'importe quand pendant la fenêtre "choose"
-  // empêche définitivement le cron de rejouer une sélection automatique ensuite.
+  // candidate_window_ends_at et pending_candidate_id remis à NULL ici (même en dehors du
+  // cron/de la cascade) pour qu'une sélection manuelle par le client n'importe quand
+  // empêche définitivement toute reprise ultérieure de la cascade de confirmation sur
+  // cette mission (voir advanceCandidateCascade).
   let updated;
   try {
     updated = await transitionMission(db, mission.id, 'pending', 'assigned', changedById, {
-      extraFields: { oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null },
+      extraFields: { oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null, pending_candidate_id: null },
       note: historyNote,
     });
   } catch (e) {
@@ -1899,6 +1934,99 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   return { ok: true, mission: updated };
 }
 
+// ── Cascade de confirmation séquentielle — remplace les anciens modes 'fast'/'choose' ──
+// Un seul mécanisme, quelle que soit la cause : contacte le candidat le mieux classé de
+// mission_interests (reliability_score DESC, rating_avg DESC — même classement que
+// l'ancien cron), attend une confirmation ACTIVE (jamais d'auto-assignation directe), et
+// passe au suivant en cas de refus explicite (exclusion définitive) ou d'absence de
+// réponse dans le délai `candidate_confirmation_minutes` (exclusion pour ce cycle
+// seulement). Liste épuisée → is_urgent=true, visible publiquement (voir GET / mode=
+// available), sans jamais resolliciter le client pour un choix — il est seulement informé.
+// Réutilisée par : POST /:id/refuse, POST /:id/transfer, PUT /users/admin/:id/toggle-active
+// (désactivation), POST /:id/candidate-decline, POST /:id/interest (relance post-urgent),
+// et le cron de timeout (index.js).
+//
+// opts.excludeOeilId  : Œil qui vient de devenir indisponible (déclencheur initial) — sa
+//   propre candidature sur cette mission est retirée avant de choisir le premier candidat.
+// opts.declinedOeilId : candidat qui vient de refuser explicitement (POST /:id/candidate-
+//   decline) — mission_interests.declined=true, exclusion DÉFINITIVE de cette mission.
+// opts.timedOutOeilId : candidat dont la fenêtre de confirmation a expiré sans réponse —
+//   ligne mission_interests supprimée (pas de flag : s'il repostule plus tard, par ex.
+//   après passage en urgent, une candidature fraîche le rend à nouveau éligible normalement).
+async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
+  const { excludeOeilId = null, declinedOeilId = null, timedOutOeilId = null } = opts;
+
+  if (excludeOeilId) {
+    await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, excludeOeilId]);
+  }
+  if (declinedOeilId) {
+    await db.query(`UPDATE mission_interests SET declined=true WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, declinedOeilId]);
+  }
+  if (timedOutOeilId) {
+    await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, timedOutOeilId]);
+  }
+
+  const { rows: candidates } = await db.query(`
+    SELECT u.id
+    FROM mission_interests mi
+    JOIN users u ON u.id = mi.oeil_id
+    LEFT JOIN oeil_profiles p ON p.user_id = u.id
+    WHERE mi.mission_id = $1 AND mi.declined = false
+    ORDER BY u.reliability_score DESC, p.rating_avg DESC
+    LIMIT 1
+  `, [mission.id]);
+
+  if (candidates.length > 0) {
+    const nextOeilId = candidates[0].id;
+    const confirmationMinutes = await getSetting(db, 'candidate_confirmation_minutes', 10);
+    const windowEndsAt = new Date(Date.now() + confirmationMinutes * 60 * 1000);
+
+    // Garde optimiste : si la mission a changé de statut entre-temps (déjà assignée par
+    // un autre chemin, annulée...), on n'écrase rien.
+    const { rowCount } = await db.query(
+      `UPDATE missions SET pending_candidate_id=$1, candidate_window_ends_at=$2, updated_at=NOW()
+       WHERE id=$3 AND status='pending' AND oeil_id IS NULL`,
+      [nextOeilId, windowEndsAt, mission.id]
+    );
+    if (rowCount === 0) return;
+
+    await notify(db, nextOeilId,
+      '🎯 Confirmez votre disponibilité',
+      `Vous êtes le candidat le mieux classé pour "${mission.title}". Confirmez votre disponibilité sous ${confirmationMinutes} min pour être assigné.`,
+      'mission', mission.id, emitToUser, 'mission_view', 'candidateConfirmRequestTitle', 'candidateConfirmRequestBody',
+      { missionTitle: mission.title, minutes: confirmationMinutes }
+    );
+
+    const { rows: [candidateContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [nextOeilId]);
+    if (candidateContact?.phone) {
+      await sendWhatsAppTemplate(waselTemplates.candidate_confirmation_request.template_name, candidateContact.phone, [mission.title, String(confirmationMinutes)]);
+    }
+
+    if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, pending_candidate_id: nextOeilId });
+  } else {
+    const { rowCount } = await db.query(
+      `UPDATE missions SET is_urgent=true, pending_candidate_id=NULL, candidate_window_ends_at=NULL, updated_at=NOW()
+       WHERE id=$1 AND status='pending' AND oeil_id IS NULL`,
+      [mission.id]
+    );
+    if (rowCount === 0) return;
+
+    await notify(db, mission.client_id,
+      '🔎 Recherche élargie',
+      `Nous élargissons la recherche d'un remplaçant pour "${mission.title}" à tous les Œils disponibles.`,
+      'mission', mission.id, emitToUser, null, 'missionUrgentBroadenedTitle', 'missionUrgentBroadenedBody',
+      { missionTitle: mission.title }
+    );
+
+    const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+    if (clientContact?.phone) {
+      await sendWhatsAppTemplate(waselTemplates.mission_urgent_broadened.template_name, clientContact.phone, [mission.title]);
+    }
+
+    if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, is_urgent: true });
+  }
+}
+
 // ── POST /:id/hire/:oeilId ── Client choisit un Œil ───────
 router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
@@ -1924,6 +2052,65 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandl
   if (!result.ok) return res.status(result.status).json({ error: result.error });
 
   res.json({ mission: result.mission });
+}));
+
+// ── POST /:id/candidate-confirm ── Le candidat sollicité confirme sa disponibilité ──
+// (voir advanceCandidateCascade) — seul le candidat actuellement sollicité (pending_
+// candidate_id) peut confirmer ; réutilise hireOeilCore, donc les mêmes vérifications
+// (suspension/cooldown/créneau) et le même comportement transfer_type='during' (chaîne
+// de transfert / split prorata) que toute autre embauche.
+router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const io = req.app.get('io');
+  const emitToUser = req.app.get('emitToUser');
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.pending_candidate_id !== req.user.id) {
+    return res.status(403).json({ error: "Vous n'êtes pas (ou plus) le candidat sollicité pour cette mission." });
+  }
+
+  const result = await hireOeilCore(db, io, emitToUser, mission, req.user.id, {
+    changedById: req.user.id,
+    historyNote: 'Confirmation du candidat sollicité (cascade de réattribution)',
+    oeilNotifTitle: '🎉 Vous avez été sélectionné !',
+    oeilNotifBody: `Votre confirmation a été enregistrée pour : ${mission.title}`,
+    oeilNotifTitleKey: 'oeilSelectedTitle',
+    oeilNotifBodyKey: 'oeilSelectedBody',
+    oeilNotifParams: { missionTitle: mission.title },
+  });
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+
+  await notify(db, mission.client_id,
+    '✅ Remplaçant trouvé',
+    `Un remplaçant a confirmé sa disponibilité pour "${mission.title}".`,
+    'mission', mission.id, emitToUser, null, 'replacementConfirmedClientTitle', 'replacementConfirmedClientBody',
+    { missionTitle: mission.title }
+  );
+  const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+  if (clientContact?.phone) {
+    await sendWhatsAppTemplate(waselTemplates.replacement_confirmed_client.template_name, clientContact.phone, [mission.title]);
+  }
+
+  res.json({ mission: result.mission });
+}));
+
+// ── POST /:id/candidate-decline ── Le candidat sollicité refuse explicitement ──
+// Exclusion définitive de cette mission (mission_interests.declined=true) puis passage
+// immédiat au candidat suivant, sans attendre l'expiration du délai de confirmation.
+router.post('/:id/candidate-decline', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const io = req.app.get('io');
+  const emitToUser = req.app.get('emitToUser');
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.pending_candidate_id !== req.user.id) {
+    return res.status(403).json({ error: "Vous n'êtes pas (ou plus) le candidat sollicité pour cette mission." });
+  }
+
+  await advanceCandidateCascade(db, io, emitToUser, mission, { declinedOeilId: req.user.id });
+  res.json({ ok: true });
 }));
 
 
@@ -2154,5 +2341,6 @@ async function checkMissionEditRequestExpiry(db, emitToUser) {
 router.checkTransferDeadlines = checkTransferDeadlines;
 router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
 router.hireOeilCore = hireOeilCore;
+router.advanceCandidateCascade = advanceCandidateCascade;
 router.notify = notify;
 module.exports = router;

@@ -60,6 +60,39 @@ module.exports = {
     note: '{{1}} nom du client qui a embauché l\'Œil',
   },
 
+  // advanceCandidateCascade (routes/missions.js) — le candidat le mieux classé de
+  // mission_interests est sollicité pour confirmer sa disponibilité avant assignation.
+  candidate_confirmation_request: {
+    template_name: 'ticket_urgent_ouvert',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} délai de confirmation en minutes',
+  },
+
+  // POST /:id/candidate-confirm — un candidat sollicité par la cascade a confirmé sa
+  // disponibilité et a été assigné, le client est notifié qu'un remplaçant a été trouvé.
+  replacement_confirmed_client: {
+    template_name: 'ticket_urgent_ouvert',
+    variableCount: 1,
+    note: '{{1}} titre de la mission',
+  },
+
+  // advanceCandidateCascade — liste de candidats initiale épuisée (tous refusés ou sans
+  // réponse), la mission passe is_urgent=true et devient visible publiquement ; le client
+  // est informé à titre de transparence uniquement (jamais sollicité pour un choix).
+  mission_urgent_broadened: {
+    template_name: 'ticket_urgent_ouvert',
+    variableCount: 1,
+    note: '{{1}} titre de la mission',
+  },
+
+  // PUT /users/admin/:id/toggle-active (désactivation) — l'Œil désactivé est notifié que
+  // sa mission a été réattribuée automatiquement, sans ambiguïté sur l'absence de pénalité.
+  oeil_reassigned_no_penalty: {
+    template_name: 'ticket_urgent_ouvert',
+    variableCount: 1,
+    note: '{{1}} titre de la mission',
+  },
+
   // ── Entrées préparées mais non utilisées (templates dédiés pas encore approuvés côté Wasel) ──
 
   // Non utilisée pour l'instant — le flux de modification de mission (PUT /missions/:id sur une
