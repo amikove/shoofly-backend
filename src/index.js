@@ -30,6 +30,7 @@ const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
 const checkMissionEditRequestExpiry = missionRoutesModule.checkMissionEditRequestExpiry;
 const checkPresenceConfirmationDeadlines = missionRoutesModule.checkPresenceConfirmationDeadlines;
 const advanceCandidateCascade = missionRoutesModule.advanceCandidateCascade;
+const hireOeilCore = missionRoutesModule.hireOeilCore;
 const notify = missionRoutesModule.notify;
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
@@ -705,14 +706,24 @@ initDb().then(() => {
     finally { cronPresenceConfirmationRunning = false; }
   });
 
-  // ── Cron toutes les 2 min — Cascade de confirmation candidat ──────────────
-  // Détecte l'expiration de la fenêtre de confirmation du candidat actuellement sollicité
-  // (candidate_confirmation_minutes, défaut 10min — voir advanceCandidateCascade dans
-  // routes/missions.js) et fait avancer la cascade au candidat suivant, ou passe la
-  // mission en is_urgent=true si la liste est épuisée. Remplace l'ancienne sélection
-  // automatique immédiate fast/choose (qui assignait sans jamais attendre de confirmation
-  // active du candidat) — un seul mécanisme désormais, quelle que soit la cause de
-  // réattribution (refus, transfert, désactivation admin).
+  // ── Cron toutes les 2 min — Cascade de confirmation candidat PAR LOT ──────
+  // Deux traitements distincts, dans cet ordre de priorité STRICT (voir spec réattribution
+  // par lot, points 5/6) :
+  //  1) Fenêtres de départage expirées (batch_tiebreak_ends_at) — au moins une confirmation
+  //     a été reçue dans le lot : on tranche entre TOUS les candidats confirmés avant
+  //     l'échéance (reliability_score DESC, rating_avg DESC, même classement que le tirage
+  //     initial) et on assigne le mieux classé via hireOeilCore (réutilisé, pas dupliqué).
+  //     PRIORITAIRE sur (2) par construction : une mission avec une fenêtre de départage
+  //     posée (même déjà expirée) n'apparaît jamais dans la requête (2) ci-dessous (filtre
+  //     batch_tiebreak_ends_at IS NULL) — une fenêtre de départage en cours n'est donc
+  //     jamais interrompue par le timeout du lot complet.
+  //  2) Lots entiers expirés SANS AUCUNE confirmation (candidate_window_ends_at, fenêtre
+  //     partagée par tout le lot — voir advanceCandidateCascade) : passage au lot suivant de
+  //     candidate_batch_size candidats via un nouveau tirage — même logique de retrait non
+  //     définitif qu'avant (candidats non blacklistés, juste retirés du lot actuel).
+  // Remplace l'ancien timeout individuel (un seul candidat, LIMIT 1) — un seul mécanisme
+  // désormais, quelle que soit la cause de réattribution (refus, transfert, désactivation
+  // admin, confirmation de présence non reçue).
   cron.schedule('*/2 * * * *', async () => {
     if (cronCandidateWindowRunning) { console.warn('⏭️ Cron cascade candidat déjà en cours, tick ignoré'); return; }
     cronCandidateWindowRunning = true;
@@ -721,18 +732,76 @@ initDb().then(() => {
       const io = app.get('io');
       const emitToUser = app.get('emitToUser');
 
-      const { rows: expiredCandidates } = await db.query(`
+      // 1) Départages expirés — priorité absolue
+      const { rows: tiebreaksExpired } = await db.query(`
         SELECT * FROM missions
-        WHERE pending_candidate_id IS NOT NULL
-          AND candidate_window_ends_at IS NOT NULL
-          AND candidate_window_ends_at <= NOW()
-          AND status='pending'
-          AND oeil_id IS NULL
+        WHERE status='pending' AND oeil_id IS NULL
+          AND batch_tiebreak_ends_at IS NOT NULL AND batch_tiebreak_ends_at <= NOW()
       `);
 
-      for (const mission of expiredCandidates) {
-        console.log(`⏱️ Candidat ${mission.pending_candidate_id} n'a pas confirmé à temps — mission ${mission.id}, passage au suivant`);
-        await advanceCandidateCascade(db, io, emitToUser, mission, { timedOutOeilId: mission.pending_candidate_id });
+      for (const mission of tiebreaksExpired) {
+        const { rows: confirmed } = await db.query(`
+          SELECT mi.oeil_id
+          FROM mission_interests mi
+          JOIN users u ON u.id = mi.oeil_id
+          LEFT JOIN oeil_profiles p ON p.user_id = u.id
+          WHERE mi.mission_id=$1 AND mi.declined=false
+            AND mi.confirmed_at IS NOT NULL AND mi.confirmed_at <= $2
+          ORDER BY u.reliability_score DESC, p.rating_avg DESC
+          LIMIT 1
+        `, [mission.id, mission.batch_tiebreak_ends_at]);
+
+        if (confirmed.length === 0) {
+          // Ne devrait pas arriver (batch_tiebreak_ends_at n'est posée que par une
+          // confirmation) mais on ne laisse jamais la mission bloquée sur une échéance passée.
+          console.warn(`⚠️ Fenêtre de départage expirée sans candidat confirmé retrouvé — mission ${mission.id}, réinitialisation`);
+          await db.query(`UPDATE missions SET batch_tiebreak_ends_at=NULL WHERE id=$1`, [mission.id]);
+          continue;
+        }
+
+        const winnerId = confirmed[0].oeil_id;
+        const result = await hireOeilCore(db, io, emitToUser, mission, winnerId, {
+          historyNote: 'Meilleur candidat confirmé retenu à l\'issue de la fenêtre de départage (cascade par lot)',
+          oeilNotifTitle: '🎉 Vous avez été sélectionné !',
+          oeilNotifBody: `Vous avez été retenu pour : ${mission.title}`,
+          oeilNotifTitleKey: 'oeilSelectedTitle',
+          oeilNotifBodyKey: 'oeilSelectedBody',
+          oeilNotifParams: { missionTitle: mission.title },
+        });
+
+        if (!result.ok) {
+          // Le candidat le mieux classé confirmé n'est plus assignable (suspendu, cooldown,
+          // conflit de créneau survenu entre-temps) — on retente au prochain tick plutôt que
+          // de choisir arbitrairement un autre confirmé ; auto-guérit si la cause se résorbe,
+          // sinon reste visible pour une affectation manuelle admin (POST /:id/assign-admin).
+          console.warn(`⚠️ Résolution départage: hireOeilCore a échoué pour mission ${mission.id} / candidat ${winnerId} (${result.error}) — nouvelle tentative au prochain tick`);
+          continue;
+        }
+        console.log(`🏆 Départage tranché — mission ${mission.id}, candidat retenu ${winnerId}`);
+
+        await notify(db, mission.client_id,
+          '✅ Remplaçant trouvé',
+          `Un remplaçant a confirmé sa disponibilité pour "${mission.title}".`,
+          'mission', mission.id, emitToUser, null, 'replacementConfirmedClientTitle', 'replacementConfirmedClientBody',
+          { missionTitle: mission.title }
+        );
+        const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+        if (clientContact?.phone) {
+          await sendWhatsAppTemplate(waselTemplates.replacement_confirmed_client.template_name, clientContact.phone, [mission.title]);
+        }
+      }
+
+      // 2) Lots entiers expirés sans aucune confirmation — passage au lot suivant
+      const { rows: batchesExpired } = await db.query(`
+        SELECT * FROM missions
+        WHERE status='pending' AND oeil_id IS NULL
+          AND candidate_window_ends_at IS NOT NULL AND candidate_window_ends_at <= NOW()
+          AND batch_tiebreak_ends_at IS NULL
+      `);
+
+      for (const mission of batchesExpired) {
+        console.log(`⏱️ Lot expiré sans aucune confirmation — mission ${mission.id}, passage au lot suivant`);
+        await advanceCandidateCascade(db, io, emitToUser, mission, {});
       }
     } catch (e) { console.error('❌ Cron cascade candidat error:', e.message); }
     finally { cronCandidateWindowRunning = false; }

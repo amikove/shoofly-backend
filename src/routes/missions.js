@@ -882,7 +882,7 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
   if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission plus disponible' });
-  if (mission.candidate_window_ends_at && new Date(mission.candidate_window_ends_at) > new Date()) {
+  if (isBatchLive(mission)) {
     return res.status(400).json({ error: "Cette mission est en phase de sélection de remplaçant, merci de manifester votre intérêt via le bouton dédié plutôt que d'accepter directement." });
   }
 
@@ -900,6 +900,7 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
         extraFields: {
           oeil_id: req.user.id, oeil2_id: oeil2Id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
           presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
+          candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
         },
         note: 'Acceptée directement par l\'Œil',
       });
@@ -907,6 +908,11 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
       if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
       throw e;
     }
+
+    // Ardoise vierge sur la cascade par lot pour cette mission (même correctif que sur
+    // presence_confirmed_at, voir session précédente) : un candidat non retenu ici ne doit
+    // jamais réapparaître "déjà confirmé/sollicité" si cette mission repart un jour en pending.
+    await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [updated.id]);
 
     // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
     // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
@@ -1553,11 +1559,11 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
       sendWhatsAppTemplate(waselTemplates.oeil_applied.template_name, clientContact.phone, ['Un Œil', mission.title]);
     }
 
-    // Relance la cascade de confirmation séquentielle si cette mission est en recherche
-    // élargie (is_urgent, liste initiale épuisée) et qu'aucun candidat n'est actuellement
-    // sollicité — cette nouvelle candidature réactive le mécanisme (voir point 8 de la
-    // spec réattribution / advanceCandidateCascade).
-    if (mission.is_urgent && !mission.pending_candidate_id) {
+    // Relance la cascade de confirmation par lot si cette mission est en recherche élargie
+    // (is_urgent, liste initiale épuisée) et qu'aucun lot n'est actuellement en cours (ni
+    // fenêtre de lot, ni fenêtre de départage) — cette nouvelle candidature réactive le
+    // mécanisme (voir point 8 de la spec réattribution / advanceCandidateCascade).
+    if (mission.is_urgent && !isBatchLive(mission)) {
       const io = req.app.get('io');
       await advanceCandidateCascade(db, io, emitToUser, mission, {});
     }
@@ -1759,6 +1765,7 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
       extraFields: {
         oeil_id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
         presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
+        candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
       },
       note: 'Affectation manuelle par admin',
     });
@@ -1766,6 +1773,12 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
     throw e;
   }
+
+  // Ardoise vierge sur la cascade par lot (même correctif que POST /:id/accept ci-dessus) —
+  // une affectation manuelle admin court-circuite la cascade à tout moment, y compris pendant
+  // un lot ou un départage en cours ; sans ce nettoyage, une réouverture future de cette
+  // mission hériterait à tort d'un solicited_at/confirmed_at périmé.
+  await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
 
   await notify(db, oeil_id,
     '📋 Mission assignée par admin',
@@ -2007,15 +2020,15 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
     return { ok: false, status: 400, error: 'Cet Œil a déjà une mission dans le même créneau.' };
   }
 
-  // candidate_window_ends_at et pending_candidate_id remis à NULL ici (même en dehors du
-  // cron/de la cascade) pour qu'une sélection manuelle par le client n'importe quand
-  // empêche définitivement toute reprise ultérieure de la cascade de confirmation sur
-  // cette mission (voir advanceCandidateCascade).
+  // candidate_window_ends_at, pending_candidate_id et batch_tiebreak_ends_at remis à NULL ici
+  // (même en dehors du cron/de la cascade) pour qu'une sélection manuelle par le client
+  // n'importe quand empêche définitivement toute reprise ultérieure de la cascade de
+  // confirmation sur cette mission (voir advanceCandidateCascade).
   let updated;
   try {
     updated = await transitionMission(db, mission.id, 'pending', 'assigned', changedById, {
       extraFields: {
-        oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null, pending_candidate_id: null,
+        oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
         presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
       },
       note: historyNote,
@@ -2024,6 +2037,10 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
     if (e instanceof MissionTransitionError) return { ok: false, status: 409, error: e.message };
     throw e;
   }
+
+  // Ardoise vierge sur la cascade par lot (même correctif que POST /:id/accept et
+  // /:id/assign-admin) — voir garde-fous de la spec réattribution par lot.
+  await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
 
     // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
     // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
@@ -2085,25 +2102,43 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   return { ok: true, mission: updated };
 }
 
-// ── Cascade de confirmation séquentielle — remplace les anciens modes 'fast'/'choose' ──
-// Un seul mécanisme, quelle que soit la cause : contacte le candidat le mieux classé de
-// mission_interests (reliability_score DESC, rating_avg DESC — même classement que
-// l'ancien cron), attend une confirmation ACTIVE (jamais d'auto-assignation directe), et
-// passe au suivant en cas de refus explicite (exclusion définitive) ou d'absence de
-// réponse dans le délai `candidate_confirmation_minutes` (exclusion pour ce cycle
-// seulement). Liste épuisée → is_urgent=true, visible publiquement (voir GET / mode=
-// available), sans jamais resolliciter le client pour un choix — il est seulement informé.
+// Un lot est-il actuellement en cours de sollicitation pour cette mission — fenêtre de lot
+// partagée (candidate_window_ends_at) encore ouverte, OU fenêtre de départage ouverte par une
+// première confirmation (batch_tiebreak_ends_at) ? N'importe où dans le fichier : les deux
+// champs sont toujours présents sur un objet mission chargé via SELECT * / RETURNING *.
+function isBatchLive(mission) {
+  const now = Date.now();
+  if (mission.batch_tiebreak_ends_at && new Date(mission.batch_tiebreak_ends_at).getTime() > now) return true;
+  if (mission.candidate_window_ends_at && new Date(mission.candidate_window_ends_at).getTime() > now) return true;
+  return false;
+}
+
+// ── Cascade de confirmation PAR LOT — remplace l'ancienne cascade séquentielle un-par-un ──
+// Un seul mécanisme, quelle que soit la cause : sollicite SIMULTANÉMENT jusqu'à
+// `candidate_batch_size` candidats de mission_interests (reliability_score DESC, rating_avg
+// DESC — même classement que l'ancien cron/l'ancienne cascade), attend une confirmation
+// ACTIVE de chacun (jamais d'auto-assignation directe). Dès la première confirmation reçue
+// (voir POST /:id/candidate-confirm), une fenêtre de départage (candidate_tiebreak_window_
+// minutes) s'ouvre pour laisser une chance aux autres confirmations du lot ; à son expiration,
+// le mieux classé parmi les confirmés est assigné (voir cron dédié, index.js). Si le lot entier
+// expire (candidate_confirmation_minutes) sans AUCUNE confirmation, passage au lot suivant.
+// Liste épuisée → is_urgent=true, visible publiquement (voir GET / mode=available), sans
+// jamais resolliciter le client pour un choix — il est seulement informé.
 // Réutilisée par : POST /:id/refuse, POST /:id/transfer, PUT /users/admin/:id/toggle-active
-// (désactivation), POST /:id/candidate-decline, POST /:id/interest (relance post-urgent),
-// et le cron de timeout (index.js).
+// (désactivation), checkPresenceConfirmationDeadlines, POST /:id/interest (relance post-
+// urgent), et le cron de lot expiré (index.js). Idempotente/sûre à tout instant : si un lot
+// est déjà en cours (isBatchLive), ne fait rien de plus que les opts ci-dessous — ne perturbe
+// jamais un cycle en cours.
 //
 // opts.excludeOeilId  : Œil qui vient de devenir indisponible (déclencheur initial) — sa
-//   propre candidature sur cette mission est retirée avant de choisir le premier candidat.
-// opts.declinedOeilId : candidat qui vient de refuser explicitement (POST /:id/candidate-
-//   decline) — mission_interests.declined=true, exclusion DÉFINITIVE de cette mission.
-// opts.timedOutOeilId : candidat dont la fenêtre de confirmation a expiré sans réponse —
-//   ligne mission_interests supprimée (pas de flag : s'il repostule plus tard, par ex.
-//   après passage en urgent, une candidature fraîche le rend à nouveau éligible normalement).
+//   propre candidature sur cette mission est retirée avant de tirer le lot.
+// opts.declinedOeilId : candidat qui vient de refuser explicitement — mission_interests.
+//   declined=true, exclusion DÉFINITIVE de cette mission. (Non utilisé par POST /:id/candidate-
+//   decline depuis le passage par lot — un refus individuel ne doit pas perturber le reste du
+//   lot en cours ; conservé pour compatibilité d'appel.)
+// opts.timedOutOeilId : conservé pour compatibilité d'appel (l'ancien timeout individuel est
+//   remplacé par le timeout de LOT entier, géré directement par le cron via un tirage frais,
+//   sans passer par cet opt) — ligne mission_interests supprimée si jamais fourni.
 async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
   const { excludeOeilId = null, declinedOeilId = null, timedOutOeilId = null } = opts;
 
@@ -2117,6 +2152,17 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
     await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, timedOutOeilId]);
   }
 
+  // Un lot (ou une fenêtre de départage) est déjà en cours : les opts ci-dessus ont déjà été
+  // appliqués si besoin, mais on ne redessine jamais un nouveau lot par-dessus un cycle en
+  // cours — la priorité départage/lot-complet est gérée par les crons appelants (index.js).
+  if (isBatchLive(mission)) return;
+
+  // Nouveau tirage de lot : ardoise vierge sur mission_interests pour cette mission — un cycle
+  // précédent résolu puis rouvert (refus, transfert, désactivation admin...) ne doit jamais
+  // laisser fuiter un solicited_at/confirmed_at périmé sur le cycle suivant.
+  await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
+
+  const batchSize = await getSetting(db, 'candidate_batch_size', 10);
   const { rows: candidates } = await db.query(`
     SELECT u.id
     FROM mission_interests mi
@@ -2124,39 +2170,48 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
     LEFT JOIN oeil_profiles p ON p.user_id = u.id
     WHERE mi.mission_id = $1 AND mi.declined = false
     ORDER BY u.reliability_score DESC, p.rating_avg DESC
-    LIMIT 1
-  `, [mission.id]);
+    LIMIT $2
+  `, [mission.id, batchSize]);
 
   if (candidates.length > 0) {
-    const nextOeilId = candidates[0].id;
+    const candidateIds = candidates.map(c => c.id);
     const confirmationMinutes = await getSetting(db, 'candidate_confirmation_minutes', 10);
     const windowEndsAt = new Date(Date.now() + confirmationMinutes * 60 * 1000);
 
-    // Garde optimiste : si la mission a changé de statut entre-temps (déjà assignée par
-    // un autre chemin, annulée...), on n'écrase rien.
+    // Garde optimiste : si la mission a changé de statut entre-temps (déjà assignée par un
+    // autre chemin, annulée...), on n'écrase rien. pending_candidate_id garde le mieux classé
+    // du lot à titre indicatif (affichage admin) uniquement — voir commentaire sur la colonne.
     const { rowCount } = await db.query(
-      `UPDATE missions SET pending_candidate_id=$1, candidate_window_ends_at=$2, updated_at=NOW()
+      `UPDATE missions SET pending_candidate_id=$1, candidate_window_ends_at=$2, batch_tiebreak_ends_at=NULL, updated_at=NOW()
        WHERE id=$3 AND status='pending' AND oeil_id IS NULL`,
-      [nextOeilId, windowEndsAt, mission.id]
+      [candidateIds[0], windowEndsAt, mission.id]
     );
     if (rowCount === 0) return;
 
-    await notify(db, nextOeilId,
-      '🎯 Confirmez votre disponibilité',
-      `Vous êtes le candidat le mieux classé pour "${mission.title}". Confirmez votre disponibilité sous ${confirmationMinutes} min pour être assigné.`,
-      'mission', mission.id, emitToUser, 'mission_view', 'candidateConfirmRequestTitle', 'candidateConfirmRequestBody',
-      { missionTitle: mission.title, minutes: confirmationMinutes }
+    await db.query(
+      `UPDATE mission_interests SET solicited_at=NOW() WHERE mission_id=$1 AND oeil_id = ANY($2::text[])`,
+      [mission.id, candidateIds]
     );
 
-    const { rows: [candidateContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [nextOeilId]);
-    if (candidateContact?.phone) {
-      await sendWhatsAppTemplate(waselTemplates.candidate_confirmation_request.template_name, candidateContact.phone, [mission.title, String(confirmationMinutes)]);
+    // Sollicitation SIMULTANÉE de tout le lot (notification in-app + WhatsApp à chacun).
+    for (const nextOeilId of candidateIds) {
+      await notify(db, nextOeilId,
+        '🎯 Confirmez votre disponibilité',
+        `Vous êtes parmi les candidats les mieux classés pour "${mission.title}". Confirmez votre disponibilité sous ${confirmationMinutes} min pour être considéré.`,
+        'mission', mission.id, emitToUser, 'mission_view', 'candidateConfirmRequestTitle', 'candidateConfirmRequestBody',
+        { missionTitle: mission.title, minutes: confirmationMinutes }
+      );
+
+      const { rows: [candidateContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [nextOeilId]);
+      if (candidateContact?.phone) {
+        await sendWhatsAppTemplate(waselTemplates.candidate_confirmation_request.template_name, candidateContact.phone, [mission.title, String(confirmationMinutes)]);
+      }
     }
 
-    if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, pending_candidate_id: nextOeilId });
+    if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, pending_candidate_id: candidateIds[0], batch_candidate_count: candidateIds.length });
   } else {
     const { rowCount } = await db.query(
-      `UPDATE missions SET is_urgent=true, pending_candidate_id=NULL, candidate_window_ends_at=NULL, updated_at=NOW()
+      `UPDATE missions SET is_urgent=true, pending_candidate_id=NULL, candidate_window_ends_at=NULL, batch_tiebreak_ends_at=NULL, updated_at=NOW()
        WHERE id=$1 AND status='pending' AND oeil_id IS NULL`,
       [mission.id]
     );
@@ -2206,61 +2261,87 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandl
 }));
 
 // ── POST /:id/candidate-confirm ── Le candidat sollicité confirme sa disponibilité ──
-// (voir advanceCandidateCascade) — seul le candidat actuellement sollicité (pending_
-// candidate_id) peut confirmer ; réutilise hireOeilCore, donc les mêmes vérifications
-// (suspension/cooldown/créneau) et le même comportement transfer_type='during' (chaîne
-// de transfert / split prorata) que toute autre embauche.
+// (voir advanceCandidateCascade) — seul un membre du lot actuellement sollicité (mission_
+// interests.solicited_at IS NOT NULL, non refusé) peut confirmer. N'assigne JAMAIS
+// immédiatement : enregistre seulement confirmed_at sur sa ligne. Dès la première
+// confirmation du lot, ouvre la fenêtre de départage (candidate_tiebreak_window_minutes,
+// SOUS GARDE IS NULL — fenêtre fixe depuis la 1ère confirmation, jamais repoussée par les
+// confirmations suivantes). La résolution (mieux classé parmi les confirmés → hireOeilCore)
+// est tranchée par le cron dédié (index.js), pas ici — voir spec réattribution par lot,
+// points 3/4/5.
 router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const io = req.app.get('io');
-  const emitToUser = req.app.get('emitToUser');
 
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (mission.pending_candidate_id !== req.user.id) {
-    return res.status(403).json({ error: "Vous n'êtes pas (ou plus) le candidat sollicité pour cette mission." });
+  if (mission.status !== 'pending' || mission.oeil_id) {
+    return res.status(409).json({ error: 'Cette mission a déjà été attribuée à un autre Œil.' });
   }
 
-  const result = await hireOeilCore(db, io, emitToUser, mission, req.user.id, {
-    changedById: req.user.id,
-    historyNote: 'Confirmation du candidat sollicité (cascade de réattribution)',
-    oeilNotifTitle: '🎉 Vous avez été sélectionné !',
-    oeilNotifBody: `Votre confirmation a été enregistrée pour : ${mission.title}`,
-    oeilNotifTitleKey: 'oeilSelectedTitle',
-    oeilNotifBodyKey: 'oeilSelectedBody',
-    oeilNotifParams: { missionTitle: mission.title },
-  });
-  if (!result.ok) return res.status(result.status).json({ error: result.error });
-
-  await notify(db, mission.client_id,
-    '✅ Remplaçant trouvé',
-    `Un remplaçant a confirmé sa disponibilité pour "${mission.title}".`,
-    'mission', mission.id, emitToUser, null, 'replacementConfirmedClientTitle', 'replacementConfirmedClientBody',
-    { missionTitle: mission.title }
+  const { rows: [interestRow] } = await db.query(
+    `SELECT confirmed_at FROM mission_interests
+     WHERE mission_id=$1 AND oeil_id=$2 AND solicited_at IS NOT NULL AND declined=false`,
+    [mission.id, req.user.id]
   );
-  const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-  if (clientContact?.phone) {
-    await sendWhatsAppTemplate(waselTemplates.replacement_confirmed_client.template_name, clientContact.phone, [mission.title]);
+  if (!interestRow) {
+    return res.status(403).json({ error: "Vous n'êtes pas (ou plus) sollicité pour cette mission." });
+  }
+  if (interestRow.confirmed_at) {
+    return res.json({ ok: true, already_confirmed: true, confirmed_at: interestRow.confirmed_at, batch_tiebreak_ends_at: mission.batch_tiebreak_ends_at });
   }
 
-  res.json({ mission: result.mission });
+  const tiebreakMinutes = await getSetting(db, 'candidate_tiebreak_window_minutes', 5);
+
+  // Les deux écritures (confirmation + éventuelle ouverture de la fenêtre de départage)
+  // forment un seul événement logique — transaction pour éviter qu'un crash entre les deux
+  // laisse une confirmation enregistrée sans jamais ouvrir la fenêtre qui la traite.
+  const { confirmedAt, batchTiebreakEndsAt } = await walletService.withTransaction(db, async (client) => {
+    const { rows: [ci] } = await client.query(
+      `UPDATE mission_interests SET confirmed_at=NOW() WHERE mission_id=$1 AND oeil_id=$2 RETURNING confirmed_at`,
+      [mission.id, req.user.id]
+    );
+    const { rows: [tb] } = await client.query(
+      `UPDATE missions SET batch_tiebreak_ends_at = NOW() + INTERVAL '1 minute' * $2::numeric
+       WHERE id=$1 AND batch_tiebreak_ends_at IS NULL
+       RETURNING batch_tiebreak_ends_at`,
+      [mission.id, tiebreakMinutes]
+    );
+    let batchTiebreakEndsAt = tb?.batch_tiebreak_ends_at;
+    if (!batchTiebreakEndsAt) {
+      const { rows: [m2] } = await client.query('SELECT batch_tiebreak_ends_at FROM missions WHERE id=$1', [mission.id]);
+      batchTiebreakEndsAt = m2.batch_tiebreak_ends_at;
+    }
+    return { confirmedAt: ci.confirmed_at, batchTiebreakEndsAt };
+  });
+
+  if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, batch_tiebreak_ends_at: batchTiebreakEndsAt });
+
+  res.json({ ok: true, confirmed_at: confirmedAt, batch_tiebreak_ends_at: batchTiebreakEndsAt });
 }));
 
 // ── POST /:id/candidate-decline ── Le candidat sollicité refuse explicitement ──
-// Exclusion définitive de cette mission (mission_interests.declined=true) puis passage
-// immédiat au candidat suivant, sans attendre l'expiration du délai de confirmation.
+// Exclusion définitive de cette mission (mission_interests.declined=true). Ne perturbe pas
+// le reste du lot en cours (pas de tirage d'un lot de remplacement immédiat) — les autres
+// membres du lot continuent d'être sollicités normalement jusqu'à résolution/expiration.
 router.post('/:id/candidate-decline', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const io = req.app.get('io');
-  const emitToUser = req.app.get('emitToUser');
 
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (mission.pending_candidate_id !== req.user.id) {
-    return res.status(403).json({ error: "Vous n'êtes pas (ou plus) le candidat sollicité pour cette mission." });
+
+  const { rows: [updated] } = await db.query(
+    `UPDATE mission_interests SET declined=true, confirmed_at=NULL
+     WHERE mission_id=$1 AND oeil_id=$2 AND solicited_at IS NOT NULL AND declined=false
+     RETURNING oeil_id`,
+    [mission.id, req.user.id]
+  );
+  if (!updated) {
+    return res.status(403).json({ error: "Vous n'êtes pas (ou plus) sollicité pour cette mission." });
   }
 
-  await advanceCandidateCascade(db, io, emitToUser, mission, { declinedOeilId: req.user.id });
+  if (io) io.to('room:admin').emit('mission_updated', { id: mission.id });
   res.json({ ok: true });
 }));
 
