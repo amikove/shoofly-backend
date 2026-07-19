@@ -72,8 +72,8 @@ module.exports = {
   // disponibilité et a été assigné, le client est notifié qu'un remplaçant a été trouvé.
   replacement_confirmed_client: {
     template_name: 'ticket_urgent_ouvert',
-    variableCount: 1,
-    note: '{{1}} titre de la mission',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} libellé fixe ("Remplaçant trouvé")',
   },
 
   // advanceCandidateCascade — liste de candidats initiale épuisée (tous refusés ou sans
@@ -81,16 +81,16 @@ module.exports = {
   // est informé à titre de transparence uniquement (jamais sollicité pour un choix).
   mission_urgent_broadened: {
     template_name: 'ticket_urgent_ouvert',
-    variableCount: 1,
-    note: '{{1}} titre de la mission',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} libellé fixe ("Recherche élargie")',
   },
 
   // PUT /users/admin/:id/toggle-active (désactivation) — l'Œil désactivé est notifié que
   // sa mission a été réattribuée automatiquement, sans ambiguïté sur l'absence de pénalité.
   oeil_reassigned_no_penalty: {
     template_name: 'ticket_urgent_ouvert',
-    variableCount: 1,
-    note: '{{1}} titre de la mission',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} libellé fixe ("Aucune pénalité")',
   },
 
   // Cron J-1 20h (index.js) — demande de confirmation active de présence pour une mission
@@ -119,9 +119,8 @@ module.exports = {
   // variables ({{1}},{{2}}) quel que soit l'appelant — un appel à 1 seule variable échoue en
   // HTTP 400 "Template variable count mismatch", indépendamment du problème de compte Wasel/
   // Meta déjà connu (OAuthException/502). oeil_reassigned_no_penalty, replacement_confirmed_
-  // client et mission_urgent_broadened ci-dessus déclarent encore variableCount=1 avec un seul
-  // argument au site d'appel — pré-existant, non corrigé ici (hors périmètre de cette session),
-  // voir rapport de session pour le détail.
+  // client et mission_urgent_broadened ci-dessus déclaraient le même défaut (variableCount=1,
+  // un seul argument au site d'appel) — corrigé le même jour (audit variableCount, 2026-07-19).
   presence_not_confirmed_no_penalty: {
     template_name: 'ticket_urgent_ouvert',
     variableCount: 2,

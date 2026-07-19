@@ -1377,7 +1377,7 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
 
         const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [req.params.id]);
         if (oeilContact?.phone) {
-          await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title]);
+          await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
         }
       }
     }

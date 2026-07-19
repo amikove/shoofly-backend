@@ -790,7 +790,7 @@ initDb().then(() => {
         );
         const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
         if (clientContact?.phone) {
-          await sendWhatsAppTemplate(waselTemplates.replacement_confirmed_client.template_name, clientContact.phone, [mission.title]);
+          await sendWhatsAppTemplate(waselTemplates.replacement_confirmed_client.template_name, clientContact.phone, [mission.title, 'Remplaçant trouvé']);
         }
       }
 
