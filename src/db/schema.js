@@ -246,7 +246,9 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('response_time_min_turns', '3'),
         ('dashboard_stuck_pending_hours', '24'),
         ('dashboard_low_reliability_threshold', '70'),
-        ('candidate_confirmation_minutes', '10')
+        ('candidate_confirmation_minutes', '10'),
+        ('presence_confirmation_deadline_minutes', '120'),
+        ('presence_confirmation_deadline_minutes_sameday', '45')
       ON CONFLICT (key) DO NOTHING;
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS is_flagged BOOLEAN DEFAULT false;
@@ -340,6 +342,16 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_no_replacement_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_super_admin BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]';
+
+    -- Confirmation active de présence — demandée au rappel J-1 20h, ou à défaut (mission
+    -- assignée le jour même, jamais passée par le rappel J-1) au rappel H-2 existant (voir
+    -- index.js et checkPresenceConfirmationDeadlines ci-dessous, routes/missions.js).
+    -- Remise à NULL sur toute nouvelle attribution d'oeil_id (POST /:id/accept, assign-admin,
+    -- hireOeilCore) pour qu'un remplaçant reparte sur un cycle de confirmation propre plutôt
+    -- que d'hériter de la deadline déjà expirée de l'Œil précédent.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS presence_confirmation_requested_at TIMESTAMPTZ;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS presence_confirmation_deadline_at TIMESTAMPTZ;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS presence_confirmed_at TIMESTAMPTZ;
 
     CREATE TABLE IF NOT EXISTS promo_codes (
       id              SERIAL PRIMARY KEY,

@@ -797,6 +797,27 @@ router.get('/campaign/five-star-bonus', authenticate, asyncHandler(async (req, r
   });
 }));
 
+// ── GET /missions/pending-confirmations ── Confirmations de présence en attente ──
+// Alimente la bannière globale côté frontend (affichée peu importe la page tant que la
+// liste n'est pas vide) — voir le rapport de session pour le contrat exact. Doit rester
+// déclarée AVANT GET /:id ci-dessous, sinon Express interpréterait "pending-confirmations"
+// comme un :id (même piège déjà évité par /actions-required et /campaign/five-star-bonus).
+router.get('/pending-confirmations', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT m.id, m.title, m.scheduled_at, m.presence_confirmation_deadline_at,
+      c.first_name AS client_first_name, c.last_name AS client_last_name
+    FROM missions m
+    JOIN users c ON c.id = m.client_id
+    WHERE m.oeil_id = $1
+      AND m.status = 'assigned'
+      AND m.presence_confirmation_requested_at IS NOT NULL
+      AND m.presence_confirmed_at IS NULL
+    ORDER BY m.presence_confirmation_deadline_at ASC
+  `, [req.user.id]);
+  res.json({ pending_confirmations: rows });
+}));
+
 // ── GET /missions/:id ──────────────────────────────────
 router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
@@ -876,7 +897,10 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
     let updated;
     try {
       updated = await transitionMission(db, req.params.id, 'pending', 'assigned', req.user.id, {
-        extraFields: { oeil_id: req.user.id, oeil2_id: oeil2Id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null },
+        extraFields: {
+          oeil_id: req.user.id, oeil2_id: oeil2Id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
+          presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
+        },
         note: 'Acceptée directement par l\'Œil',
       });
     } catch (e) {
@@ -1651,6 +1675,38 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   res.json({ ok: true, transfer_type: transferType, deadline });
 }));
 
+// ── POST /missions/:id/confirm-presence ── L'Œil confirme sa présence ──
+// Confirmation active demandée au rappel J-1 20h ou, à défaut (mission assignée le jour
+// même), au rappel H-2 (voir index.js + checkPresenceConfirmationDeadlines ci-dessous).
+// Idempotent : si déjà confirmée, renvoie succès sans erreur ni re-déclenchement (COALESCE).
+// N'exige pas qu'une demande active existe déjà (presence_confirmation_requested_at) — un
+// Œil peut confirmer par anticipation ; les crons J-1/H-2 sautent alors la mission (déjà
+// confirmée) sans jamais renvoyer de sollicitation ni poser de deadline.
+// Seul l'Œil actuellement assigné peut confirmer : si un remplacement a déjà été déclenché
+// (checkPresenceConfirmationDeadlines a retiré l'Œil, oeil_id a changé ou est redevenu NULL),
+// cette vérification rejette naturellement toute confirmation tardive de l'Œil d'origine —
+// voir le rapport de session pour la nuance sur ce cas (point f de la spec).
+router.post('/:id/confirm-presence', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const io = req.app.get('io');
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.oeil_id !== req.user.id) {
+    return res.status(403).json({ error: "Vous n'êtes pas (ou plus) l'Œil assigné à cette mission." });
+  }
+
+  const { rows: [updated] } = await db.query(
+    `UPDATE missions SET presence_confirmed_at = COALESCE(presence_confirmed_at, NOW())
+     WHERE id=$1 AND oeil_id=$2 RETURNING presence_confirmed_at`,
+    [mission.id, req.user.id]
+  );
+
+  if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, presence_confirmed_at: updated.presence_confirmed_at });
+
+  res.json({ ok: true, presence_confirmed_at: updated.presence_confirmed_at });
+}));
+
 // ── POST /missions/:id/assign-admin ── Admin affecte manuellement ──
 router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
     const db = getDb();
@@ -1700,7 +1756,10 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
 
   try {
     await transitionMission(db, mission.id, 'pending', 'assigned', req.user.id, {
-      extraFields: { oeil_id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null },
+      extraFields: {
+        oeil_id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
+        presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
+      },
       note: 'Affectation manuelle par admin',
     });
   } catch (e) {
@@ -1809,7 +1868,96 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
   }
 }
 
+// ── Cron : confirmations de présence expirées sans réponse ──────────────
+// (appelé depuis index.js via cron) — déclenche le mécanisme universel de remplacement
+// (advanceCandidateCascade) exactement comme PUT /users/admin/:id/toggle-active
+// (désactivation admin, voir routes/users.js) : aucune pénalité, aucun mouvement financier,
+// aucun cooldown ni transfer_count — une absence de réponse au délai de confirmation n'est
+// pas une faute avérée (voir rapport de session, règle e). transfer_type est toujours
+// 'before' : cette vérification ne porte que sur des missions encore 'assigned' (jamais
+// en_route/active — la confirmation de présence se joue entièrement avant le début).
+// La suite (recherche séquentielle de remplaçant, passage en urgent si liste épuisée,
+// annulation + remboursement si aucun remplaçant avant transfer_deadline) est entièrement
+// gérée par l'infrastructure existante (advanceCandidateCascade, checkTransferDeadlines
+// ci-dessus) — rien de nouveau n'est construit ici pour ces étapes.
+async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
+  const { rows: expired } = await db.query(`
+    SELECT m.*, u.first_name, u.last_name
+    FROM missions m
+    JOIN users u ON u.id = m.oeil_id
+    WHERE m.status='assigned'
+      AND m.oeil_id IS NOT NULL
+      AND m.presence_confirmation_deadline_at IS NOT NULL
+      AND m.presence_confirmation_deadline_at <= NOW()
+      AND m.presence_confirmed_at IS NULL
+  `);
 
+  for (const mission of expired) {
+    const oeilId = mission.oeil_id;
+
+    const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+    const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+    const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+    const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+
+    let updated;
+    try {
+      updated = await transitionMission(db, mission.id, 'assigned', 'pending', null, {
+        extraFields: {
+          is_priority: true,
+          transfer_type: 'before',
+          transferred_from: oeilId,
+          transfer_reason: 'Confirmation de présence non reçue avant expiration du délai',
+          transfer_deadline: deadline,
+          oeil_id: null,
+          presence_confirmed_at: null,
+          presence_confirmation_requested_at: null,
+          presence_confirmation_deadline_at: null,
+        },
+        extraGuards: { oeil_id: oeilId },
+        note: 'Réattribution automatique — confirmation de présence non reçue à temps',
+      });
+    } catch (e) {
+      if (e instanceof MissionTransitionError) {
+        console.log(`ℹ️ checkPresenceConfirmationDeadlines: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
+        continue;
+      }
+      throw e;
+    }
+
+    // Retire la propre candidature de l'Œil sur sa propre mission (même correctif que
+    // POST /:id/transfer et la désactivation admin, voir bug fantôme audit 2.9) avant de
+    // lancer la cascade.
+    await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, oeilId]);
+
+    await advanceCandidateCascade(db, io, emitToUser, updated, {});
+
+    await notify(db, oeilId,
+      '⏰ Présence non confirmée',
+      `Vous n'avez pas confirmé votre présence à temps pour "${mission.title}". La mission a été réattribuée. Aucune pénalité ni retenue financière ne vous est appliquée.`,
+      'warning', mission.id, emitToUser, null, 'presenceNotConfirmedReassignedTitle', 'presenceNotConfirmedReassignedBody',
+      { missionTitle: mission.title }
+    );
+
+    const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [oeilId]);
+    if (oeilContact?.phone) {
+      await sendWhatsAppTemplate(waselTemplates.presence_not_confirmed_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
+    }
+
+    const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+    for (const admin of admins) {
+      await notify(db, admin.id,
+        '🔄 Réattribution automatique — présence non confirmée',
+        `L'Œil ${mission.first_name} ${mission.last_name} n'a pas confirmé sa présence à temps pour "${mission.title}". Réattribution automatique lancée, aucune pénalité appliquée.`,
+        'warning', mission.id, emitToUser, 'admin_missions', 'presenceNotConfirmedAdminTitle', 'presenceNotConfirmedAdminBody',
+        { missionTitle: mission.title, oeilName: `${mission.first_name} ${mission.last_name}` }
+      );
+    }
+
+    if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'pending', is_priority: true });
+    console.log(`⏰ Confirmation de présence non reçue à temps — mission ${mission.id}, Œil ${oeilId} retiré sans pénalité`);
+  }
+}
 
 
 // ── Cœur de la logique d'embauche d'un Œil parmi les intéressés — réutilisé
@@ -1866,7 +2014,10 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   let updated;
   try {
     updated = await transitionMission(db, mission.id, 'pending', 'assigned', changedById, {
-      extraFields: { oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null, pending_candidate_id: null },
+      extraFields: {
+        oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null, pending_candidate_id: null,
+        presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
+      },
       note: historyNote,
     });
   } catch (e) {
@@ -2340,6 +2491,7 @@ async function checkMissionEditRequestExpiry(db, emitToUser) {
 
 router.checkTransferDeadlines = checkTransferDeadlines;
 router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
+router.checkPresenceConfirmationDeadlines = checkPresenceConfirmationDeadlines;
 router.hireOeilCore = hireOeilCore;
 router.advanceCandidateCascade = advanceCandidateCascade;
 router.notify = notify;
