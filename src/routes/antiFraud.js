@@ -4,7 +4,11 @@ const { authenticate, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const { getSetting } = require('../utils/settings');
 const asyncHandler = require('../middleware/asyncHandler');
-const { logStatus } = require('../utils/missionHistory');
+const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
+// Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
+// de dupliquer la logique de sélection de candidat — même approche que
+// PUT /users/admin/:id/toggle-active (routes/users.js).
+const missionRoutes = require('./missions');
 
 // ══ RÈGLES ANTI-FRAUDE ════════════════════════════════════════
 // Score de risque : 0-100. Au-delà de 70 → alerte. Au-delà de 90 → blocage auto.
@@ -412,12 +416,16 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
     [req.params.userId, reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.', 'accountSuspendedTitle', reason ? null : 'accountSuspendedDefaultBody', null]
   );
 
-  // Si l'utilisateur bloqué est un Œil avec des missions en cours, les remettre
-  // automatiquement en file d'attente prioritaire plutôt que de les laisser
-  // bloquées avec un prestataire qui ne peut plus les honorer. Même mécanisme
-  // que POST /:id/transfer (missions.js) : pending + is_priority + délai de
-  // grâce selon le type de mission. Pas de pénalité de fiabilité ici — le
-  // blocage du compte est déjà la conséquence.
+  // Si l'utilisateur bloqué est un Œil avec des missions en cours, réattribution automatique
+  // via la cascade de confirmation séquentielle partagée (transitionMission + advanceCandidateCascade),
+  // même mécanisme que PUT /users/admin/:id/toggle-active — remplace l'ancien passage direct en
+  // file d'attente prioritaire (bug corrigé, audit 2026-07-19 : héritage de l'ancien système
+  // fast/choose, jamais migré vers la cascade lors du remplacement en commit f908f6c).
+  // transfer_type toujours forcé à 'before' (jamais 'during', même si la mission était déjà
+  // 'active'/'en_route') : un blocage anti-fraude ne doit produire aucun mouvement financier ni
+  // split au prorata pour l'Œil bloqué. Contrairement à toggle-active, aucun message "aucune
+  // pénalité" n'est envoyé à l'Œil ici — un blocage pour fraude reste une mesure punitive.
+  let reassignedCount = 0;
   const { rows: strandedMissions } = await db.query(
     `SELECT * FROM missions WHERE oeil_id=$1 AND status IN ('assigned','en_route','active')`,
     [req.params.userId]
@@ -425,20 +433,32 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
   const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
   const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
   for (const mission of strandedMissions) {
-    const transferType = mission.status === 'assigned' ? 'before' : 'during';
     const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
     const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+    let updated;
+    try {
+      updated = await transitionMission(db, mission.id, mission.status, 'pending', req.user.id, {
+        extraFields: {
+          is_priority: true,
+          transfer_type: 'before',
+          transferred_from: req.params.userId,
+          transfer_reason: 'Compte prestataire bloqué pour fraude',
+          transfer_deadline: deadline,
+          oeil_id: null,
+        },
+        note: 'Réattribution automatique — Œil bloqué par un admin (anti-fraude)',
+      });
+    } catch (e) {
+      if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
+      throw e;
+    }
+    reassignedCount++;
 
-    const { rowCount } = await db.query(
-      `UPDATE missions SET
-         status='pending', is_priority=true, transfer_type=$1, transferred_from=$2,
-         transfer_reason=$3, transfer_deadline=$4, oeil_id=NULL, updated_at=NOW()
-       WHERE id=$5 AND status=$6`,
-      [transferType, req.params.userId, 'Compte prestataire indisponible', deadline, mission.id, mission.status]
-    );
-    if (rowCount === 0) continue; // statut déjà changé entre-temps
+    // Retire la propre candidature de l'Œil bloqué sur sa propre mission (même correctif que
+    // POST /:id/transfer et toggle-active, voir bug fantôme audit 2.9) avant de lancer la cascade.
+    await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, req.params.userId]);
 
-    await logStatus(db, mission.id, 'pending', req.user.id, 'Réattribution automatique — Œil bloqué par un admin');
+    await missionRoutes.advanceCandidateCascade(db, io, emitToUser, updated, {});
 
     // Formulation neutre côté client : ne mentionne ni blocage ni fraude.
     const title = '⚠️ Changement sur votre mission';
@@ -448,10 +468,9 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
       [mission.client_id, title, body, mission.id, 'missionChangeAlertTitle', 'missionChangeAlertBody', JSON.stringify({ missionTitle: mission.title })]
     );
     if (emitToUser) emitToUser(mission.client_id, 'notification', { title, body });
-    if (io) io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
   }
 
-  res.json({ message: 'Compte bloqué', user_id: req.params.userId, reassigned_missions: strandedMissions.length });
+  res.json({ message: 'Compte bloqué', user_id: req.params.userId, reassigned_missions: reassignedCount });
 }));
 
 // ── POST /anti-fraud/hold-withdrawal/:id ─────────────────
