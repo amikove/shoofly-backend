@@ -158,6 +158,9 @@ io.on('connection', (socket) => {
   if (!userSockets.has(uid)) userSockets.set(uid, new Set());
   userSockets.get(uid).add(socket.id);
 
+  // Admin dashboard: join the broadcast room for live mission/ticket events
+  if (socket.userRole === 'admin') socket.join('room:admin');
+
   // Auto-join mission rooms this user is part of
   socket.on('join_mission', async (missionId) => {
   try {
