@@ -12,6 +12,8 @@ const { initDb, getDb } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
 const { runAutoValidateMissions } = require('./jobs/autoValidateMissions');
+const { sendWhatsAppTemplate } = require('./services/wasel');
+const waselTemplates = require('./config/waselTemplates');
 
 const cron = require('node-cron');
 const xss = require('xss-clean');
@@ -26,6 +28,7 @@ const missionRoutes = require('./routes/missions');
 const missionRoutesModule = require('./routes/missions');
 const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
 const checkMissionEditRequestExpiry = missionRoutesModule.checkMissionEditRequestExpiry;
+const checkPresenceConfirmationDeadlines = missionRoutesModule.checkPresenceConfirmationDeadlines;
 const advanceCandidateCascade = missionRoutesModule.advanceCandidateCascade;
 const notify = missionRoutesModule.notify;
 const mediaRoutes   = require('./routes/media');
@@ -259,8 +262,15 @@ initDb().then(() => {
   let cronStaleMissionsRunning = false;
   let cronCandidateWindowRunning = false;
   let cronTicketAutoResolveRunning = false;
+  let cronPresenceConfirmationRunning = false;
 
-// ── Cron J-1 20h — Rappel mission demain ─────────────────
+// ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
+  // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
+  // (POST /missions/:id/confirm-presence — voir routes/missions.js) avec un délai de réponse
+  // (presence_confirmation_deadline_minutes, défaut 120min → ~22h le soir même). Sans réponse
+  // avant expiration, checkPresenceConfirmationDeadlines (cron dédié ci-dessous) déclenche le
+  // remplacement automatique. Missions déjà confirmées ou déjà sollicitées (garde défensive
+  // contre un double tick) sont sautées.
   cron.schedule('0 20 * * *', async () => {
     if (cronReminderJ1Running) { console.warn('⏭️ Cron J-1 rappel déjà en cours, tick ignoré'); return; }
     cronReminderJ1Running = true;
@@ -270,35 +280,51 @@ initDb().then(() => {
       const tomorrow = new Date();
       tomorrow.setDate(tomorrow.getDate() + 1);
       const dateStr = tomorrow.toISOString().slice(0, 10);
+      const deadlineMinutes = await getSetting(db, 'presence_confirmation_deadline_minutes', 120);
 
       const { rows: missions } = await db.query(`
-        SELECT m.*, u.first_name, u.last_name
+        SELECT m.*, u.first_name, u.last_name, u.phone
         FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status IN ('assigned')
         AND DATE(m.scheduled_at) = $1
         AND m.oeil_id IS NOT NULL
+        AND m.presence_confirmed_at IS NULL
+        AND m.presence_confirmation_requested_at IS NULL
       `, [dateStr]);
 
       for (const m of missions) {
+        const deadlineAt = new Date(Date.now() + deadlineMinutes * 60 * 1000);
+        await db.query(
+          `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1 WHERE id=$2`,
+          [deadlineAt, m.id]
+        );
+        const missionTime = new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
            VALUES ($1, $2, $3, 'warning', $4, 'mission_view', $5, $6, $7)`,
           [m.oeil_id,
-           '⏰ Rappel mission demain',
-           `Vous avez une mission demain : "${m.title}" à ${new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}. Confirmez votre présence en étant à l'heure.`,
+           '✅ Confirmez votre présence — mission demain',
+           `Confirmez votre présence pour "${m.title}" prévue demain à ${missionTime}. Vous avez jusqu'à ${deadlineTime} ce soir pour confirmer, sinon nous chercherons un remplaçant.`,
            m.id,
-           'missionReminderTomorrowTitle',
-           'missionReminderTomorrowBody',
-           JSON.stringify({ missionTitle: m.title, time: new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) })]
+           'presenceConfirmationRequestJ1Title',
+           'presenceConfirmationRequestJ1Body',
+           JSON.stringify({ missionTitle: m.title, time: missionTime, deadlineTime })]
         );
         if (emitToUser) emitToUser(m.oeil_id, 'notification', {
-          title: '⏰ Rappel mission demain',
-          body: `Mission demain : "${m.title}"`,
+          title: '✅ Confirmez votre présence — mission demain',
+          body: `"${m.title}" — confirmez avant ${deadlineTime}`,
           missionId: m.id,
           type: 'warning'
         });
-        console.log(`⏰ Rappel J-1 envoyé pour mission ${m.id}`);
+        if (m.phone) {
+          await sendWhatsAppTemplate(waselTemplates.presence_confirmation_request_j1.template_name, m.phone, [m.title, deadlineTime]);
+        } else {
+          console.warn(`[wasel] Œil ${m.oeil_id} sans téléphone renseigné — envoi ignoré (presence_confirmation_request_j1)`);
+        }
+        console.log(`⏰ Confirmation de présence demandée (J-1) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
       }
     } catch (e) { console.error('❌ Cron J-1 rappel error:', e.message); }
     finally { cronReminderJ1Running = false; }
@@ -315,7 +341,7 @@ initDb().then(() => {
       const dateStr = tomorrow.toISOString().slice(0, 10);
 
       const { rows: missions } = await db.query(`
-        SELECT m.*, 
+        SELECT m.*,
           u.first_name AS oeil_first, u.last_name AS oeil_last, u.phone AS oeil_phone,
           c.first_name AS client_first, c.last_name AS client_last
         FROM missions m
@@ -324,6 +350,7 @@ initDb().then(() => {
         WHERE m.status IN ('assigned')
         AND DATE(m.scheduled_at) = $1
         AND m.oeil_id IS NOT NULL
+        AND m.presence_confirmed_at IS NULL
         ORDER BY m.city, m.quartier
       `, [dateStr]);
 
@@ -539,24 +566,65 @@ initDb().then(() => {
 
       // H-2h (marge ±10min, dimensionnée pour la fréquence du cron */30 * * * *)
       const { rows: missions2h } = await db.query(`
-        SELECT m.* FROM missions m
+        SELECT m.*, u.phone FROM missions m
+        JOIN users u ON u.id = m.oeil_id
         WHERE m.status = 'assigned'
         AND m.scheduled_at BETWEEN NOW() + INTERVAL '1 minute' * $1::numeric AND NOW() + INTERVAL '1 minute' * $2::numeric
         AND m.oeil_id IS NOT NULL
       `, [reminderEarlyMinutes - 10, reminderEarlyMinutes + 10]);
       for (const m of missions2h) {
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, '⏰ Mission dans 2 heures', $2, 'warning', $3, 'mission_view', $4, $5, $6)`,
-          [m.oeil_id, `Votre mission "${m.title}" commence dans 2 heures. Préparez-vous !`, m.id,
-           'missionIn2HoursTitle', 'missionIn2HoursBody', JSON.stringify({ missionTitle: m.title })]
-        );
-        if (emitToUser) emitToUser(m.oeil_id, 'notification', {
-          title: '⏰ Mission dans 2 heures',
-          body: `"${m.title}" commence bientôt`,
-          missionId: m.id,
-          type: 'warning'
-        });
+        // Mission assignée le jour même — jamais passée par le rappel J-1 20h de la veille
+        // (presence_confirmation_requested_at encore NULL) : le rappel H-2 sert alors de
+        // moment de demande de confirmation active, À LA PLACE du rappel informatif ci-dessous,
+        // avec un délai raccourci dédié (presence_confirmation_deadline_minutes_sameday, défaut
+        // 45min). Missions déjà sollicitées via J-1, ou déjà confirmées : comportement
+        // strictement inchangé (rappel purement informatif, comme avant cette session).
+        if (!m.presence_confirmation_requested_at && !m.presence_confirmed_at) {
+          const deadlineSamedayMinutes = await getSetting(db, 'presence_confirmation_deadline_minutes_sameday', 45);
+          const deadlineAt = new Date(Date.now() + deadlineSamedayMinutes * 60 * 1000);
+          await db.query(
+            `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1 WHERE id=$2`,
+            [deadlineAt, m.id]
+          );
+          const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
+          await db.query(
+            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+             VALUES ($1, $2, $3, 'warning', $4, 'mission_view', $5, $6, $7)`,
+            [m.oeil_id,
+             '✅ Confirmez votre présence — mission bientôt',
+             `Confirmez votre présence pour "${m.title}" prévue dans ~2 heures. Vous avez jusqu'à ${deadlineTime} pour confirmer, sinon nous chercherons un remplaçant en urgence.`,
+             m.id,
+             'presenceConfirmationRequestSamedayTitle',
+             'presenceConfirmationRequestSamedayBody',
+             JSON.stringify({ missionTitle: m.title, deadlineTime })]
+          );
+          if (emitToUser) emitToUser(m.oeil_id, 'notification', {
+            title: '✅ Confirmez votre présence — mission bientôt',
+            body: `"${m.title}" — confirmez avant ${deadlineTime}`,
+            missionId: m.id,
+            type: 'warning'
+          });
+          if (m.phone) {
+            await sendWhatsAppTemplate(waselTemplates.presence_confirmation_request_sameday.template_name, m.phone, [m.title, deadlineTime]);
+          } else {
+            console.warn(`[wasel] Œil ${m.oeil_id} sans téléphone renseigné — envoi ignoré (presence_confirmation_request_sameday)`);
+          }
+          console.log(`⏰ Confirmation de présence demandée (H-2, jour même) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
+        } else {
+          await db.query(
+            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+             VALUES ($1, '⏰ Mission dans 2 heures', $2, 'warning', $3, 'mission_view', $4, $5, $6)`,
+            [m.oeil_id, `Votre mission "${m.title}" commence dans 2 heures. Préparez-vous !`, m.id,
+             'missionIn2HoursTitle', 'missionIn2HoursBody', JSON.stringify({ missionTitle: m.title })]
+          );
+          if (emitToUser) emitToUser(m.oeil_id, 'notification', {
+            title: '⏰ Mission dans 2 heures',
+            body: `"${m.title}" commence bientôt`,
+            missionId: m.id,
+            type: 'warning'
+          });
+        }
       }
 
       // H-30min (marge ±10min)
@@ -616,6 +684,25 @@ initDb().then(() => {
       await checkMissionEditRequestExpiry(db, emitToUser);
     } catch (e) { console.error('❌ Mission edit request expiry cron error:', e.message); }
     finally { cronMissionEditExpiryRunning = false; }
+  });
+
+  // ── Cron toutes les 5 min — Confirmations de présence expirées ────────────
+  // Vérifie presence_confirmation_deadline_at (posée par le rappel J-1 20h ou, à défaut, par
+  // le rappel H-2 pour une mission assignée le jour même — voir les deux crons ci-dessus) et
+  // déclenche le remplacement automatique sans pénalité via checkPresenceConfirmationDeadlines
+  // (routes/missions.js), qui délègue elle-même à advanceCandidateCascade — même cadence que
+  // les autres vérifications de deadline (checkTransferDeadlines, checkMissionEditRequestExpiry
+  // ci-dessus), largement suffisante face au délai le plus court (45min, cas jour même).
+  cron.schedule('*/5 * * * *', async () => {
+    if (cronPresenceConfirmationRunning) { console.warn('⏭️ Cron confirmations de présence déjà en cours, tick ignoré'); return; }
+    cronPresenceConfirmationRunning = true;
+    try {
+      const db = getDb();
+      const io = app.get('io');
+      const emitToUser = app.get('emitToUser');
+      await checkPresenceConfirmationDeadlines(db, io, emitToUser);
+    } catch (e) { console.error('❌ Cron confirmations de présence error:', e.message); }
+    finally { cronPresenceConfirmationRunning = false; }
   });
 
   // ── Cron toutes les 2 min — Cascade de confirmation candidat ──────────────

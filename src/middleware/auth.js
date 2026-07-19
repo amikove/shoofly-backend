@@ -47,6 +47,11 @@ function isSuspendedOeilAllowed(req) {
     if (method === 'POST' && /^\/[^/]+\/messages$/.test(path)) return true;
     if (method === 'POST' && /^\/[^/]+\/seen$/.test(path)) return true;
     if (method === 'POST' && /^\/[^/]+\/location$/.test(path)) return true;
+    // Confirmer sa présence concerne une mission déjà assignée (pas une nouvelle prise de
+    // mission) — même logique que /:id/status, /:id/location : un Œil suspendu doit pouvoir
+    // continuer d'agir sur ce qu'il a déjà, sinon la suspension garantirait mécaniquement un
+    // non-réponse et un remplacement, ce qui n'est pas le rôle de la suspension.
+    if (method === 'POST' && /^\/[^/]+\/confirm-presence$/.test(path)) return true;
     return false;
   }
 

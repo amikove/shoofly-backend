@@ -93,6 +93,41 @@ module.exports = {
     note: '{{1}} titre de la mission',
   },
 
+  // Cron J-1 20h (index.js) — demande de confirmation active de présence pour une mission
+  // prévue demain. Envoi one-way (pas de bouton de réponse rapide géré : le template partagé
+  // 'ticket_urgent_ouvert' n'a pas de quick-reply configuré côté Meta, et aucun webhook de
+  // réception de réponse WhatsApp n'existe dans ce backend — voir rapport de session, point 2).
+  presence_confirmation_request_j1: {
+    template_name: 'ticket_urgent_ouvert',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} heure limite de confirmation (ex: "22h00")',
+  },
+
+  // Cron H-2 (index.js) — même demande de confirmation active, cas mission assignée le jour
+  // même (jamais passée par le rappel J-1), délai raccourci dédié.
+  presence_confirmation_request_sameday: {
+    template_name: 'ticket_urgent_ouvert',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} heure limite de confirmation (ex: "14h45")',
+  },
+
+  // checkPresenceConfirmationDeadlines (job planifié, routes/missions.js) — délai de
+  // confirmation de présence expiré sans réponse, réattribution automatique lancée,
+  // sans ambiguïté sur l'absence de pénalité (même esprit que oeil_reassigned_no_penalty).
+  // variableCount=2 corrigé empiriquement (audit session confirmation de présence,
+  // 2026-07-19) : le template Wasel réel 'ticket_urgent_ouvert' exige TOUJOURS exactement 2
+  // variables ({{1}},{{2}}) quel que soit l'appelant — un appel à 1 seule variable échoue en
+  // HTTP 400 "Template variable count mismatch", indépendamment du problème de compte Wasel/
+  // Meta déjà connu (OAuthException/502). oeil_reassigned_no_penalty, replacement_confirmed_
+  // client et mission_urgent_broadened ci-dessus déclarent encore variableCount=1 avec un seul
+  // argument au site d'appel — pré-existant, non corrigé ici (hors périmètre de cette session),
+  // voir rapport de session pour le détail.
+  presence_not_confirmed_no_penalty: {
+    template_name: 'ticket_urgent_ouvert',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} libellé fixe ("Aucune pénalité")',
+  },
+
   // ── Entrées préparées mais non utilisées (templates dédiés pas encore approuvés côté Wasel) ──
 
   // Non utilisée pour l'instant — le flux de modification de mission (PUT /missions/:id sur une
