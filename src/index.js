@@ -1,4 +1,11 @@
 require('dotenv').config();
+
+// Diagnostic fuseau horaire — les 12 cron.schedule ci-dessous fixent explicitement
+// { timezone: 'Africa/Casablanca' } donc ne dépendent pas de ce réglage, mais ce log
+// confirme dans les logs Render quel fuseau le processus utilise par défaut (utile pour
+// tout code qui, lui, s'appuie encore sur l'horloge locale du process — voir RAPPORT_TIMEZONE_CRONS.md).
+console.log(`🌍 TZ process: ${process.env.TZ || '(non définie)'} | Fuseau résolu: ${Intl.DateTimeFormat().resolvedOptions().timeZone} | Offset actuel: UTC${(-new Date().getTimezoneOffset() / 60) >= 0 ? '+' : ''}${-new Date().getTimezoneOffset() / 60}`);
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -303,8 +310,8 @@ initDb().then(() => {
           `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1 WHERE id=$2`,
           [deadlineAt, m.id]
         );
-        const missionTime = new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
-        const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        const missionTime = new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
+        const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -332,7 +339,7 @@ initDb().then(() => {
       }
     } catch (e) { console.error('❌ Cron J-1 rappel error:', e.message); }
     finally { cronReminderJ1Running = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron J-1 22h — Email récap admin non-confirmations ───
   cron.schedule('0 22 * * *', async () => {
@@ -369,11 +376,11 @@ initDb().then(() => {
       }, {});
 
       // Construire le corps de l'email
-      let body = `Récapitulatif missions du ${tomorrow.toLocaleDateString('fr-FR')} — ${missions.length} mission(s) en attente de confirmation\n\n`;
+      let body = `Récapitulatif missions du ${tomorrow.toLocaleDateString('fr-FR', { timeZone: 'Africa/Casablanca' })} — ${missions.length} mission(s) en attente de confirmation\n\n`;
       for (const [zone, ms] of Object.entries(grouped)) {
         body += `📍 ${zone}\n`;
         for (const m of ms) {
-          body += `  • ${m.title} — ${new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}\n`;
+          body += `  • ${m.title} — ${new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' })}\n`;
           body += `    Œil : ${m.oeil_first} ${m.oeil_last} (${m.oeil_phone})\n`;
           body += `    Client : ${m.client_first} ${m.client_last}\n\n`;
         }
@@ -396,7 +403,7 @@ initDb().then(() => {
       console.log(`📋 Récap admin envoyé — ${missions.length} missions demain`);
     } catch (e) { console.error('❌ Cron récap admin error:', e.message); }
     finally { cronRecapAdminRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les heures — Alertes H et H+30 ───────────
   cron.schedule('*/30 * * * *', async () => {
@@ -520,7 +527,7 @@ initDb().then(() => {
 
     } catch (e) { console.error('❌ Cron H/H+30 error:', e.message); }
     finally { cronAlertHRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les heures — Missions expirées (niveau 3) ─
   cron.schedule('0 * * * *', async () => {
@@ -556,7 +563,7 @@ initDb().then(() => {
       }
     } catch (e) { console.error('❌ Cron missions expirées error:', e.message); }
     finally { cronExpiredMissionsRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron J H-2h et H-30min — Rappels avant mission ──────
   cron.schedule('*/30 * * * *', async () => {
@@ -590,7 +597,7 @@ initDb().then(() => {
             `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1 WHERE id=$2`,
             [deadlineAt, m.id]
           );
-          const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+          const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
           await db.query(
             `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -664,7 +671,7 @@ initDb().then(() => {
       }
     } catch (e) { console.error('❌ Cron rappels error:', e.message); }
     finally { cronPreMissionRemindersRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // Vérifier deadlines transfert toutes les 5 minutes
   cron.schedule('*/5 * * * *', async () => {
@@ -676,7 +683,7 @@ initDb().then(() => {
       await checkTransferDeadlines(db, emitToUser);
     } catch (e) { console.error('❌ Transfer deadline cron error:', e.message); }
     finally { cronTransferDeadlineRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // Expirer les demandes de modification de mission sans réponse de l'Œil toutes les 5 minutes
   cron.schedule('*/5 * * * *', async () => {
@@ -688,7 +695,7 @@ initDb().then(() => {
       await checkMissionEditRequestExpiry(db, emitToUser);
     } catch (e) { console.error('❌ Mission edit request expiry cron error:', e.message); }
     finally { cronMissionEditExpiryRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 5 min — Confirmations de présence expirées ────────────
   // Vérifie presence_confirmation_deadline_at (posée par le rappel J-1 20h ou, à défaut, par
@@ -707,7 +714,7 @@ initDb().then(() => {
       await checkPresenceConfirmationDeadlines(db, io, emitToUser);
     } catch (e) { console.error('❌ Cron confirmations de présence error:', e.message); }
     finally { cronPresenceConfirmationRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 2 min — Cascade de confirmation candidat PAR LOT ──────
   // Deux traitements distincts, dans cet ordre de priorité STRICT (voir spec réattribution
@@ -808,7 +815,7 @@ initDb().then(() => {
       }
     } catch (e) { console.error('❌ Cron cascade candidat error:', e.message); }
     finally { cronCandidateWindowRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   cron.schedule('0 * * * *', async () => {
     if (cronAutoValidateRunning) { console.warn('⏭️ Cron auto-validation déjà en cours, tick ignoré'); return; }
@@ -817,7 +824,7 @@ initDb().then(() => {
       await runAutoValidateMissions(getDb());
     } catch (e) { console.error('❌ Cron error:', e.message); }
     finally { cronAutoValidateRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 30 min — Missions jamais assignées (12h+, encore >4h avant le créneau) ──
   cron.schedule('*/30 * * * *', async () => {
@@ -856,7 +863,7 @@ initDb().then(() => {
         }
     } catch (e) { console.error('❌ Cron missions sans Œil error:', e.message); }
     finally { cronStaleMissionsRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les heures — auto-résolution des tickets après 72h d'inactivité ──
   // IMPORTANT : is_urgent=true est EXCLU explicitement de la requête (jamais concerné
@@ -909,7 +916,7 @@ initDb().then(() => {
       }
     } catch (e) { console.error('❌ Cron auto-résolution tickets error:', e.message); }
     finally { cronTicketAutoResolveRunning = false; }
-  });
+  }, { timezone: 'Africa/Casablanca' });
 
   // Keep-alive pour Render plan gratuit
 if (process.env.NODE_ENV === 'production') {
