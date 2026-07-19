@@ -2241,7 +2241,7 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
 
     const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
     if (clientContact?.phone) {
-      await sendWhatsAppTemplate(waselTemplates.mission_urgent_broadened.template_name, clientContact.phone, [mission.title]);
+      await sendWhatsAppTemplate(waselTemplates.mission_urgent_broadened.template_name, clientContact.phone, [mission.title, 'Recherche élargie']);
     }
 
     if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, is_urgent: true });
