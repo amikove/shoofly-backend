@@ -1,4 +1,5 @@
 ﻿const router = require('express').Router();
+const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
@@ -345,8 +346,18 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
   res.json({ missions, total, page: +page, pages: Math.ceil(total / limit) });
 }));
 
+// Rate limit dédié sur la création de mission — 10 missions / 15min par IP,
+// en plus du plafond global déjà appliqué à toutes les routes (index.js).
+const missionCreateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Trop de missions créées depuis cette adresse. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // ── POST /missions ─────────────────────────────────────────
-router.post('/', authenticate, requireRole('client'), [
+router.post('/', missionCreateLimiter, authenticate, requireRole('client'), [
   body('type').isIn(['immobilier','file_attente','audit','personnalisee']),
   body('title').trim().isLength({ min: 6, max: 200 }),
   body('address').trim().notEmpty(),

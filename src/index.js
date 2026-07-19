@@ -110,6 +110,15 @@ const uploadLimiter = rateLimit({
   message: { error: 'Trop d\'uploads. Réessayez dans 10 minutes.' },
 });
 
+// Rate limit strict sur inscription — 5 comptes / 15min par IP
+const registerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Trop de comptes créés depuis cette adresse. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json({ limit: '5mb' }));
 app.use(xss());
@@ -118,8 +127,9 @@ app.use(mongoSanitize());
 app.use('/uploads', express.static(path.resolve(process.env.UPLOAD_DIR || './uploads')));
 
 // ── Routes ────────────────────────────────────────────────
-app.use('/api/auth/login', loginLimiter);
-app.use('/api/media',      uploadLimiter);
+app.use('/api/auth/login',    loginLimiter);
+app.use('/api/auth/register', registerLimiter);
+app.use('/api/media',         uploadLimiter);
 app.use('/api/auth',     authRoutes);
 app.use('/api/missions', missionRoutes);
 app.use('/api/media',    mediaRoutes);
