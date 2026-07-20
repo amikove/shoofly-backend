@@ -1,5 +1,18 @@
 require('dotenv').config();
 
+// Filet de sécurité de dernier recours — une exception qui arrive jusqu'ici a échappé à
+// toute la gestion d'erreur existante (asyncHandler sur les routes, try/catch de chaque cron
+// et handler socket ci-dessous) : l'état du process n'est plus fiable, donc on log puis on
+// quitte plutôt que de tenter de continuer (Render redémarre le service automatiquement).
+// setImmediate() laisse le temps au console.error de se vider avant l'arrêt.
+function crashAndLog(kind, err) {
+  const stack = err instanceof Error ? err.stack : String(err);
+  console.error(`[${new Date().toISOString()}] 💥 ${kind}:\n${stack}`);
+  setImmediate(() => process.exit(1));
+}
+process.on('uncaughtException', (err) => crashAndLog('uncaughtException', err));
+process.on('unhandledRejection', (reason) => crashAndLog('unhandledRejection', reason));
+
 // Diagnostic fuseau horaire — les 12 cron.schedule ci-dessous fixent explicitement
 // { timezone: 'Africa/Casablanca' } donc ne dépendent pas de ce réglage, mais ce log
 // confirme dans les logs Render quel fuseau le processus utilise par défaut (utile pour
