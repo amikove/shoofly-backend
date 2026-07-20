@@ -18,7 +18,7 @@ const asyncHandler = require('../middleware/asyncHandler');
 const missionRoutes = require('./missions');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const { CloudinaryStorage } = require('../utils/cloudinaryStorage');
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
