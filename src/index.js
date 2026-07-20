@@ -56,6 +56,7 @@ const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
 const reportRoutes = require('./routes/reports');
 const ticketRoutes = require('./routes/tickets');
+const paymentRoutes = require('./routes/payments');
 
 // ── CORS — liste blanche unique, source de vérité partagée par Express et Socket.IO ──
 const productionOrigins = ['https://shoofly.netlify.app', 'https://shoofly-react.vercel.app'];
@@ -133,10 +134,22 @@ const registerLimiter = rateLimit({
 });
 
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
-app.use(express.json({ limit: '5mb' }));
-app.use(xss());
-app.use(hpp());
-app.use(mongoSanitize());
+
+// Callback PayZone (webhook serveur-à-serveur) : la vérification de signature HMAC (voir
+// services/payzone.js) porte sur le corps BRUT exact reçu sur le fil — capturé ici, scopé à
+// cette route précise, AVANT tout body-parser JSON global (qui consommerait/re-sérialiserait
+// le flux, rendant la signature invérifiable). Les 4 middlewares globaux juste en dessous
+// (json/xss/hpp/mongoSanitize) sont donc explicitement sautés pour cette route : ils
+// liraient un flux déjà consommé et écraseraient le Buffer brut par un objet re-parsé.
+const PAYZONE_CALLBACK_PATH = '/api/payments/payzone/callback';
+app.use(PAYZONE_CALLBACK_PATH, express.raw({ type: '*/*', limit: '1mb' }));
+const skipForPayzoneCallback = (middleware) => (req, res, next) => (
+  req.path === PAYZONE_CALLBACK_PATH ? next() : middleware(req, res, next)
+);
+app.use(skipForPayzoneCallback(express.json({ limit: '5mb' })));
+app.use(skipForPayzoneCallback(xss()));
+app.use(skipForPayzoneCallback(hpp()));
+app.use(skipForPayzoneCallback(mongoSanitize()));
 app.use('/uploads', express.static(path.resolve(process.env.UPLOAD_DIR || './uploads')));
 
 // ── Routes ────────────────────────────────────────────────
@@ -153,6 +166,7 @@ app.use('/api/reliability', reliabilityRoutes);
 app.use('/api/promo', promoRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/tickets', ticketRoutes);
+app.use('/api/payments', paymentRoutes);
 
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 app.get('/api', (_, res) => res.json({ name: 'SHOOFLY API', version: '1.0.0' }));
