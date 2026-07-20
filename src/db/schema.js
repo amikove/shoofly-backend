@@ -258,7 +258,8 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('presence_confirmation_deadline_minutes', '120'),
         ('presence_confirmation_deadline_minutes_sameday', '45'),
         ('candidate_batch_size', '10'),
-        ('candidate_tiebreak_window_minutes', '5')
+        ('candidate_tiebreak_window_minutes', '5'),
+        ('payment_attempt_abandoned_minutes', '30')
       ON CONFLICT (key) DO NOTHING;
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS is_flagged BOOLEAN DEFAULT false;
@@ -629,6 +630,26 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- vérification préalable faite (aucune ligne négative), même validation immédiate.
     ALTER TABLE users DROP CONSTRAINT IF EXISTS users_balance_check;
     ALTER TABLE users ADD CONSTRAINT users_balance_check CHECK(balance >= 0);
+
+    -- Paiement client réel via PayZone (sandbox) — la mission n'est créée qu'à la confirmation
+    -- du paiement (callback webhook), jamais au moment du formulaire. mission_payload contient
+    -- les données du formulaire déjà validées/tarifées au moment de l'init (voir POST
+    -- /payments/payzone/init, routes/payments.js) — rejouées telles quelles à la confirmation,
+    -- jamais re-validées/re-tarifées, pour garantir que le montant réellement facturé via
+    -- PayZone correspond exactement à la mission créée.
+    CREATE TABLE IF NOT EXISTS mission_payment_attempts (
+      id              SERIAL PRIMARY KEY,
+      client_id       TEXT NOT NULL REFERENCES users(id),
+      mission_payload JSONB NOT NULL,
+      price           NUMERIC(10,2) NOT NULL,
+      charge_id       TEXT UNIQUE NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'created' CHECK(status IN ('created','charged','declined','error')),
+      mission_id      TEXT REFERENCES missions(id),
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      confirmed_at    TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_payment_attempts_client ON mission_payment_attempts(client_id);
+    CREATE INDEX IF NOT EXISTS idx_payment_attempts_status ON mission_payment_attempts(status);
   `);
   console.log('✅ PostgreSQL schema ready');
 }

@@ -37,6 +37,166 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 }
 
+// ── Réutilisable : validation + tarification d'une soumission de formulaire mission ──
+// Extrait de POST /missions pour être partagé avec POST /payments/payzone/init
+// (routes/payments.js — paiement PayZone). Ne fait AUCUNE écriture DB (uniquement des
+// lectures pour validation) — retourne { error } ou { insert, freePromo } prêts pour
+// insertMissionRecord ci-dessous. Comportement strictement identique à l'ancien code
+// inline de POST /missions.
+async function prepareMissionInsert(db, clientId, body) {
+  const {
+    type, title, description, address, city, quartier, scheduled_at,
+    duration_est, price, is_urgent, oeil_id,
+    property_type, visit_type, video_call,
+    institution, purpose,
+    company_name, audit_type, frequency, criteria, subcategory,
+    promo_code, discount, original_price,
+    replacement_preference,
+  } = body;
+
+  const canonicalCity = resolveCity(city);
+  if (!canonicalCity) return { error: 'Ville invalide' };
+  let canonicalQuartier = null;
+  if (quartier) {
+    canonicalQuartier = resolveQuartier(canonicalCity, quartier);
+    if (!canonicalQuartier) return { error: 'Quartier invalide pour cette ville' };
+  }
+  if (subcategory && !isValidSubcategory(type, subcategory)) {
+    return { error: 'Sous-catégorie invalide pour ce type de mission' };
+  }
+
+  let { commission, oeil_earning } = await pricing(+original_price || +price, db);
+
+  // Code promo gratuit — Shoofly paie l'Œil de sa poche. Le code doit être réel, actif,
+  // de type 'free', non expiré et pas déjà épuisé par ce client : ne jamais faire confiance
+  // au platform_amount envoyé par le client. Avant ce correctif, un client pouvait soumettre
+  // n'importe quel promo_code inexistant + price=0 + platform_amount arbitraire et obtenir
+  // une dépense réelle fabriquée (constaté empiriquement : 99999 MAD avec un code fictif —
+  // audit scénario 9.2). Le montant utilisé est désormais TOUJOURS celui stocké côté serveur
+  // sur promo_codes.platform_amount, jamais celui du corps de la requête.
+  let freePromo = null;
+  if (promo_code && +price === 0) {
+    const { rows: [p] } = await db.query(
+      `SELECT * FROM promo_codes WHERE UPPER(code)=UPPER($1) AND is_active=true`, [promo_code]
+    );
+    if (!p || p.type !== 'free') {
+      return { error: 'Code promo invalide pour une mission gratuite' };
+    }
+    if (p.expires_at && new Date(p.expires_at) < new Date()) {
+      return { error: 'Code promo expiré' };
+    }
+    if (p.max_uses && p.used_count >= p.max_uses) {
+      return { error: 'Code promo épuisé' };
+    }
+    const { rows: [usage] } = await db.query(
+      `SELECT COUNT(*)::int AS n FROM promo_uses WHERE promo_id=$1 AND user_id=$2`, [p.id, clientId]
+    );
+    if (usage.n >= p.max_uses_per_user) {
+      return { error: 'Vous avez déjà utilisé ce code' };
+    }
+    if (!p.platform_amount) {
+      return { error: "Ce code promo n'a pas de montant configuré" };
+    }
+    freePromo = p;
+    oeil_earning = parseFloat(p.platform_amount);
+    commission = 0;
+  }
+
+  const status = oeil_id ? 'assigned' : 'pending';
+
+  return {
+    insert: {
+      type, title, description, address, city: canonicalCity, quartier: canonicalQuartier, scheduled_at,
+      duration_est, price, commission, oeil_earning, is_urgent, oeil_id,
+      property_type, visit_type, video_call, institution, purpose,
+      company_name, audit_type, frequency, criteria, subcategory,
+      promo_code, discount, replacement_preference, status,
+    },
+    freePromo,
+  };
+}
+
+// ── Réutilisable : écriture DB de la mission + effets de bord synchrones (dépense promo
+// gratuite, historique de statut, usage du code promo) — PAS de notifications ici (règle du
+// projet : jamais de notify() dans une transaction, voir POST /:id/validate plus haut).
+// `db` peut être le pool (getDb()) ou un client déjà en transaction (walletService.
+// withTransaction), selon l'appelant — POST /missions passe le pool (comportement inchangé),
+// le callback PayZone passe un client de transaction (voir routes/payments.js).
+async function insertMissionRecord(db, clientId, insertData, freePromo) {
+  const {
+    type, title, description, address, city, quartier, scheduled_at,
+    duration_est, price, commission, oeil_earning, is_urgent, oeil_id,
+    property_type, visit_type, video_call, institution, purpose,
+    company_name, audit_type, frequency, criteria, subcategory,
+    promo_code, discount, replacement_preference, status,
+  } = insertData;
+
+  const id = uuidv4();
+  const { rows: [mission] } = await db.query(`
+    INSERT INTO missions (
+      id,client_id,type,subcategory,status,title,description,address,city,quartier,scheduled_at,
+      duration_est,price,commission,oeil_earning,is_urgent,
+      property_type,visit_type,video_call,institution,purpose,
+      company_name,audit_type,frequency,criteria,oeil_id,replacement_preference
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+    RETURNING *
+  `, [
+    id, clientId, type, subcategory||null, status, title, description||null, address, city, quartier,
+    new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
+    !!is_urgent, property_type||null, visit_type||null, !!video_call,
+    institution||null, purpose||null, company_name||null, audit_type||null,
+    frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast'
+  ]);
+
+  // Mission offerte via code promo gratuit : Shoofly paie l'Œil de sa poche, sans commission générée.
+  // On enregistre ce coût comme une dépense pour qu'il reste visible dans le Dashboard Financier.
+  // Montant = freePromo.platform_amount (validé côté serveur dans prepareMissionInsert), jamais une valeur cliente.
+  if (freePromo) {
+    await db.query(
+      `INSERT INTO expenses (amount, category, description, expense_date, created_by) VALUES ($1, $2, $3, $4, $5)`,
+      [freePromo.platform_amount, 'Promotions', `[Généré automatiquement] Mission offerte "${title}" — code promo ${freePromo.code}`, new Date().toISOString().slice(0, 10), null]
+    );
+  }
+
+  await logStatus(db, mission.id, 'pending', clientId, 'Mission créée');
+
+  if (promo_code) {
+    const { rows: [promo] } = await db.query(
+      `SELECT id FROM promo_codes WHERE UPPER(code)=UPPER($1)`, [promo_code]
+    );
+    if (promo) {
+      await db.query(
+        `INSERT INTO promo_uses (promo_id, user_id, mission_id, discount) VALUES ($1,$2,$3,$4)`,
+        [promo.id, clientId, mission.id, discount || 0]
+      );
+      await db.query(
+        `UPDATE promo_codes SET used_count=used_count+1 WHERE id=$1`, [promo.id]
+      );
+    }
+  }
+
+  return mission;
+}
+
+// ── Réutilisable : notifications + broadcast admin après création — JAMAIS à l'intérieur
+// d'une transaction. Identique que la mission vienne d'une création directe (POST /missions)
+// ou d'un paiement PayZone confirmé (POST /payments/payzone/callback).
+async function notifyNewMission(db, mission, emitToUser, io) {
+  const { rows: oeils } = await db.query(
+    `SELECT u.id FROM users u JOIN oeil_profiles p ON p.user_id=u.id
+     WHERE u.role='oeil' AND u.is_active=true AND p.is_verified=true AND p.is_available=true
+       AND u.city=$1`,
+    [mission.city]
+  );
+  for (const o of oeils) {
+    await notify(db, o.id, `Nouvelle mission${mission.is_urgent?' 🚨 URGENTE':''}`,
+      `${mission.title} — ${mission.city} · ${mission.price} MAD`, 'mission', mission.id, emitToUser, null,
+      mission.is_urgent ? 'newMissionUrgentTitle' : 'newMissionAvailableTitle', 'newMissionBody',
+      { missionTitle: mission.title, city: mission.city, price: mission.price });
+  }
+  if (io) io.to('room:admin').emit('new_mission', mission);
+}
+
 // ── POST /missions/:id/validate ────────────────────────────
 router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
   const db = getDb();
@@ -356,8 +516,9 @@ const missionCreateLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// ── POST /missions ─────────────────────────────────────────
-router.post('/', missionCreateLimiter, authenticate, requireRole('client'), [
+// Réutilisé par POST /payments/payzone/init (routes/payments.js — paiement PayZone) :
+// mêmes règles de validation structurelle qu'à la création directe d'une mission.
+const missionCreateValidators = [
   body('type').isIn(['immobilier','file_attente','audit','personnalisee']),
   body('title').trim().isLength({ min: 6, max: 200 }),
   body('address').trim().notEmpty(),
@@ -365,7 +526,10 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), [
   body('scheduled_at').isISO8601(),
   body('price').isFloat({ min: 0 }),
   body('replacement_preference').optional().isIn(['fast','choose']),
-], asyncHandler(async (req, res) => {
+];
+
+// ── POST /missions ─────────────────────────────────────────
+router.post('/', missionCreateLimiter, authenticate, requireRole('client'), missionCreateValidators, asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -373,127 +537,12 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), [
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
 
-  const {
-    type, title, description, address, city, quartier, scheduled_at,
-    duration_est, price, is_urgent, oeil_id,
-    property_type, visit_type, video_call,
-    institution, purpose,
-    company_name, audit_type, frequency, criteria, subcategory,
-    promo_code, discount, original_price, platform_amount,
-    replacement_preference,
-  } = req.body;
+  const { error, insert, freePromo } = await prepareMissionInsert(db, req.user.id, req.body);
+  if (error) return res.status(400).json({ error });
 
-  const canonicalCity = resolveCity(city);
-  if (!canonicalCity) return res.status(400).json({ error: 'Ville invalide' });
-  let canonicalQuartier = null;
-  if (quartier) {
-    canonicalQuartier = resolveQuartier(canonicalCity, quartier);
-    if (!canonicalQuartier) return res.status(400).json({ error: 'Quartier invalide pour cette ville' });
-  }
-  if (subcategory && !isValidSubcategory(type, subcategory)) {
-    return res.status(400).json({ error: 'Sous-catégorie invalide pour ce type de mission' });
-  }
+  const mission = await insertMissionRecord(db, req.user.id, insert, freePromo);
 
-const id = uuidv4();
-  let { commission, oeil_earning } = await pricing(+original_price || +price, db);
-
-  // Code promo gratuit — Shoofly paie l'Œil de sa poche. Le code doit être réel, actif,
-  // de type 'free', non expiré et pas déjà épuisé par ce client : ne jamais faire confiance
-  // au platform_amount envoyé par le client. Avant ce correctif, un client pouvait soumettre
-  // n'importe quel promo_code inexistant + price=0 + platform_amount arbitraire et obtenir
-  // une dépense réelle fabriquée (constaté empiriquement : 99999 MAD avec un code fictif —
-  // audit scénario 9.2). Le montant utilisé est désormais TOUJOURS celui stocké côté serveur
-  // sur promo_codes.platform_amount, jamais celui du corps de la requête.
-  let freePromo = null;
-  if (promo_code && +price === 0) {
-    const { rows: [p] } = await db.query(
-      `SELECT * FROM promo_codes WHERE UPPER(code)=UPPER($1) AND is_active=true`, [promo_code]
-    );
-    if (!p || p.type !== 'free') {
-      return res.status(400).json({ error: 'Code promo invalide pour une mission gratuite' });
-    }
-    if (p.expires_at && new Date(p.expires_at) < new Date()) {
-      return res.status(400).json({ error: 'Code promo expiré' });
-    }
-    if (p.max_uses && p.used_count >= p.max_uses) {
-      return res.status(400).json({ error: 'Code promo épuisé' });
-    }
-    const { rows: [usage] } = await db.query(
-      `SELECT COUNT(*)::int AS n FROM promo_uses WHERE promo_id=$1 AND user_id=$2`, [p.id, req.user.id]
-    );
-    if (usage.n >= p.max_uses_per_user) {
-      return res.status(400).json({ error: 'Vous avez déjà utilisé ce code' });
-    }
-    if (!p.platform_amount) {
-      return res.status(400).json({ error: "Ce code promo n'a pas de montant configuré" });
-    }
-    freePromo = p;
-    oeil_earning = parseFloat(p.platform_amount);
-    commission = 0;
-  }
-
-const status = oeil_id ? 'assigned' : 'pending';
-
-const { rows: [mission] } = await db.query(`
-  INSERT INTO missions (
-    id,client_id,type,subcategory,status,title,description,address,city,quartier,scheduled_at,
-    duration_est,price,commission,oeil_earning,is_urgent,
-    property_type,visit_type,video_call,institution,purpose,
-    company_name,audit_type,frequency,criteria,oeil_id,replacement_preference
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
-  RETURNING *
-`, [
-  id, req.user.id, type, subcategory||null, status, title, description||null, address, canonicalCity, canonicalQuartier,
-  new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
-  !!is_urgent, property_type||null, visit_type||null, !!video_call,
-  institution||null, purpose||null, company_name||null, audit_type||null,
-  frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast'
-]);
-
-// Mission offerte via code promo gratuit : Shoofly paie l'Œil de sa poche, sans commission générée.
-// On enregistre ce coût comme une dépense pour qu'il reste visible dans le Dashboard Financier.
-// Montant = freePromo.platform_amount (validé côté serveur ci-dessus), jamais une valeur cliente.
-if (freePromo) {
-  await db.query(
-    `INSERT INTO expenses (amount, category, description, expense_date, created_by) VALUES ($1, $2, $3, $4, $5)`,
-    [freePromo.platform_amount, 'Promotions', `[Généré automatiquement] Mission offerte "${title}" — code promo ${freePromo.code}`, new Date().toISOString().slice(0, 10), null]
-  );
-}
-
-await logStatus(db, mission.id, 'pending', req.user.id, 'Mission créée');
-
-// Enregistrer l'utilisation du code promo
-
-  if (promo_code) {
-    const { rows: [promo] } = await db.query(
-      `SELECT id FROM promo_codes WHERE UPPER(code)=UPPER($1)`, [promo_code]
-    );
-    if (promo) {
-      await db.query(
-        `INSERT INTO promo_uses (promo_id, user_id, mission_id, discount) VALUES ($1,$2,$3,$4)`,
-        [promo.id, req.user.id, mission.id, discount || 0]
-      );
-      await db.query(
-        `UPDATE promo_codes SET used_count=used_count+1 WHERE id=$1`, [promo.id]
-      );
-    }
-  }
-
-  // Notify verified available oeils, restreint aux Œils de la même ville que la mission
-  const { rows: oeils } = await db.query(
-    `SELECT u.id FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-     WHERE u.role='oeil' AND u.is_active=true AND p.is_verified=true AND p.is_available=true
-       AND u.city=$1`,
-    [canonicalCity]
-  );
-  for (const o of oeils) {
-    await notify(db, o.id, `Nouvelle mission${is_urgent?' 🚨 URGENTE':''}`,
-      `${title} — ${canonicalCity} · ${price} MAD`, 'mission', id, emitToUser, null,
-      is_urgent ? 'newMissionUrgentTitle' : 'newMissionAvailableTitle', 'newMissionBody', {missionTitle: title, city: canonicalCity, price});
-  }
-
-  // Broadcast to admin room
-  io.to('room:admin').emit('new_mission', mission);
+  await notifyNewMission(db, mission, emitToUser, io);
 
   res.status(201).json({ mission });
 }));
@@ -2597,4 +2646,10 @@ router.checkPresenceConfirmationDeadlines = checkPresenceConfirmationDeadlines;
 router.hireOeilCore = hireOeilCore;
 router.advanceCandidateCascade = advanceCandidateCascade;
 router.notify = notify;
+router.pricing = pricing;
+router.prepareMissionInsert = prepareMissionInsert;
+router.insertMissionRecord = insertMissionRecord;
+router.notifyNewMission = notifyNewMission;
+router.missionCreateValidators = missionCreateValidators;
+router.missionCreateLimiter = missionCreateLimiter;
 module.exports = router;
