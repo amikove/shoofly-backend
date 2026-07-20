@@ -146,7 +146,7 @@ router.get('/me', authenticate, asyncHandler(async (req, res) => {
 
 router.put('/me', authenticate, asyncHandler(async (req, res) => {
     const db = getDb();
-    const { first_name, last_name, phone, city, bio, coverage_zone, disponibilites } = req.body;
+    const { first_name, last_name, phone, city, bio, coverage_zone, disponibilites, has_bank_account } = req.body;
     if (phone) {
       const { rows: existingPhone } = await db.query('SELECT id FROM users WHERE phone=$1 AND id != $2', [phone, req.user.id]);
       if (existingPhone.length) return res.status(409).json({ error: 'Numéro de téléphone déjà utilisé' });
@@ -171,9 +171,14 @@ router.put('/me', authenticate, asyncHandler(async (req, res) => {
      req.user.id]
   );
   if (req.user.role === 'oeil') {
+    // has_bank_account est tri-state (true / false / jamais répondu) : contrairement à bio et
+    // coverage_zone ci-dessus, `false` est une réponse valide qu'il ne faut pas confondre avec
+    // "champ non fourni" — le pattern `valeur||null` utilisé pour les champs texte échouerait
+    // ici car `false||null` vaut `null` en JS et écraserait silencieusement la réponse.
+    const hasBankAccount = typeof has_bank_account === 'boolean' ? has_bank_account : null;
     await db.query(
-      `UPDATE oeil_profiles SET bio=COALESCE($1,bio), coverage_zone=COALESCE($2,coverage_zone) WHERE user_id=$3`,
-      [bio||null, coverage_zone||null, req.user.id]
+      `UPDATE oeil_profiles SET bio=COALESCE($1,bio), coverage_zone=COALESCE($2,coverage_zone), has_bank_account=COALESCE($3,has_bank_account) WHERE user_id=$4`,
+      [bio||null, coverage_zone||null, hasBankAccount, req.user.id]
     );
   }
 

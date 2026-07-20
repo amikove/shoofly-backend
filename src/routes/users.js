@@ -1261,7 +1261,7 @@ router.get('/admin/dashboard/experience-utilisateur', authenticate, requireRole(
 
 router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const [u, m, rev, wd, byType, byStatus, topOeils] = await Promise.all([
+  const [u, m, rev, wd, byType, byStatus, topOeils, bankAccount] = await Promise.all([
     db.query(`SELECT
       COUNT(*)::int AS total,
       COUNT(*) FILTER (WHERE role='client')::int AS clients,
@@ -1281,7 +1281,21 @@ router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission
     db.query(`SELECT status, COUNT(*)::int AS count FROM missions GROUP BY status`),
     db.query(`SELECT u.first_name||' '||u.last_name AS name, p.total_missions, p.rating_avg, p.total_earnings
               FROM oeil_profiles p JOIN users u ON u.id=p.user_id ORDER BY p.total_missions DESC LIMIT 5`),
+    // Ampleur du non-bancarisé chez les Œils — mesure seule pour l'instant, voir has_bank_account
+    // (oeil_profiles, tri-state). Les deux pourcentages répondent à des questions différentes :
+    // "of_total" inclut les non-répondants au dénominateur (mesure conservatrice, plancher réel),
+    // "of_answered" ne compte que ceux ayant explicitement répondu (mesure du phénomène parmi les
+    // réponses obtenues, insensible au taux de réponse).
+    db.query(`SELECT
+      COUNT(*)::int AS total_oeils,
+      COUNT(*) FILTER (WHERE has_bank_account=true)::int AS has_bank_account,
+      COUNT(*) FILTER (WHERE has_bank_account=false)::int AS no_bank_account,
+      COUNT(*) FILTER (WHERE has_bank_account IS NULL)::int AS unanswered
+      FROM oeil_profiles`),
   ]);
+  const bk = bankAccount.rows[0];
+  const answered = bk.has_bank_account + bk.no_bank_account;
+  const pct = (n, d) => d > 0 ? Math.round((n / d) * 1000) / 10 : 0;
   res.json({
     ...u.rows[0], ...m.rows[0],
     verified_oeils: rev.rows[0].n,
@@ -1289,6 +1303,14 @@ router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission
     missions_by_type: byType.rows,
     missions_by_status: byStatus.rows,
     top_oeils: topOeils.rows,
+    bank_account_stats: {
+      total_oeils: bk.total_oeils,
+      has_bank_account: bk.has_bank_account,
+      no_bank_account: bk.no_bank_account,
+      unanswered: bk.unanswered,
+      no_bank_account_pct_of_total: pct(bk.no_bank_account, bk.total_oeils),
+      no_bank_account_pct_of_answered: pct(bk.no_bank_account, answered),
+    },
   });
 }));
 

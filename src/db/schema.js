@@ -650,6 +650,12 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
     CREATE INDEX IF NOT EXISTS idx_payment_attempts_client ON mission_payment_attempts(client_id);
     CREATE INDEX IF NOT EXISTS idx_payment_attempts_status ON mission_payment_attempts(status);
+
+    -- Mesure de l'ampleur du non-bancarisé chez les Œils (aucune solution de paiement
+    -- alternative construite pour l'instant, juste la collecte de donnée). Nullable et sans
+    -- défaut, à dessein : NULL = jamais répondu, distinct de FALSE = a explicitement déclaré
+    -- ne pas avoir de compte bancaire. Renseigné via PUT /auth/me (voir routes/auth.js).
+    ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS has_bank_account BOOLEAN;
   `);
   console.log('✅ PostgreSQL schema ready');
 }
