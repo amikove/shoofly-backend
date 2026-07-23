@@ -8,9 +8,22 @@ function getDb() {
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+      // Sans ceci, une tentative de connexion qui ne répond jamais (DB injoignable) reste
+      // ouverte indéfiniment et finit par épuiser le pool — voir checkDbConnection ci-dessous.
+      connectionTimeoutMillis: 4000,
     });
   }
   return pool;
+}
+
+// Vérifie que la base répond réellement (utilisé par /health). Réutilise le pool existant
+// (aucune connexion supplémentaire créée) et borne l'attente : si la DB ne répond pas dans le
+// délai, on rejette plutôt que de bloquer indéfiniment.
+async function checkDbConnection(db = getDb(), timeoutMs = 5000) {
+  await Promise.race([
+    db.query('SELECT 1'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('DB health check timeout')), timeoutMs)),
+  ]);
 }
 
 async function initDb() {
@@ -659,4 +672,4 @@ CREATE TABLE IF NOT EXISTS identity_documents (
   `);
   console.log('✅ PostgreSQL schema ready');
 }
-module.exports = { getDb, initDb };
+module.exports = { getDb, initDb, checkDbConnection };
