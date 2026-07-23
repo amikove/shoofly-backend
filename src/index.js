@@ -28,7 +28,7 @@ const rateLimit = require('express-rate-limit');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 
-const { initDb, getDb } = require('./db/schema');
+const { initDb, getDb, checkDbConnection } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
 const { runAutoValidateMissions } = require('./jobs/autoValidateMissions');
@@ -168,7 +168,15 @@ app.use('/api/reports', reportRoutes);
 app.use('/api/tickets', ticketRoutes);
 app.use('/api/payments', paymentRoutes);
 
-app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+app.get('/health', async (_, res) => {
+  try {
+    await checkDbConnection();
+    res.json({ status: 'ok', db: 'ok', timestamp: new Date().toISOString() });
+  } catch (err) {
+    console.error('❌ /health DB check failed:', err.message);
+    res.status(503).json({ status: 'error', db: 'unreachable', timestamp: new Date().toISOString() });
+  }
+});
 app.get('/api', (_, res) => res.json({ name: 'SHOOFLY API', version: '1.0.0' }));
 app.use((req, res) => res.status(404).json({ error: `Route introuvable: ${req.method} ${req.path}` }));
 app.use((err, req, res, next) => {
