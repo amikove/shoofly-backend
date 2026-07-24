@@ -127,6 +127,17 @@ module.exports = {
     note: '{{1}} titre de la mission, {{2}} libellé fixe ("Aucune pénalité")',
   },
 
+  // sendUrgentWhatsAppWave (routes/missions.js), appelée depuis notifyNewMission à la création
+  // d'une mission is_urgent=true (POST /missions direct ou paiement PayZone confirmé) ET par le
+  // cron de vagues suivantes (index.js) — un Œil éligible (disponible, vérifié, même ville, pas
+  // encore contacté pour cette mission) est alerté par WhatsApp, par vagues de
+  // urgent_mission_whatsapp_batch_size.
+  urgent_mission_whatsapp_wave: {
+    template_name: 'ticket_urgent_ouvert',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} prix affiché (ex: "350 MAD")',
+  },
+
   // ── Entrées préparées mais non utilisées (templates dédiés pas encore approuvés côté Wasel) ──
 
   // Non utilisée pour l'instant — le flux de modification de mission (PUT /missions/:id sur une

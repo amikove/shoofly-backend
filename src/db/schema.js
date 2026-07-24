@@ -272,7 +272,9 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('presence_confirmation_deadline_minutes_sameday', '45'),
         ('candidate_batch_size', '10'),
         ('candidate_tiebreak_window_minutes', '5'),
-        ('payment_attempt_abandoned_minutes', '30')
+        ('payment_attempt_abandoned_minutes', '30'),
+        ('urgent_mission_whatsapp_batch_size', '10'),
+        ('urgent_mission_whatsapp_batch_delay_minutes', '30')
       ON CONFLICT (key) DO NOTHING;
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS is_flagged BOOLEAN DEFAULT false;
@@ -669,6 +671,25 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- défaut, à dessein : NULL = jamais répondu, distinct de FALSE = a explicitement déclaré
     -- ne pas avoir de compte bancaire. Renseigné via PUT /auth/me (voir routes/auth.js).
     ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS has_bank_account BOOLEAN;
+
+    -- Vagues WhatsApp pour les missions urgentes (notifyNewMission) — évite d'envoyer un
+    -- WhatsApp (facturé par Wasel) à tous les Œils disponibles de la ville en une seule fois.
+    -- À la création, seuls les urgent_mission_whatsapp_batch_size premiers Œils éligibles
+    -- (classés reliability_score DESC, rating_avg DESC) sont contactés par WhatsApp ; la
+    -- notification in-app, elle, part toujours à tous immédiatement (inchangée). Si la mission
+    -- reste sans oeil_id après urgent_mission_whatsapp_batch_delay_minutes, le cron dédié
+    -- (index.js) envoie une nouvelle vague aux Œils éligibles pas encore contactés — voir
+    -- sendUrgentWhatsAppWave, routes/missions.js.
+    CREATE TABLE IF NOT EXISTS mission_whatsapp_contacts (
+      mission_id   TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      oeil_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      contacted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (mission_id, oeil_id)
+    );
+    -- Prochaine vague programmée (NULL = aucune vague en attente : mission non urgente, déjà
+    -- assignée, ou pool épuisé). Nullée sur toute nouvelle attribution d'oeil_id (POST
+    -- /:id/accept, assign-admin, hireOeilCore), même principe que candidate_window_ends_at.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS urgent_whatsapp_next_wave_at TIMESTAMPTZ;
   `);
   console.log('✅ PostgreSQL schema ready');
 }
