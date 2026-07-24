@@ -178,6 +178,64 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
   return mission;
 }
 
+// ── Réutilisable : vague WhatsApp pour une mission urgente — appelée à la création (voir
+// notifyNewMission ci-dessous, mission.is_urgent) ET par le cron de vagues suivantes (index.js).
+// Contacte au plus urgent_mission_whatsapp_batch_size Œils éligibles (disponibles, vérifiés,
+// même ville que la mission) PAS ENCORE contactés pour cette mission précise (table dédiée
+// mission_whatsapp_contacts — anti-doublon), classés reliability_score DESC, rating_avg DESC
+// (même principe que advanceCandidateCascade, sans réutiliser mission_interests : ici personne
+// n'a encore postulé, c'est le pool des Œils disponibles de la ville, pas des candidats).
+// Programme la vague suivante (missions.urgent_whatsapp_next_wave_at) si le pool n'est pas
+// épuisé ; sinon laisse le champ à NULL — l'alerte admin "mission sans Œil depuis 12h" déjà
+// existante (index.js, cronStaleMissionsRunning) prend le relais, aucune nouvelle logique de
+// repli à construire ici (garde-fou explicite de la spec).
+async function sendUrgentWhatsAppWave(db, mission) {
+  const batchSize = await getSetting(db, 'urgent_mission_whatsapp_batch_size', 10);
+  const delayMinutes = await getSetting(db, 'urgent_mission_whatsapp_batch_delay_minutes', 30);
+
+  const { rows: pool } = await db.query(
+    `SELECT u.id, u.phone FROM users u JOIN oeil_profiles p ON p.user_id=u.id
+     WHERE u.role='oeil' AND u.is_active=true AND p.is_verified=true AND p.is_available=true
+       AND u.city=$1
+       AND u.id NOT IN (SELECT oeil_id FROM mission_whatsapp_contacts WHERE mission_id=$2)
+     ORDER BY u.reliability_score DESC, p.rating_avg DESC
+     LIMIT $3`,
+    [mission.city, mission.id, batchSize]
+  );
+
+  for (const o of pool) {
+    await db.query(
+      `INSERT INTO mission_whatsapp_contacts (mission_id, oeil_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [mission.id, o.id]
+    );
+    if (o.phone) {
+      await sendWhatsAppTemplate(waselTemplates.urgent_mission_whatsapp_wave.template_name, o.phone, [mission.title, `${mission.price} MAD`]);
+    } else {
+      console.warn(`[wasel] Œil ${o.id} sans téléphone renseigné — envoi ignoré (urgent-mission-wave)`);
+    }
+  }
+
+  // Reste-t-il des Œils éligibles non encore contactés ? Si oui, vague suivante programmée ;
+  // sinon pool épuisé, on ne programme rien de plus (voir garde-fou ci-dessus).
+  const { rows: [{ n: remaining }] } = await db.query(
+    `SELECT COUNT(*)::int AS n FROM users u JOIN oeil_profiles p ON p.user_id=u.id
+     WHERE u.role='oeil' AND u.is_active=true AND p.is_verified=true AND p.is_available=true
+       AND u.city=$1
+       AND u.id NOT IN (SELECT oeil_id FROM mission_whatsapp_contacts WHERE mission_id=$2)`,
+    [mission.city, mission.id]
+  );
+
+  // Garde oeil_id IS NULL : évite d'écraser/reprogrammer une vague sur une mission qui vient
+  // d'être assignée par un autre chemin pendant l'envoi de cette vague (même esprit que la
+  // garde optimiste WHERE status='pending' AND oeil_id IS NULL d'advanceCandidateCascade).
+  await db.query(
+    `UPDATE missions SET urgent_whatsapp_next_wave_at=$1 WHERE id=$2 AND oeil_id IS NULL`,
+    [remaining > 0 ? new Date(Date.now() + delayMinutes * 60 * 1000) : null, mission.id]
+  );
+
+  return pool.length;
+}
+
 // ── Réutilisable : notifications + broadcast admin après création — JAMAIS à l'intérieur
 // d'une transaction. Identique que la mission vienne d'une création directe (POST /missions)
 // ou d'un paiement PayZone confirmé (POST /payments/payzone/callback).
@@ -195,6 +253,13 @@ async function notifyNewMission(db, mission, emitToUser, io) {
       { missionTitle: mission.title, city: mission.city, price: mission.price });
   }
   if (io) io.to('room:admin').emit('new_mission', mission);
+
+  // WhatsApp (facturé par Wasel) : jamais à tous les Œils en une fois pour une mission urgente —
+  // par vagues seulement, voir sendUrgentWhatsAppWave ci-dessus. Missions non urgentes : aucun
+  // WhatsApp ici (comportement inchangé — seule la notification in-app ci-dessus existait déjà).
+  if (mission.is_urgent) {
+    await sendUrgentWhatsAppWave(db, mission);
+  }
 }
 
 // ── POST /missions/:id/validate ────────────────────────────
@@ -961,6 +1026,7 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
           oeil_id: req.user.id, oeil2_id: oeil2Id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
           presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
           candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
+          urgent_whatsapp_next_wave_at: null,
         },
         note: 'Acceptée directement par l\'Œil',
       });
@@ -1825,6 +1891,7 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
         oeil_id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
         presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
         candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
+        urgent_whatsapp_next_wave_at: null,
       },
       note: 'Affectation manuelle par admin',
     });
@@ -2100,6 +2167,7 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
       extraFields: {
         oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
         presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
+        urgent_whatsapp_next_wave_at: null,
       },
       note: historyNote,
     });
@@ -2650,6 +2718,7 @@ router.pricing = pricing;
 router.prepareMissionInsert = prepareMissionInsert;
 router.insertMissionRecord = insertMissionRecord;
 router.notifyNewMission = notifyNewMission;
+router.sendUrgentWhatsAppWave = sendUrgentWhatsAppWave;
 router.missionCreateValidators = missionCreateValidators;
 router.missionCreateLimiter = missionCreateLimiter;
 module.exports = router;

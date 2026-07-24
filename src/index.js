@@ -13,7 +13,7 @@ function crashAndLog(kind, err) {
 process.on('uncaughtException', (err) => crashAndLog('uncaughtException', err));
 process.on('unhandledRejection', (reason) => crashAndLog('unhandledRejection', reason));
 
-// Diagnostic fuseau horaire — les 12 cron.schedule ci-dessous fixent explicitement
+// Diagnostic fuseau horaire — les 13 cron.schedule ci-dessous fixent explicitement
 // { timezone: 'Africa/Casablanca' } donc ne dépendent pas de ce réglage, mais ce log
 // confirme dans les logs Render quel fuseau le processus utilise par défaut (utile pour
 // tout code qui, lui, s'appuie encore sur l'horloge locale du process — voir RAPPORT_TIMEZONE_CRONS.md).
@@ -52,6 +52,7 @@ const checkPresenceConfirmationDeadlines = missionRoutesModule.checkPresenceConf
 const advanceCandidateCascade = missionRoutesModule.advanceCandidateCascade;
 const hireOeilCore = missionRoutesModule.hireOeilCore;
 const notify = missionRoutesModule.notify;
+const sendUrgentWhatsAppWave = missionRoutesModule.sendUrgentWhatsAppWave;
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
 const reportRoutes = require('./routes/reports');
@@ -319,6 +320,7 @@ initDb().then(() => {
   let cronCandidateWindowRunning = false;
   let cronTicketAutoResolveRunning = false;
   let cronPresenceConfirmationRunning = false;
+  let cronUrgentWhatsAppWaveRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
   // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
@@ -860,6 +862,34 @@ initDb().then(() => {
       }
     } catch (e) { console.error('❌ Cron cascade candidat error:', e.message); }
     finally { cronCandidateWindowRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron toutes les 5 min — Vagues WhatsApp suivantes (missions urgentes) ─
+  // Cadence alignée sur checkTransferDeadlines/checkMissionEditRequestExpiry/
+  // checkPresenceConfirmationDeadlines ci-dessus (vérifications de deadline sur des fenêtres de
+  // dizaines de minutes à quelques heures) — pas la cadence 2min de la cascade candidat
+  // ci-dessus, réservée à ses propres fenêtres plus courtes (candidate_confirmation_minutes,
+  // candidate_tiebreak_window_minutes). urgent_whatsapp_next_wave_at est posé par
+  // sendUrgentWhatsAppWave (routes/missions.js — appelée depuis notifyNewMission à la création
+  // ET ici pour les vagues suivantes, logique non dupliquée) : NULL tant qu'aucune vague n'est
+  // en attente (mission non urgente, déjà assignée, ou pool d'Œils éligibles épuisé — dans ce
+  // dernier cas l'alerte admin "mission sans Œil depuis 12h" ci-dessous prend le relais).
+  cron.schedule('*/5 * * * *', async () => {
+    if (cronUrgentWhatsAppWaveRunning) { console.warn('⏭️ Cron vagues WhatsApp missions urgentes déjà en cours, tick ignoré'); return; }
+    cronUrgentWhatsAppWaveRunning = true;
+    try {
+      const db = getDb();
+      const { rows: dueMissions } = await db.query(`
+        SELECT * FROM missions
+        WHERE is_urgent=true AND oeil_id IS NULL
+          AND urgent_whatsapp_next_wave_at IS NOT NULL AND urgent_whatsapp_next_wave_at <= NOW()
+      `);
+      for (const mission of dueMissions) {
+        const sent = await sendUrgentWhatsAppWave(db, mission);
+        console.log(`📲 Vague WhatsApp mission urgente ${mission.id} — ${sent} Œil(s) contacté(s)`);
+      }
+    } catch (e) { console.error('❌ Cron vagues WhatsApp missions urgentes error:', e.message); }
+    finally { cronUrgentWhatsAppWaveRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   cron.schedule('0 * * * *', async () => {

@@ -1419,6 +1419,7 @@ const {
   candidate_confirmation_minutes,
   presence_confirmation_deadline_minutes, presence_confirmation_deadline_minutes_sameday,
   candidate_batch_size, candidate_tiebreak_window_minutes,
+  urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
 } = req.body
   const updates = {
     commission, min_price, five_star_bonus_active, five_star_bonus_percent,
@@ -1436,6 +1437,7 @@ const {
     candidate_confirmation_minutes,
     presence_confirmation_deadline_minutes, presence_confirmation_deadline_minutes_sameday,
     candidate_batch_size, candidate_tiebreak_window_minutes,
+    urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
   }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
