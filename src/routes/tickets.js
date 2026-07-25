@@ -4,6 +4,8 @@ const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { VALID_CATEGORIES, URGENT_CATEGORY, SURVEILLANCE_CATEGORIES } = require('../constants/ticketCategories');
+const { sendWhatsAppTemplate } = require('../services/wasel');
+const waselTemplates = require('../config/waselTemplates');
 
 async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null) {
   const r = await db.query(
@@ -75,7 +77,7 @@ router.post('/', authenticate, requireRole('client', 'oeil'), asyncHandler(async
   }
 
   if (isUrgent) {
-    const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+    const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
     for (const admin of admins) {
       await notify(
         db, admin.id,
@@ -85,6 +87,9 @@ router.post('/', authenticate, requireRole('client', 'oeil'), asyncHandler(async
         'urgentTicketAdminTitle', 'urgentTicketAdminBody',
         { reporterRole: req.user.role === 'client' ? 'Client' : 'Œil', subcategory: subcategory || category, reference, ticketId: ticket.id }
       );
+      if (admin.phone) {
+        await sendWhatsAppTemplate(waselTemplates.urgent_ticket_admin.template_name, admin.phone, [reference, subcategory || category]);
+      }
     }
     const io = req.app.get('io');
     if (io) io.to('room:admin').emit('urgent_ticket_created', { ticketId: ticket.id, reference, subcategory });

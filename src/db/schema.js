@@ -690,6 +690,13 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- assignée, ou pool épuisé). Nullée sur toute nouvelle attribution d'oeil_id (POST
     -- /:id/accept, assign-admin, hireOeilCore), même principe que candidate_window_ends_at.
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS urgent_whatsapp_next_wave_at TIMESTAMPTZ;
+
+    -- Filtrage WhatsApp 2026-07-25 — un seul WhatsApp "nouvelle candidature" par mission
+    -- (jamais un envoi par candidature individuelle), déclenché dès que le nombre de
+    -- candidatures atteint candidature_whatsapp_seuil_count (POST /:id/interest,
+    -- routes/missions.js) ou, à défaut, après candidature_whatsapp_seuil_minutes depuis la
+    -- première candidature (cron dédié, index.js). NULL = pas encore envoyé pour cette mission.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS candidature_whatsapp_sent_at TIMESTAMPTZ;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

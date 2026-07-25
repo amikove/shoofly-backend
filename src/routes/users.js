@@ -1420,6 +1420,7 @@ const {
   presence_confirmation_deadline_minutes, presence_confirmation_deadline_minutes_sameday,
   candidate_batch_size, candidate_tiebreak_window_minutes,
   urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
+  candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
 } = req.body
   const updates = {
     commission, min_price, five_star_bonus_active, five_star_bonus_percent,
@@ -1438,6 +1439,7 @@ const {
     presence_confirmation_deadline_minutes, presence_confirmation_deadline_minutes_sameday,
     candidate_batch_size, candidate_tiebreak_window_minutes,
     urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
+    candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
   }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
@@ -1667,16 +1669,9 @@ router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('a
        VALUES ($1, '✅ Identité vérifiée', 'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.', 'success', 'none', $2, $3, $4)`,
       [doc.user_id, 'identityVerifiedTitle', 'identityVerifiedBody', null]
     );
-    // Test technique API Wasel — même bouton, aucune étape supplémentaire pour l'admin.
-    // Réutilise nouvelle_verification_identite (contenu sans rapport avec l'approbation,
-    // assumé pour ce test de plomberie, en attendant un vrai template "approuvé" chez Wasel).
-    const { rows: [oeilContact] } = await db.query('SELECT phone, first_name, last_name FROM users WHERE id=$1', [doc.user_id]);
-    if (oeilContact?.phone) {
-      const oeilName = `${oeilContact.first_name} ${oeilContact.last_name}`.trim();
-      sendWhatsAppTemplate('nouvelle_verification_identite', oeilContact.phone, [oeilName]);
-    } else {
-      console.warn(`[wasel] Œil ${doc.user_id} sans téléphone renseigné — envoi ignoré (identity approved)`);
-    }
+    // Pas de WhatsApp ici — aucune action rapide n'est attendue de l'Œil suite à cette
+    // notification (filtrage WhatsApp 2026-07-25). Auparavant détourné via le template
+    // générique 'nouvelle_verification_identite', retiré.
 
   res.json({ message: 'Identité approuvée', user_id: doc.user_id });
 }));
