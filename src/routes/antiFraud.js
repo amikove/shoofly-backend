@@ -5,6 +5,8 @@ const { requirePermission } = require('../middleware/permissions');
 const { getSetting } = require('../utils/settings');
 const asyncHandler = require('../middleware/asyncHandler');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
+const { sendWhatsAppTemplate } = require('../services/wasel');
+const waselTemplates = require('../config/waselTemplates');
 // Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
 // de dupliquer la logique de sélection de candidat — même approche que
 // PUT /users/admin/:id/toggle-active (routes/users.js).
@@ -405,16 +407,24 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
     const emitToUser = req.app.get('emitToUser');
     const io = req.app.get('io');
     const { reason } = req.body;
-    const { rows: [target] } = await db.query('SELECT role FROM users WHERE id=$1', [req.params.userId]);
+    const { rows: [target] } = await db.query('SELECT role, phone FROM users WHERE id=$1', [req.params.userId]);
     if (!target) return res.status(404).json({ error: 'Introuvable' });
     if (target.role === 'admin' && !req.user.is_super_admin) {
       return res.status(403).json({ error: 'Seul le Super Admin peut bloquer un compte administrateur.' });
     }
     await db.query(`UPDATE users SET is_active=false WHERE id=$1`, [req.params.userId]);
+  const suspensionReason = reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.';
   await db.query(
     `INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Compte suspendu',$2,'info','none',$3,$4,$5)`,
-    [req.params.userId, reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.', 'accountSuspendedTitle', reason ? null : 'accountSuspendedDefaultBody', null]
+    [req.params.userId, suspensionReason, 'accountSuspendedTitle', reason ? null : 'accountSuspendedDefaultBody', null]
   );
+  // Cas particulier (voir waselTemplates.js) : seul canal encore capable d'atteindre cet
+  // utilisateur puisqu'il ne peut plus se connecter à l'app (is_active=false). Ne s'applique
+  // QU'à cette route précise — jamais à PUT /users/admin/:id/toggle-active (désactivation
+  // générique, accès conservé, aucun WhatsApp).
+  if (target.phone) {
+    await sendWhatsAppTemplate(waselTemplates.account_blocked_fraud_oeil.template_name, target.phone, [suspensionReason]);
+  }
 
   // Si l'utilisateur bloqué est un Œil avec des missions en cours, réattribution automatique
   // via la cascade de confirmation séquentielle partagée (transitionMission + advanceCandidateCascade),

@@ -321,6 +321,7 @@ initDb().then(() => {
   let cronTicketAutoResolveRunning = false;
   let cronPresenceConfirmationRunning = false;
   let cronUrgentWhatsAppWaveRunning = false;
+  let cronCandidatureWhatsAppRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
   // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
@@ -465,7 +466,7 @@ initDb().then(() => {
 
       // Missions qui auraient dû démarrer il y a 0-30 min (H)
       const { rows: lateH } = await db.query(`
-        SELECT m.*, u.first_name, u.last_name
+        SELECT m.*, u.first_name, u.last_name, u.phone
         FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status = 'assigned'
@@ -482,6 +483,9 @@ initDb().then(() => {
           [m.oeil_id, `La mission "${m.title}" devait commencer maintenant. Mettez à jour votre statut immédiatement.`, m.id,
            'missionStartedAlertTitle', 'missionStartedAlertBody', JSON.stringify({ missionTitle: m.title })]
         );
+        if (m.phone) {
+          await sendWhatsAppTemplate(waselTemplates.mission_late_alert_oeil.template_name, m.phone, [m.title]);
+        }
         // Alerte admin
         const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
         for (const admin of admins) {
@@ -682,12 +686,16 @@ initDb().then(() => {
             missionId: m.id,
             type: 'warning'
           });
+          if (m.phone) {
+            await sendWhatsAppTemplate(waselTemplates.pre_mission_reminder_oeil.template_name, m.phone, [m.title, '2 heures']);
+          }
         }
       }
 
       // H-30min (marge ±10min)
       const { rows: missions30 } = await db.query(`
-        SELECT m.* FROM missions m
+        SELECT m.*, u.phone FROM missions m
+        JOIN users u ON u.id = m.oeil_id
         WHERE m.status = 'assigned'
         AND m.scheduled_at BETWEEN NOW() + INTERVAL '1 minute' * $1::numeric AND NOW() + INTERVAL '1 minute' * $2::numeric
         AND m.oeil_id IS NOT NULL
@@ -705,6 +713,9 @@ initDb().then(() => {
           missionId: m.id,
           type: 'warning'
         });
+        if (m.phone) {
+          await sendWhatsAppTemplate(waselTemplates.pre_mission_reminder_oeil.template_name, m.phone, [m.title, '30 minutes']);
+        }
         // Alerte admin si H-30min
         const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
         for (const admin of admins) {
@@ -842,10 +853,9 @@ initDb().then(() => {
           'mission', mission.id, emitToUser, null, 'replacementConfirmedClientTitle', 'replacementConfirmedClientBody',
           { missionTitle: mission.title }
         );
-        const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-        if (clientContact?.phone) {
-          await sendWhatsAppTemplate(waselTemplates.replacement_confirmed_client.template_name, clientContact.phone, [mission.title, 'Remplaçant trouvé']);
-        }
+        // Pas de WhatsApp ici — le client a déjà été informé qu'un remplaçant était
+        // recherché, aucune action rapide n'est attendue de lui à ce stade (filtrage
+        // WhatsApp 2026-07-25).
       }
 
       // 2) Lots entiers expirés sans aucune confirmation — passage au lot suivant
@@ -892,6 +902,45 @@ initDb().then(() => {
     finally { cronUrgentWhatsAppWaveRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
+  // ── Cron toutes les 5 min — Seuil WhatsApp candidatures (repli délai) ────
+  // Complète le déclencheur synchrone par nombre de candidatures (POST /:id/interest,
+  // routes/missions.js) : si une mission n'atteint jamais candidature_whatsapp_seuil_count
+  // candidatures, ce cron envoie quand même le WhatsApp au client après candidature_whatsapp_
+  // seuil_minutes depuis sa toute première candidature — à condition qu'il y en ait eu au
+  // moins une (INNER JOIN mission_interests). Un seul envoi total par mission, garanti par le
+  // même champ de suivi que le déclencheur synchrone (missions.candidature_whatsapp_sent_at,
+  // garde atomique WHERE ... IS NULL). Exclut les missions déjà résolues (status != 'pending')
+  // — inutile d'alerter le client sur des candidatures d'une mission déjà assignée/annulée.
+  cron.schedule('*/5 * * * *', async () => {
+    if (cronCandidatureWhatsAppRunning) { console.warn('⏭️ Cron seuil WhatsApp candidatures déjà en cours, tick ignoré'); return; }
+    cronCandidatureWhatsAppRunning = true;
+    try {
+      const db = getDb();
+      const seuilMinutes = await getSetting(db, 'candidature_whatsapp_seuil_minutes', 60);
+      const { rows: dueMissions } = await db.query(`
+        SELECT m.id, m.title, c.phone AS client_phone, COUNT(mi.id)::int AS n
+        FROM missions m
+        JOIN mission_interests mi ON mi.mission_id = m.id
+        JOIN users c ON c.id = m.client_id
+        WHERE m.status = 'pending' AND m.candidature_whatsapp_sent_at IS NULL
+        GROUP BY m.id, m.title, c.phone
+        HAVING MIN(mi.created_at) <= NOW() - INTERVAL '1 minute' * $1::numeric
+      `, [seuilMinutes]);
+
+      for (const m of dueMissions) {
+        const { rowCount } = await db.query(
+          `UPDATE missions SET candidature_whatsapp_sent_at=NOW() WHERE id=$1 AND candidature_whatsapp_sent_at IS NULL`,
+          [m.id]
+        );
+        if (rowCount > 0 && m.client_phone) {
+          await sendWhatsAppTemplate(waselTemplates.oeil_applied.template_name, m.client_phone, [String(m.n), m.title]);
+          console.log(`📲 Seuil WhatsApp candidatures (délai) déclenché pour mission ${m.id} — ${m.n} candidature(s)`);
+        }
+      }
+    } catch (e) { console.error('❌ Cron seuil WhatsApp candidatures error:', e.message); }
+    finally { cronCandidatureWhatsAppRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
   cron.schedule('0 * * * *', async () => {
     if (cronAutoValidateRunning) { console.warn('⏭️ Cron auto-validation déjà en cours, tick ignoré'); return; }
     cronAutoValidateRunning = true;
@@ -920,11 +969,9 @@ initDb().then(() => {
       `, [staleMissionHours, staleMissionMinLeadHours]);
 
       for (const m of staleMissions) {
-          // Notification admin uniquement — la suggestion client (augmenter le budget) a été retirée :
+          // Notification admin — la suggestion client (augmenter le budget) a été retirée :
           // aucune page d'édition de mission n'existe encore pour que le client agisse dessus.
-          // TODO : ajouter aussi un envoi WhatsApp automatique à l'admin une fois un compte WhatsApp
-          // Business API configuré (Badr SMS, OrangeSMS Maroc, ou Yobota — déjà étudiés précédemment).
-          const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+          const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
           for (const admin of admins) {
             await db.query(
               `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -932,6 +979,9 @@ initDb().then(() => {
               [admin.id, '⏳ Mission sans Œil depuis 12h', `Aucun Œil n'a encore été trouvé pour "${m.title}", en attente depuis plus de 12h.`, m.id,
                'staleMissionAdminTitle', 'staleMissionAdminBody', JSON.stringify({ missionTitle: m.title })]
             );
+            if (admin.phone) {
+              await sendWhatsAppTemplate(waselTemplates.mission_without_oeil_admin.template_name, admin.phone, [m.title]);
+            }
           }
           await db.query(`UPDATE missions SET stale_notified_at = NOW() WHERE id = $1`, [m.id]);
           console.log(`⏳ Notification mission sans Œil envoyée pour ${m.id}`);
