@@ -166,16 +166,16 @@ module.exports = {
     note: '{{1}} titre de la mission',
   },
 
-  // Cron H-2h/H-30min (index.js, "Rappels avant mission") — rappel purement informatif (PAS
-  // une demande de confirmation active, voir presence_confirmation_request_sameday ci-dessus
-  // pour ce cas distinct). Même template aux deux moments, {{2}} distingue le délai restant.
-  // Le passage effectif de H-30 à H-45 et l'ajout d'une conséquence de réattribution sont
-  // traités par un chantier séparé ("confirmation H-2/H-45") — non touché ici, seul le
-  // câblage WhatsApp du rappel existant est ajouté.
-  pre_mission_reminder_oeil: {
-    template_name: 'rappel_avant_mission',
+  // Cron H-45min (index.js, "Rappels avant mission") — anciennement un rappel purement
+  // informatif ("rappel_avant_mission", #30 du catalogue) ; renommé et repris ici comme VRAIE
+  // demande de confirmation active (chantier "confirmation H-2/H-45"), au même titre que
+  // presence_confirmation_request_j1/_sameday ci-dessus. Seul appelant restant après ce
+  // chantier (l'ancien appel H-2 informatif a été fusionné dans la branche active H-2 qui
+  // utilise déjà presence_confirmation_request_sameday).
+  presence_confirmation_request_h45: {
+    template_name: 'confirmez_presence_h45',
     variableCount: 2,
-    note: '{{1}} titre de la mission, {{2}} délai restant (ex: "2 heures" / "30 minutes")',
+    note: '{{1}} titre de la mission, {{2}} heure limite de confirmation (ex: "18h30")',
   },
 
   // Cron "Alertes H et H+30" (index.js) — la mission aurait dû commencer, l'Œil est alerté.

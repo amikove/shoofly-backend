@@ -257,7 +257,7 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('late_start_alert_window_minutes', '30'),
         ('late_start_auto_transfer_minutes', '60'),
         ('reminder_before_mission_minutes_early', '120'),
-        ('reminder_before_mission_minutes_late', '30'),
+        ('reminder_before_mission_minutes_late', '45'),
         ('refund_partial_threshold_hours', '2'),
         ('refund_partial_rate', '0.5'),
         ('new_oeil_mission_threshold', '10'),
@@ -276,6 +276,13 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('urgent_mission_whatsapp_batch_size', '10'),
         ('urgent_mission_whatsapp_batch_delay_minutes', '30')
       ON CONFLICT (key) DO NOTHING;
+
+    -- Migration ponctuelle (chantier confirmation H-2/H-45) : le INSERT ci-dessus ne change
+    -- jamais une valeur déjà seedée (ON CONFLICT DO NOTHING), donc toute base déjà initialisée
+    -- avant ce déploiement resterait silencieusement à l'ancien défaut ('30') sans cette ligne.
+    -- Gardée par "AND value='30'" : ne s'applique qu'une fois (idempotente) et ne touche jamais
+    -- une valeur qu'un admin aurait déjà personnalisée volontairement.
+    UPDATE settings SET value='45' WHERE key='reminder_before_mission_minutes_late' AND value='30';
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS is_flagged BOOLEAN DEFAULT false;
 
