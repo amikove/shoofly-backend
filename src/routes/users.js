@@ -1332,17 +1332,46 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
     if (target.role === 'admin' && !req.user.is_super_admin) {
       return res.status(403).json({ error: 'Seul le Super Admin peut activer/désactiver un compte administrateur.' });
     }
-    const { rows: [u] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 RETURNING is_active`, [req.params.id]);
 
-    // Désactivation (pas réactivation) d'un Œil ayant une mission active/en_route/assignée :
+    // Pour un Œil, le bouton générique admin agit désormais sur is_suspended — accès à la
+    // connexion conservé, réutilise l'infrastructure de restriction déjà en place pour la
+    // suspension par score de fiabilité (middleware/auth.js, isSuspendedOeilAllowed) — plutôt
+    // que is_active, blocage total réservé à POST /anti-fraud/block/:userId. Pour les autres
+    // rôles (client, admin), is_suspended n'a aucun effet côté middleware (restriction
+    // explicitement limitée à role='oeil') : comportement inchangé, is_active reste le
+    // mécanisme utilisé pour ces cibles.
+    let u;
+    if (target.role === 'oeil') {
+      const { rows: [before] } = await db.query('SELECT is_suspended FROM users WHERE id=$1', [req.params.id]);
+      const willSuspend = !before.is_suspended;
+      const { rows: [row] } = willSuspend
+        ? await db.query(
+            `UPDATE users SET is_suspended=true, suspended_at=NOW(), suspended_reason=$2 WHERE id=$1 RETURNING is_suspended`,
+            [req.params.id, 'Suspension administrative']
+          )
+        : await db.query(
+            `UPDATE users SET is_suspended=false, suspended_at=NULL, suspended_reason=NULL WHERE id=$1 RETURNING is_suspended`,
+            [req.params.id]
+          );
+      u = row;
+    } else {
+      const { rows: [row] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 RETURNING is_active`, [req.params.id]);
+      u = row;
+    }
+
+    // Suspension (pas réactivation) d'un Œil ayant une mission active/en_route/assignée :
     // réattribution automatique via la cascade de confirmation séquentielle, sans jamais
     // resolliciter le client. transfer_type est toujours forcé à 'before' (jamais 'during'),
     // même si la mission était déjà 'active'/'en_route' : contrairement à un abandon volontaire
     // en cours de mission (qui donne lieu à un split au prorata via mission_transfer_chain),
-    // une désactivation admin ne doit produire AUCUN mouvement financier ni pénalité pour l'Œil
-    // désactivé — le remplaçant touche l'intégralité de oeil_earning.
+    // une suspension admin ne doit produire AUCUN mouvement financier ni pénalité pour l'Œil
+    // suspendu — le remplaçant touche l'intégralité de oeil_earning.
     let reassignedCount = 0;
-    if (!u.is_active && target.role === 'oeil') {
+    if (target.role === 'oeil' && u.is_suspended) {
+      await missionRoutes.notify(db, req.params.id, '🔴 Compte suspendu',
+        'Votre compte a été suspendu par un administrateur. Vous conservez l\'accès à votre compte : vous pouvez toujours vous connecter, terminer vos missions en cours et demander un examen de votre dossier.',
+        'error', null, emitToUser, null, 'accountSuspendedAdminTitle', 'accountSuspendedAdminBody', null);
+
       const { rows: strandedMissions } = await db.query(
         `SELECT * FROM missions WHERE oeil_id=$1 AND status IN ('assigned','en_route','active')`,
         [req.params.id]
@@ -1359,11 +1388,11 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
               is_priority: true,
               transfer_type: 'before',
               transferred_from: req.params.id,
-              transfer_reason: 'Compte prestataire désactivé par un administrateur',
+              transfer_reason: 'Compte prestataire suspendu par un administrateur',
               transfer_deadline: deadline,
               oeil_id: null,
             },
-            note: 'Réattribution automatique — Œil désactivé par un admin',
+            note: 'Réattribution automatique — Œil suspendu par un admin',
           });
         } catch (e) {
           if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
@@ -1371,14 +1400,14 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
         }
         reassignedCount++;
 
-        // Retire la propre candidature de l'Œil désactivé sur sa propre mission (même correctif
+        // Retire la propre candidature de l'Œil suspendu sur sa propre mission (même correctif
         // que POST /:id/transfer, voir bug fantôme audit 2.9) avant de lancer la cascade.
         await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, req.params.id]);
 
         await missionRoutes.advanceCandidateCascade(db, io, emitToUser, updated, {});
 
         const reassignTitle = '📋 Mission réattribuée';
-        const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la désactivation de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`;
+        const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la suspension de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`;
         await missionRoutes.notify(db, req.params.id, reassignTitle, reassignBody,
           'mission', mission.id, emitToUser, null, 'missionReassignedNoPenaltyTitle', 'missionReassignedNoPenaltyBody', { missionTitle: mission.title });
 
@@ -1387,9 +1416,17 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
           await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
         }
       }
+    } else if (target.role === 'oeil' && !u.is_suspended) {
+      await missionRoutes.notify(db, req.params.id, '✅ Compte réactivé',
+        'Votre compte a été réactivé par un administrateur. Vous pouvez de nouveau accepter de nouvelles missions.',
+        'success', null, emitToUser, null, 'accountReactivatedTitle', 'accountUnsuspendedAdminBody', null);
     }
 
-    res.json({ is_active: u.is_active, reassigned_missions: reassignedCount });
+    if (target.role === 'oeil') {
+      res.json({ is_suspended: u.is_suspended, reassigned_missions: reassignedCount });
+    } else {
+      res.json({ is_active: u.is_active, reassigned_missions: reassignedCount });
+    }
   }));
 
 // ── Admin : paramètres ─────────────────────────────────────
