@@ -251,7 +251,7 @@ router.get('/admin/all', authenticate, requireRole('admin'), asyncHandler(async 
   if (role)       { where.push(`u.role=$${p++}`); params.push(role); }
   if (is_active !== undefined) { where.push(`u.is_active=$${p++}`); params.push(is_active === '1'); }
   const { rows } = await db.query(`
-      SELECT u.id,u.email,u.role,u.first_name,u.last_name,u.phone,u.city,u.avatar_url,u.is_active,u.created_at,
+      SELECT u.id,u.email,u.role,u.first_name,u.last_name,u.phone,u.city,u.avatar_url,u.is_active,u.is_suspended,u.suspended_reason,u.created_at,
         pr.is_verified,pr.rating_avg,pr.total_missions,pr.balance
       FROM users u LEFT JOIN oeil_profiles pr ON pr.user_id=u.id
       ${where.length ? 'WHERE '+where.join(' AND ') : ''}
