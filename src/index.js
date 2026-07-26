@@ -13,7 +13,7 @@ function crashAndLog(kind, err) {
 process.on('uncaughtException', (err) => crashAndLog('uncaughtException', err));
 process.on('unhandledRejection', (reason) => crashAndLog('unhandledRejection', reason));
 
-// Diagnostic fuseau horaire — les 13 cron.schedule ci-dessous fixent explicitement
+// Diagnostic fuseau horaire — les 14 cron.schedule ci-dessous fixent explicitement
 // { timezone: 'Africa/Casablanca' } donc ne dépendent pas de ce réglage, mais ce log
 // confirme dans les logs Render quel fuseau le processus utilise par défaut (utile pour
 // tout code qui, lui, s'appuie encore sur l'horloge locale du process — voir RAPPORT_TIMEZONE_CRONS.md).
