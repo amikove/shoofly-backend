@@ -463,6 +463,10 @@ initDb().then(() => {
       const now = new Date();
       const alertWindowMinutes = await getSetting(db, 'late_start_alert_window_minutes', 30);
       const autoTransferMinutes = await getSetting(db, 'late_start_auto_transfer_minutes', 60);
+      // Un seul SELECT admins par tick, réutilisé par les deux blocs ci-dessous (H et H+30) —
+      // la liste ne change pas en cours de tick, inutile de la requêter une fois par mission
+      // (audit perf 2026-07-26).
+      const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
 
       // Missions qui auraient dû démarrer il y a 0-30 min (H)
       const { rows: lateH } = await db.query(`
@@ -486,8 +490,7 @@ initDb().then(() => {
         if (m.phone) {
           await sendWhatsAppTemplate(waselTemplates.mission_late_alert_oeil.template_name, m.phone, [m.title]);
         }
-        // Alerte admin
-        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+        // Alerte admin (liste récupérée une seule fois par tick, voir plus haut)
         for (const admin of admins) {
           await db.query(
             `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -564,7 +567,7 @@ initDb().then(() => {
            'penaltyAppliedTitle', 'penaltyAppliedBody', JSON.stringify({ missionTitle: m.title })]
         );
 
-        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+        // Liste admins récupérée une seule fois par tick (voir plus haut)
         for (const admin of admins) {
           await db.query(
             `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -599,8 +602,10 @@ initDb().then(() => {
         AND m.oeil_id IS NOT NULL
       `, [overdueVerificationHours]);
 
+      // Un seul SELECT admins par tick, réutilisé pour chaque mission expirée ci-dessous
+      // (audit perf 2026-07-26).
+      const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
       for (const m of expired) {
-        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
         for (const admin of admins) {
           await db.query(
             `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -695,6 +700,9 @@ initDb().then(() => {
         AND m.scheduled_at BETWEEN NOW() + INTERVAL '1 minute' * $1::numeric AND NOW() + INTERVAL '1 minute' * $2::numeric
         AND m.oeil_id IS NOT NULL
       `, [reminderLateMinutes - 10, reminderLateMinutes + 10]);
+      // Un seul SELECT admins par tick, réutilisé pour chaque mission ci-dessous (voir alerte
+      // admin passive plus bas) — audit perf 2026-07-26.
+      const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
       for (const m of missions45) {
         const responseMinutesH45 = 15;
         const deadlineAt = new Date(Date.now() + responseMinutesH45 * 60 * 1000);
@@ -731,8 +739,8 @@ initDb().then(() => {
         // Alerte admin passive (inchangée dans son principe — informe qu'une mission approche
         // sans confirmation reçue). Si l'Œil ne répond pas dans les 15min et que la réattribution
         // se déclenche, le signal admin correspondant est déjà envoyé séparément par
-        // checkPresenceConfirmationDeadlines (routes/missions.js) — pas dupliqué ici.
-        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+        // checkPresenceConfirmationDeadlines (routes/missions.js) — pas dupliqué ici. Liste
+        // admins récupérée une seule fois par tick (voir plus haut).
         for (const admin of admins) {
           await db.query(
             `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -987,10 +995,12 @@ initDb().then(() => {
           AND stale_notified_at IS NULL
       `, [staleMissionHours, staleMissionMinLeadHours]);
 
+      // Un seul SELECT admins par tick, réutilisé pour chaque mission ci-dessous (audit perf
+      // 2026-07-26).
+      const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
       for (const m of staleMissions) {
           // Notification admin — la suggestion client (augmenter le budget) a été retirée :
           // aucune page d'édition de mission n'existe encore pour que le client agisse dessus.
-          const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
           for (const admin of admins) {
             await db.query(
               `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)

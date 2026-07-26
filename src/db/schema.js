@@ -11,6 +11,10 @@ function getDb() {
       // Sans ceci, une tentative de connexion qui ne répond jamais (DB injoignable) reste
       // ouverte indéfiniment et finit par épuiser le pool — voir checkDbConnection ci-dessous.
       connectionTimeoutMillis: 4000,
+      // Défaut pg (10) trop juste : les 14 cron.schedule (index.js) n'ont aucun décalage entre
+      // eux, donc plusieurs peuvent se réveiller au même tick (ex: toutes les heures rondes),
+      // en plus du trafic HTTP/WebSocket qui partage le même pool (audit perf 2026-07-26).
+      max: 15,
     });
   }
   return pool;
@@ -532,6 +536,13 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     CREATE INDEX IF NOT EXISTS idx_identity_documents_user_id ON identity_documents(user_id);
     CREATE INDEX IF NOT EXISTS idx_ratings_oeil_id ON ratings(oeil_id);
     CREATE INDEX IF NOT EXISTS idx_ratings_client_id ON ratings(client_id);
+
+    -- Audit perf 2026-07-26 : missions.city et users.role n'avaient aucun index. Composites
+    -- (pas simples) car toujours filtrés ensemble dans les requêtes à fort volume : le feed
+    -- "missions disponibles" (GET /missions?mode=available, status='pending' AND city=$1) et
+    -- le pool WhatsApp missions urgentes (sendUrgentWhatsAppWave, role='oeil' AND city=$1).
+    CREATE INDEX IF NOT EXISTS idx_missions_status_city ON missions(status, city);
+    CREATE INDEX IF NOT EXISTS idx_users_role_city ON users(role, city);
 
     -- Chaîne de transferts en cours de mission (transfer_type='during') : une ligne par Œil ayant
     -- porté la mission, avec sa portion de temps réel — permet un split des gains au prorata,
