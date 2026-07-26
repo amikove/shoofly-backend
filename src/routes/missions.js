@@ -2104,6 +2104,10 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
       AND m.presence_confirmed_at IS NULL
   `);
 
+  // Un seul SELECT admins par tick, réutilisé pour chaque mission ci-dessous (voir alerte admin
+  // plus bas) — la liste ne change pas en cours de tick (audit perf 2026-07-26).
+  const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+
   for (const mission of expired) {
     const oeilId = mission.oeil_id;
 
@@ -2156,7 +2160,6 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
       await sendWhatsAppTemplate(waselTemplates.presence_not_confirmed_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
     }
 
-    const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
     for (const admin of admins) {
       await notify(db, admin.id,
         '🔄 Réattribution automatique — présence non confirmée',
@@ -2393,6 +2396,12 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
     );
 
     // Sollicitation SIMULTANÉE de tout le lot (notification in-app + WhatsApp à chacun).
+    // Téléphones résolus en un seul aller-retour (au lieu d'un SELECT par candidat, jusqu'à
+    // candidate_batch_size — audit perf 2026-07-26) : la liste ne bouge pas pendant la boucle.
+    const { rows: candidateContacts } = await db.query(
+      'SELECT id, phone FROM users WHERE id = ANY($1::text[])', [candidateIds]
+    );
+    const phoneById = new Map(candidateContacts.map(c => [c.id, c.phone]));
     for (const nextOeilId of candidateIds) {
       await notify(db, nextOeilId,
         '🎯 Confirmez votre disponibilité',
@@ -2401,9 +2410,9 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
         { missionTitle: mission.title, minutes: confirmationMinutes }
       );
 
-      const { rows: [candidateContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [nextOeilId]);
-      if (candidateContact?.phone) {
-        await sendWhatsAppTemplate(waselTemplates.candidate_confirmation_request.template_name, candidateContact.phone, [mission.title, String(confirmationMinutes)]);
+      const candidatePhone = phoneById.get(nextOeilId);
+      if (candidatePhone) {
+        await sendWhatsAppTemplate(waselTemplates.candidate_confirmation_request.template_name, candidatePhone, [mission.title, String(confirmationMinutes)]);
       }
     }
 
