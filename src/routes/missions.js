@@ -50,7 +50,7 @@ async function prepareMissionInsert(db, clientId, body) {
     property_type, visit_type, video_call,
     institution, purpose,
     company_name, audit_type, frequency, criteria, subcategory,
-    promo_code, discount, original_price,
+    promo_code, discount,
     replacement_preference,
   } = body;
 
@@ -65,7 +65,15 @@ async function prepareMissionInsert(db, clientId, body) {
     return { error: 'Sous-catégorie invalide pour ce type de mission' };
   }
 
-  let { commission, oeil_earning } = await pricing(+original_price || +price, db);
+  // Commission/oeil_earning TOUJOURS calculés sur price (le montant réellement facturé/
+  // enregistré), jamais sur un original_price envoyé par le client. original_price n'est
+  // qu'un affichage côté frontend (POST /promo/validate) — avant ce correctif, un client
+  // pouvait l'envoyer arbitrairement élevé (avec ou sans promo_code réel, y compris à
+  // price>0) et se faire créditer un oeil_earning sans rapport avec ce qu'il paie
+  // réellement (constaté : price=1, original_price=99999 → oeil crédité ~79999 MAD à la
+  // validation). Le cas gratuit (price=0 + promo réel) reste géré séparément ci-dessous,
+  // avec platform_amount — jamais une valeur cliente.
+  let { commission, oeil_earning } = await pricing(+price, db);
 
   // Code promo gratuit — Shoofly paie l'Œil de sa poche. Le code doit être réel, actif,
   // de type 'free', non expiré et pas déjà épuisé par ce client : ne jamais faire confiance
@@ -604,6 +612,15 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), miss
 
   const { error, insert, freePromo } = await prepareMissionInsert(db, req.user.id, req.body);
   if (error) return res.status(400).json({ error });
+
+  // Création directe réservée aux missions gratuites (price=0, promo 'free' ou aucune) —
+  // toute mission payante doit passer par POST /payments/payzone/init, seule voie qui
+  // collecte réellement le paiement. Sans cette garde, un client pouvait appeler cette
+  // route directement (hors frontend) avec un price>0 et obtenir une mission réelle,
+  // assignable et payant l'Œil, sans jamais payer quoi que ce soit.
+  if (+insert.price > 0) {
+    return res.status(400).json({ error: 'Paiement requis pour cette mission — utilisez POST /payments/payzone/init.' });
+  }
 
   const mission = await insertMissionRecord(db, req.user.id, insert, freePromo);
 
