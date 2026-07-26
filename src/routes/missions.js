@@ -203,7 +203,7 @@ async function sendUrgentWhatsAppWave(db, mission) {
 
   const { rows: pool } = await db.query(
     `SELECT u.id, u.phone FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-     WHERE u.role='oeil' AND u.is_active=true AND p.is_verified=true AND p.is_available=true
+     WHERE u.role='oeil' AND u.is_active=true AND u.is_suspended=false AND p.is_verified=true AND p.is_available=true
        AND u.city=$1
        AND u.id NOT IN (SELECT oeil_id FROM mission_whatsapp_contacts WHERE mission_id=$2)
      ORDER BY u.reliability_score DESC, p.rating_avg DESC
@@ -227,7 +227,7 @@ async function sendUrgentWhatsAppWave(db, mission) {
   // sinon pool épuisé, on ne programme rien de plus (voir garde-fou ci-dessus).
   const { rows: [{ n: remaining }] } = await db.query(
     `SELECT COUNT(*)::int AS n FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-     WHERE u.role='oeil' AND u.is_active=true AND p.is_verified=true AND p.is_available=true
+     WHERE u.role='oeil' AND u.is_active=true AND u.is_suspended=false AND p.is_verified=true AND p.is_available=true
        AND u.city=$1
        AND u.id NOT IN (SELECT oeil_id FROM mission_whatsapp_contacts WHERE mission_id=$2)`,
     [mission.city, mission.id]
@@ -250,7 +250,7 @@ async function sendUrgentWhatsAppWave(db, mission) {
 async function notifyNewMission(db, mission, emitToUser, io) {
   const { rows: oeils } = await db.query(
     `SELECT u.id FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-     WHERE u.role='oeil' AND u.is_active=true AND p.is_verified=true AND p.is_available=true
+     WHERE u.role='oeil' AND u.is_active=true AND u.is_suspended=false AND p.is_verified=true AND p.is_available=true
        AND u.city=$1`,
     [mission.city]
   );

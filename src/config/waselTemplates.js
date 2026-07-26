@@ -1,9 +1,11 @@
 // Centralise les noms de templates WhatsApp (Wasel/Meta) utilisés par src/services/wasel.js.
 //
 // Filtrage 2026-07-25 : sur les 44 événements candidats catalogués (audit 2026-07-23), seuls
-// les 21 ci-dessous envoient réellement un WhatsApp — critère unique retenu : "une action est
-// attendue rapidement" de la part du destinataire (+ 1 cas particulier de blocage total, voir
-// account_blocked_fraud_oeil). Tout le reste reste en notification in-app uniquement.
+// 21 envoyaient réellement un WhatsApp — critère unique retenu : "une action est attendue
+// rapidement" de la part du destinataire (+ 1 cas particulier de blocage total, voir
+// account_blocked_fraud_oeil). Tout le reste reste en notification in-app uniquement. Un 22e
+// (mission_without_oeil_admin) a été ajouté après coup, hors de ce filtrage : implémentation
+// d'un TODO WhatsApp préexistant, voir sa note ci-dessous — pas un nouvel événement candidat.
 //
 // Chaque événement gardé a désormais SON PROPRE nom de template dédié (ci-dessous) — les 2
 // templates génériques de test technique ('ticket_urgent_ouvert', 'nouvelle_verification_

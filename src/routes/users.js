@@ -779,8 +779,8 @@ router.get('/admin/dashboard/oeils', authenticate, requireRole('admin'), require
       db.query(`
         SELECT
           COUNT(*)::int AS total,
-          COUNT(*) FILTER (WHERE is_active=true)::int AS actifs,
-          COUNT(*) FILTER (WHERE is_active=false)::int AS inactifs
+          COUNT(*) FILTER (WHERE is_active=true AND is_suspended=false)::int AS actifs,
+          COUNT(*) FILTER (WHERE is_active=false OR is_suspended=true)::int AS inactifs
         FROM users WHERE role='oeil'
       `),
       db.query(`
