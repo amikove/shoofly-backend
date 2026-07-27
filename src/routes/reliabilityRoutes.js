@@ -176,7 +176,7 @@ router.get('/admin/all-scores', authenticate, requireRole('admin'), asyncHandler
 
   const { rows: oeils } = await db.query(`
     SELECT id, first_name, last_name, email, city, quartier,
-           reliability_score, is_suspended
+           reliability_score, is_suspended, is_active
     FROM users
     ${wc}
     ORDER BY ${orderBy}

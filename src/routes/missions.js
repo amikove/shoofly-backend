@@ -65,6 +65,42 @@ async function prepareMissionInsert(db, clientId, body) {
     return { error: 'Sous-catégorie invalide pour ce type de mission' };
   }
 
+  // oeil_id fourni par le client (réservation directe depuis sa fiche) — jamais fait confiance
+  // sans revalidation serveur : avant ce correctif, il passait tel quel jusqu'à l'INSERT,
+  // permettant d'assigner directement (y compris via un paiement PayZone réellement encaissé)
+  // un Œil suspendu, bloqué anti-fraude (is_active=false), non vérifié, indisponible, ou déjà
+  // pris sur le même créneau (audit croisé 2026-07-26, Partie E). Mêmes flags que le pattern
+  // "Œil éligible" déjà utilisé plus haut (sendUrgentWhatsAppWave/notifyNewMission) + même
+  // requête de conflit de créneau que hireOeilCore/assign-admin plus bas dans ce fichier.
+  if (oeil_id) {
+    const { rows: [oeilCheck] } = await db.query(
+      `SELECT u.role, u.is_active, u.is_suspended, p.is_verified, p.is_available
+       FROM users u JOIN oeil_profiles p ON p.user_id=u.id
+       WHERE u.id=$1`,
+      [oeil_id]
+    );
+    if (!oeilCheck || oeilCheck.role !== 'oeil') return { error: 'Œil introuvable' };
+    if (!oeilCheck.is_verified) return { error: 'Cet Œil n\'est pas encore vérifié.' };
+    if (!oeilCheck.is_available) return { error: 'Cet Œil n\'est pas disponible actuellement.' };
+    // Message volontairement générique (suspendu / bloqué anti-fraude) — même choix que
+    // hireOeilCore : la raison précise est une information interne de fiabilité, non
+    // communicable au client.
+    if (oeilCheck.is_suspended || !oeilCheck.is_active) {
+      return { error: 'Cet Œil n\'est plus disponible pour cette mission.' };
+    }
+
+    const scheduleConflictWindowHours = await getSetting(db, 'schedule_conflict_window_hours', 4);
+    const { rows: creneauConflicts } = await db.query(`
+      SELECT m.id FROM missions m
+      WHERE m.oeil_id = $1
+        AND m.status IN ('assigned','en_route','active')
+        AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $2)) / 3600) < $3::numeric
+    `, [oeil_id, new Date(scheduled_at), scheduleConflictWindowHours]);
+    if (creneauConflicts.length > 0) {
+      return { error: 'Cet Œil a déjà une mission dans le même créneau.' };
+    }
+  }
+
   // Commission/oeil_earning TOUJOURS calculés sur price (le montant réellement facturé/
   // enregistré), jamais sur un original_price envoyé par le client. original_price n'est
   // qu'un affichage côté frontend (POST /promo/validate) — avant ce correctif, un client
