@@ -16,7 +16,7 @@ const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const { isValidSubcategory } = require('../constants/missionCategories');
-const { checkOeilAssignable } = require('../utils/oeilAssignment');
+const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
 
 
 async function getCommissionRate(db) {
@@ -1128,14 +1128,31 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
         [req.params.id, mission.transferred_from]
       );
 
+    // Masquage strict côté client : une candidature dont l'Œil échoue une des 5
+    // vérifications de checkOeilAssignable (vérifié/disponible/suspendu-bloqué/conflit de
+    // créneau) est retirée avant la sérialisation — jamais de champ brut is_verified/
+    // is_available/is_suspended/is_active/suspended_reason dans la réponse envoyée au client
+    // (voir RAPPORT_GAP_BACKEND_MASQUAGE_ADMIN_OVERRIDE.md section 4 : la raison précise d'un
+    // blocage est une information interne de fiabilité, non communicable au client, même via
+    // un onglet réseau). L'admin, qui peut aussi consulter cette liste, garde la liste complète
+    // et non filtrée — cet écran n'est pas celui visé par la règle badge/override (assign-admin).
+    let visibleRows = rows;
+    if (req.user.role === 'client') {
+      const eligibility = await checkOeilsAssignableBulk(db, rows.map(o => o.id), {
+        scheduledAt: mission.scheduled_at,
+        excludeMissionId: mission.id,
+      });
+      visibleRows = rows.filter(o => eligibility[o.id]?.ok === true);
+    }
+
     // Le client voit des tiers (Œils candidats) : masque la note d'un débutant
     // (< 10 missions) pour ne pas afficher un signal peu significatif.
     // L'admin, qui peut aussi consulter cette liste, garde la vraie valeur.
     // Le temps de réponse moyen est calculé en une seule requête groupée pour
     // tous les candidats (voir computeAvgResponseMinutesBulk) plutôt qu'en boucle.
-    const avgResponseByOeil = await computeAvgResponseMinutesBulk(db, rows.map(o => o.id));
+    const avgResponseByOeil = await computeAvgResponseMinutesBulk(db, visibleRows.map(o => o.id));
     const newOeilThreshold = await getSetting(db, 'new_oeil_mission_threshold', 10);
-    const interests = rows.map(o => {
+    const interests = visibleRows.map(o => {
       const is_new_oeil = isNewOeil(o.total_missions, newOeilThreshold);
       const avg_response_minutes = avgResponseByOeil[o.id] ?? null;
       if (req.user.role === 'client' && is_new_oeil) {
@@ -1897,6 +1914,40 @@ router.post('/:id/confirm-presence', authenticate, requireRole('oeil'), asyncHan
   if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, presence_confirmed_at: updated.presence_confirmed_at });
 
   res.json({ ok: true, presence_confirmed_at: updated.presence_confirmed_at });
+}));
+
+// ── GET /:id/assignable-oeils ── Picker admin (assign-admin) : champs bruts ──
+// Route dédiée plutôt qu'un paramètre ajouté à GET /users/oeils : cette dernière est aussi
+// consommée par des écrans client (client/Oeils.jsx, client/Dashboard.jsx) avec le filtre
+// `p.is_verified=true` toujours actif — pas question d'y brancher un mode qui expose
+// is_active/is_suspended/suspended_reason, même derrière un paramètre. Réservée à l'admin
+// (requireRole) et ne filtre ni ne masque aucun Œil, contrairement à /users/oeils : c'est
+// justement le but (badges d'éligibilité sur des candidats par ailleurs inéligibles). Voir
+// RAPPORT_GAP_BACKEND_MASQUAGE_ADMIN_OVERRIDE.md section 5, point 2.
+router.get('/:id/assignable-oeils', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows: [mission] } = await db.query('SELECT id, scheduled_at FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  const { rows } = await db.query(`
+    SELECT u.id, u.first_name, u.last_name, u.city, u.avatar_url,
+           u.is_active, u.is_suspended, u.suspended_reason,
+           p.bio, p.coverage_zone, p.is_verified, p.is_available,
+           p.rating_avg, p.rating_count, p.total_missions
+    FROM users u JOIN oeil_profiles p ON p.user_id=u.id
+    WHERE u.role='oeil'
+    ORDER BY p.rating_avg DESC, p.total_missions DESC
+  `);
+
+  // Conflit de créneau en une seule requête groupée (getScheduleConflictSetBulk) plutôt
+  // qu'une vérification par candidat — même esprit que computeAvgResponseMinutesBulk.
+  const conflictSet = await getScheduleConflictSetBulk(db, rows.map(o => o.id), {
+    scheduledAt: mission.scheduled_at,
+    excludeMissionId: mission.id,
+  });
+
+  const oeils = rows.map(o => ({ ...o, has_schedule_conflict: conflictSet.has(o.id) }));
+  res.json({ oeils });
 }));
 
 // ── POST /missions/:id/assign-admin ── Admin affecte manuellement ──
