@@ -1705,15 +1705,20 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
     await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser, 'interests_modal', 'newOeilInterestTitle', 'newOeilInterestBody', {missionTitle: mission.title});
 
     // WhatsApp au client : jamais à chaque candidature individuelle — un seul envoi par
-    // mission, déclenché dès que le nombre de candidatures atteint candidature_whatsapp_
-    // seuil_count (défaut 3). Si ce seuil n'est jamais atteint, le cron dédié (index.js)
-    // envoie après candidature_whatsapp_seuil_minutes depuis la première candidature. Garde
-    // atomique (UPDATE ... WHERE candidature_whatsapp_sent_at IS NULL) pour éviter un double
-    // envoi si deux candidatures arrivent presque simultanément.
+    // mission, déclenché dès que le nombre de candidatures d'Œils vérifiés atteint
+    // candidature_whatsapp_seuil_count (défaut 3). Ne compte que les Œils avec oeil_profiles.
+    // is_verified=true (audit sécurité post-chantiers, Partie D) : sinon plusieurs comptes
+    // jetables non vérifiés peuvent forcer artificiellement l'envoi. Si ce seuil n'est jamais
+    // atteint, le cron dédié (index.js) envoie après candidature_whatsapp_seuil_minutes depuis
+    // la première candidature vérifiée. Garde atomique (UPDATE ... WHERE candidature_whatsapp_
+    // sent_at IS NULL) pour éviter un double envoi si deux candidatures arrivent presque
+    // simultanément.
     if (!mission.candidature_whatsapp_sent_at) {
       const seuilCount = await getSetting(db, 'candidature_whatsapp_seuil_count', 3);
       const { rows: [{ n: interestCount }] } = await db.query(
-        `SELECT COUNT(*)::int AS n FROM mission_interests WHERE mission_id=$1`, [req.params.id]
+        `SELECT COUNT(*)::int AS n FROM mission_interests mi
+         JOIN oeil_profiles p ON p.user_id = mi.oeil_id AND p.is_verified = true
+         WHERE mi.mission_id=$1`, [req.params.id]
       );
       if (interestCount >= seuilCount) {
         const { rowCount } = await db.query(
