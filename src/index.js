@@ -932,11 +932,12 @@ initDb().then(() => {
   // ── Cron toutes les 5 min — Seuil WhatsApp candidatures (repli délai) ────
   // Complète le déclencheur synchrone par nombre de candidatures (POST /:id/interest,
   // routes/missions.js) : si une mission n'atteint jamais candidature_whatsapp_seuil_count
-  // candidatures, ce cron envoie quand même le WhatsApp au client après candidature_whatsapp_
-  // seuil_minutes depuis sa toute première candidature — à condition qu'il y en ait eu au
-  // moins une (INNER JOIN mission_interests). Un seul envoi total par mission, garanti par le
-  // même champ de suivi que le déclencheur synchrone (missions.candidature_whatsapp_sent_at,
-  // garde atomique WHERE ... IS NULL). Exclut les missions déjà résolues (status != 'pending')
+  // candidatures vérifiées, ce cron envoie quand même le WhatsApp au client après
+  // candidature_whatsapp_seuil_minutes depuis sa toute première candidature d'un Œil vérifié —
+  // à condition qu'il y en ait eu au moins une (JOIN oeil_profiles ... is_verified=true, audit
+  // sécurité post-chantiers Partie D). Un seul envoi total par mission, garanti par le même
+  // champ de suivi que le déclencheur synchrone (missions.candidature_whatsapp_sent_at, garde
+  // atomique WHERE ... IS NULL). Exclut les missions déjà résolues (status != 'pending')
   // — inutile d'alerter le client sur des candidatures d'une mission déjà assignée/annulée.
   cron.schedule('*/5 * * * *', async () => {
     if (cronCandidatureWhatsAppRunning) { console.warn('⏭️ Cron seuil WhatsApp candidatures déjà en cours, tick ignoré'); return; }
@@ -948,6 +949,7 @@ initDb().then(() => {
         SELECT m.id, m.title, c.phone AS client_phone, COUNT(mi.id)::int AS n
         FROM missions m
         JOIN mission_interests mi ON mi.mission_id = m.id
+        JOIN oeil_profiles p ON p.user_id = mi.oeil_id AND p.is_verified = true
         JOIN users c ON c.id = m.client_id
         WHERE m.status = 'pending' AND m.candidature_whatsapp_sent_at IS NULL
         GROUP BY m.id, m.title, c.phone
