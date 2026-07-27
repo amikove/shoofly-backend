@@ -16,6 +16,7 @@ const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const { isValidSubcategory } = require('../constants/missionCategories');
+const { checkOeilAssignable } = require('../utils/oeilAssignment');
 
 
 async function getCommissionRate(db) {
@@ -66,39 +67,13 @@ async function prepareMissionInsert(db, clientId, body) {
   }
 
   // oeil_id fourni par le client (réservation directe depuis sa fiche) — jamais fait confiance
-  // sans revalidation serveur : avant ce correctif, il passait tel quel jusqu'à l'INSERT,
-  // permettant d'assigner directement (y compris via un paiement PayZone réellement encaissé)
-  // un Œil suspendu, bloqué anti-fraude (is_active=false), non vérifié, indisponible, ou déjà
-  // pris sur le même créneau (audit croisé 2026-07-26, Partie E). Mêmes flags que le pattern
-  // "Œil éligible" déjà utilisé plus haut (sendUrgentWhatsAppWave/notifyNewMission) + même
-  // requête de conflit de créneau que hireOeilCore/assign-admin plus bas dans ce fichier.
+  // sans revalidation serveur (audit croisé 2026-07-26, Partie E ; commit 25d88be). Logique
+  // désormais partagée avec hireOeilCore et POST /:id/assign-admin via checkOeilAssignable
+  // (extraction 2026-07-27, Partie F) — comportement strictement inchangé ici : pas d'override
+  // pour ce point d'entrée, pas de mission existante à exclure du conflit de créneau.
   if (oeil_id) {
-    const { rows: [oeilCheck] } = await db.query(
-      `SELECT u.role, u.is_active, u.is_suspended, p.is_verified, p.is_available
-       FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-       WHERE u.id=$1`,
-      [oeil_id]
-    );
-    if (!oeilCheck || oeilCheck.role !== 'oeil') return { error: 'Œil introuvable' };
-    if (!oeilCheck.is_verified) return { error: 'Cet Œil n\'est pas encore vérifié.' };
-    if (!oeilCheck.is_available) return { error: 'Cet Œil n\'est pas disponible actuellement.' };
-    // Message volontairement générique (suspendu / bloqué anti-fraude) — même choix que
-    // hireOeilCore : la raison précise est une information interne de fiabilité, non
-    // communicable au client.
-    if (oeilCheck.is_suspended || !oeilCheck.is_active) {
-      return { error: 'Cet Œil n\'est plus disponible pour cette mission.' };
-    }
-
-    const scheduleConflictWindowHours = await getSetting(db, 'schedule_conflict_window_hours', 4);
-    const { rows: creneauConflicts } = await db.query(`
-      SELECT m.id FROM missions m
-      WHERE m.oeil_id = $1
-        AND m.status IN ('assigned','en_route','active')
-        AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $2)) / 3600) < $3::numeric
-    `, [oeil_id, new Date(scheduled_at), scheduleConflictWindowHours]);
-    if (creneauConflicts.length > 0) {
-      return { error: 'Cet Œil a déjà une mission dans le même créneau.' };
-    }
+    const assignCheck = await checkOeilAssignable(db, oeil_id, { scheduledAt: scheduled_at });
+    if (assignCheck.error) return { error: assignCheck.error };
   }
 
   // Commission/oeil_earning TOUJOURS calculés sur price (le montant réellement facturé/
@@ -1929,7 +1904,7 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     const db = getDb();
     const emitToUser = req.app.get('emitToUser');
     const io = req.app.get('io');
-    const { oeil_id, override_warning } = req.body;
+    const { oeil_id, override_warning, override_reason } = req.body;
     if (!oeil_id) return res.status(400).json({ error: 'oeil_id requis' });
     const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
     if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
@@ -1938,19 +1913,35 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     // mission_interests) — reflète l'état au moment de l'appel, jamais bloquant (décision produit :
     // l'admin doit toujours pouvoir écraser une cascade en cours).
     const cascadeInterrupted = isBatchLive(mission);
-    // Vérifier que l'Œil est vérifié et disponible
-    const { rows: [profile] } = await db.query(
-      `SELECT is_verified, is_available FROM oeil_profiles WHERE user_id=$1`, [oeil_id]
-    );
-    if (!profile?.is_verified) return res.status(400).json({ error: 'Œil non vérifié' });
-    // Suspension/cooldown : bloqué par défaut, mais l'admin peut passer outre avec confirmation explicite
-    const { rows: [oeilStatus] } = await db.query('SELECT is_suspended, transfer_cooldown_until FROM users WHERE id=$1', [oeil_id]);
-    const hasCooldown = oeilStatus?.transfer_cooldown_until && new Date(oeilStatus.transfer_cooldown_until) > new Date();
-    if ((oeilStatus?.is_suspended || hasCooldown) && !override_warning) {
+
+    // Contrôle faisant foi — is_verified/is_available/conflit de créneau TOUJOURS bloquants ;
+    // is_suspended/is_active (anti-fraude) volontairement passés en overridable:true ici pour ne
+    // pas encore rejeter à ce stade (le rejet définitif sur ces deux-là, s'il a lieu, est décidé
+    // juste après par le bloc de confirmation ci-dessous — priorité aux contrôles objectifs,
+    // jamais overridables, avant de solliciter une confirmation sur un contrôle subjectif).
+    // 2026-07-27, Partie F : couvre désormais aussi is_verified et is_available (jamais
+    // vérifiés ici avant ce correctif malgré leur sélection) et is_active (jamais vérifié du
+    // tout ici avant ce correctif).
+    const assignCheck = await checkOeilAssignable(db, oeil_id, {
+      scheduledAt: mission.scheduled_at,
+      excludeMissionId: mission.id,
+      overridable: true,
+    });
+    if (assignCheck.error) return res.status(400).json({ error: assignCheck.error });
+
+    // Suspension / blocage anti-fraude / cooldown de transfert : bloqué par défaut, mais l'admin
+    // peut passer outre avec confirmation explicite (override_warning, mécanisme préexistant —
+    // is_active y rejoint is_suspended depuis 2026-07-27, Partie F : même sémantique, un jugement
+    // sur le comportement passé de l'Œil que l'admin peut vouloir outrepasser pour une mission
+    // urgente sans autre candidat, à condition d'être informé et de confirmer explicitement).
+    const { rows: [cooldownRow] } = await db.query('SELECT transfer_cooldown_until FROM users WHERE id=$1', [oeil_id]);
+    const hasCooldown = cooldownRow?.transfer_cooldown_until && new Date(cooldownRow.transfer_cooldown_until) > new Date();
+    if ((assignCheck.isSuspended || !assignCheck.isActive || hasCooldown) && !override_warning) {
       const reasons = [];
-      if (oeilStatus?.is_suspended) reasons.push('cet Œil est actuellement suspendu');
+      if (assignCheck.isSuspended) reasons.push('cet Œil est actuellement suspendu');
+      if (!assignCheck.isActive) reasons.push('cet Œil est bloqué pour anti-fraude');
       if (hasCooldown) {
-        const remaining = Math.ceil((new Date(oeilStatus.transfer_cooldown_until) - Date.now()) / 3600000);
+        const remaining = Math.ceil((new Date(cooldownRow.transfer_cooldown_until) - Date.now()) / 3600000);
         reasons.push(`cet Œil est en cooldown pour encore ${remaining}h suite à un transfert de mission`);
       }
       return res.status(409).json({
@@ -1959,21 +1950,21 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
       });
     }
 
-  // Vérifier les conflits de créneau (même requête que POST /:id/hire/:oeilId)
-  const scheduleConflictWindowHoursAdmin = await getSetting(db, 'schedule_conflict_window_hours', 4);
-  const { rows: creneauConflicts } = await db.query(`
-    SELECT m.id FROM missions m
-    WHERE m.oeil_id = $1
-      AND m.status IN ('assigned','en_route','active')
-      AND m.id != $2
-      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < $4::numeric
-  `, [oeil_id, mission.id, mission.scheduled_at, scheduleConflictWindowHoursAdmin])
-
-  if (creneauConflicts.length > 0) {
-    return res.status(400).json({ error: 'Cet Œil a déjà une mission dans le même créneau.' })
-  }
-
   const { rows: [oeil] } = await db.query('SELECT first_name, last_name, phone FROM users WHERE id=$1', [oeil_id]);
+
+  // Trace de l'override — si l'admin a dû passer outre suspension/anti-fraude/cooldown, consigné
+  // dans mission_status_history.note (même mécanisme que toute transition, voir transitionMission
+  // ci-dessous) avec la raison libre optionnelle fournie (même pattern que le champ `reason` de
+  // toggle-active, commit c1805a3).
+  let note = 'Affectation manuelle par admin';
+  if (assignCheck.isSuspended || !assignCheck.isActive || hasCooldown) {
+    const overrideReasons = [];
+    if (assignCheck.isSuspended) overrideReasons.push('suspendu');
+    if (!assignCheck.isActive) overrideReasons.push('bloqué anti-fraude');
+    if (hasCooldown) overrideReasons.push('cooldown de transfert');
+    note = `Affectation manuelle par admin (override : ${overrideReasons.join(', ')})`;
+    if (override_reason) note += ` — raison : ${override_reason}`;
+  }
 
   try {
     await transitionMission(db, mission.id, 'pending', 'assigned', req.user.id, {
@@ -1983,7 +1974,7 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
         candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
         urgent_whatsapp_next_wave_at: null,
       },
-      note: 'Affectation manuelle par admin',
+      note,
     });
   } catch (e) {
     if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
@@ -2233,7 +2224,9 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
     oeilNotifParams = null,
   } = opts || {};
 
-  // Vérifier suspension et cooldown de transfert — sur l'Œil qu'on embauche, pas sur le client
+  // Vérifier suspension et cooldown de transfert — sur l'Œil qu'on embauche, pas sur le client.
+  // Cooldown de transfert hors périmètre des 5 vérifications standard de checkOeilAssignable
+  // (spec réattribution 2026-07-27, Partie F) — conservé tel quel, aucun override côté client.
   const { rows: [oeilUser] } = await db.query(
     'SELECT is_suspended, transfer_cooldown_until FROM users WHERE id=$1', [oeilId]
   );
@@ -2249,18 +2242,16 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   );
   if (!interest) return { ok: false, status: 400, error: "Cet Œil n'a pas exprimé son intérêt" };
 
-  // Vérifier le créneau avant assignation (doit précéder toute mutation de la mission)
-  const scheduleConflictWindowHours = await getSetting(db, 'schedule_conflict_window_hours', 4);
-  const { rows: creneauConflicts } = await db.query(`
-    SELECT m.id FROM missions m
-    WHERE m.oeil_id = $1
-      AND m.status IN ('assigned','en_route','active')
-      AND m.id != $2
-      AND ABS(EXTRACT(EPOCH FROM (m.scheduled_at - $3)) / 3600) < $4::numeric
-  `, [oeilId, mission.id, mission.scheduled_at, scheduleConflictWindowHours])
-
-  if (creneauConflicts.length > 0) {
-    return { ok: false, status: 400, error: 'Cet Œil a déjà une mission dans le même créneau.' };
+  // is_verified/is_available/is_active (anti-fraude)/conflit de créneau — jamais d'override
+  // côté client (2026-07-27, Partie F : is_suspended déjà écarté ci-dessus, ce contrôle couvre
+  // en plus is_active, qui n'était vérifié nulle part sur ce chemin avant ce correctif).
+  const assignCheck = await checkOeilAssignable(db, oeilId, {
+    scheduledAt: mission.scheduled_at,
+    excludeMissionId: mission.id,
+  });
+  if (assignCheck.error) {
+    const status = assignCheck.code === 'suspended_or_blocked' ? 403 : 400;
+    return { ok: false, status, error: assignCheck.error };
   }
 
   // candidate_window_ends_at, pending_candidate_id et batch_tiebreak_ends_at remis à NULL ici
@@ -2300,7 +2291,13 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
       );
     }
 
-  // Supprimer les intérêts en conflit de créneau
+  // Supprimer les intérêts en conflit de créneau — requête distincte du contrôle de
+  // checkOeilAssignable ci-dessus (ici : les AUTRES missions encore pending sur lesquelles cet
+  // Œil avait candidaté, pas ses missions déjà assignées) ; nécessite donc sa propre lecture du
+  // réglage (scheduleConflictWindowHours n'est plus dans le scope de cette fonction depuis
+  // l'extraction vers checkOeilAssignable, 2026-07-27 Partie F — getSetting est cache 60s,
+  // ce second appel ne coûte pas de requête DB supplémentaire dans l'immense majorité des cas).
+  const scheduleConflictWindowHours = await getSetting(db, 'schedule_conflict_window_hours', 4);
   const { rows: conflictInterests } = await db.query(`
     SELECT mi.mission_id FROM mission_interests mi
     JOIN missions m ON m.id = mi.mission_id
