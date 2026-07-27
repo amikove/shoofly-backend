@@ -1333,6 +1333,11 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
       return res.status(403).json({ error: 'Seul le Super Admin peut activer/désactiver un compte administrateur.' });
     }
 
+    const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+    if (reason.length > 500) {
+      return res.status(400).json({ error: 'La raison ne doit pas dépasser 500 caractères.' });
+    }
+
     // Pour un Œil, le bouton générique admin agit désormais sur is_suspended — accès à la
     // connexion conservé, réutilise l'infrastructure de restriction déjà en place pour la
     // suspension par score de fiabilité (middleware/auth.js, isSuspendedOeilAllowed) — plutôt
@@ -1347,7 +1352,7 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
       const { rows: [row] } = willSuspend
         ? await db.query(
             `UPDATE users SET is_suspended=true, suspended_at=NOW(), suspended_reason=$2 WHERE id=$1 RETURNING is_suspended`,
-            [req.params.id, 'Suspension administrative']
+            [req.params.id, reason || 'Suspension administrative']
           )
         : await db.query(
             `UPDATE users SET is_suspended=false, suspended_at=NULL, suspended_reason=NULL WHERE id=$1 RETURNING is_suspended`,
