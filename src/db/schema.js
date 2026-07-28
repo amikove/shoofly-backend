@@ -254,6 +254,7 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('client_validation_hours', '12'),
         ('schedule_conflict_window_hours', '4'),
         ('transfer_cooldown_hours', '4'),
+        ('transfer_cooldown_before_hours', '2'),
         ('abandon_during_mission_cooldown_hours', '48'),
         ('stale_mission_hours', '12'),
         ('stale_mission_min_lead_hours', '4'),
