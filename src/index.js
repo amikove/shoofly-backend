@@ -48,6 +48,7 @@ const missionRoutes = require('./routes/missions');
 const missionRoutesModule = require('./routes/missions');
 const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
 const checkMissionEditRequestExpiry = missionRoutesModule.checkMissionEditRequestExpiry;
+const checkAssistanceRequestExpiry = missionRoutesModule.checkAssistanceRequestExpiry;
 const checkPresenceConfirmationDeadlines = missionRoutesModule.checkPresenceConfirmationDeadlines;
 const advanceCandidateCascade = missionRoutesModule.advanceCandidateCascade;
 const hireOeilCore = missionRoutesModule.hireOeilCore;
@@ -315,6 +316,7 @@ initDb().then(() => {
   let cronPreMissionRemindersRunning = false;
   let cronTransferDeadlineRunning = false;
   let cronMissionEditExpiryRunning = false;
+  let cronAssistanceRequestExpiryRunning = false;
   let cronAutoValidateRunning = false;
   let cronStaleMissionsRunning = false;
   let cronCandidateWindowRunning = false;
@@ -780,6 +782,19 @@ initDb().then(() => {
       await checkMissionEditRequestExpiry(db, emitToUser);
     } catch (e) { console.error('❌ Mission edit request expiry cron error:', e.message); }
     finally { cronMissionEditExpiryRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // Expirer les demandes "Demander assistance" (catégorie mission) sans réponse du client,
+  // toutes les 5 minutes — même cadence que les autres vérifications de deadline ci-dessus.
+  cron.schedule('*/5 * * * *', async () => {
+    if (cronAssistanceRequestExpiryRunning) { console.warn('⏭️ Cron expiration demandes assistance déjà en cours, tick ignoré'); return; }
+    cronAssistanceRequestExpiryRunning = true;
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+      await checkAssistanceRequestExpiry(db, emitToUser);
+    } catch (e) { console.error('❌ Assistance request expiry cron error:', e.message); }
+    finally { cronAssistanceRequestExpiryRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 5 min — Confirmations de présence expirées ────────────

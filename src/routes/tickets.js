@@ -6,6 +6,7 @@ const asyncHandler = require('../middleware/asyncHandler');
 const { VALID_CATEGORIES, URGENT_CATEGORY, SURVEILLANCE_CATEGORIES } = require('../constants/ticketCategories');
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
+const { generateUniqueReference } = require('../utils/ticketReference');
 
 async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null) {
   const r = await db.query(
@@ -13,23 +14,6 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
     [userId, title, body, type, missionId, actionType, titleKey, bodyKey, params ? JSON.stringify(params) : null]
   );
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
-}
-
-const REFERENCE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sans caractères ambigus (0/O, 1/I)
-
-function randomReference() {
-  let ref = '';
-  for (let i = 0; i < 6; i++) ref += REFERENCE_CHARS[Math.floor(Math.random() * REFERENCE_CHARS.length)];
-  return `TKT-${ref}`;
-}
-
-async function generateUniqueReference(db) {
-  for (let i = 0; i < 5; i++) {
-    const ref = randomReference();
-    const { rows } = await db.query('SELECT 1 FROM support_tickets WHERE reference=$1', [ref]);
-    if (!rows.length) return ref;
-  }
-  throw new Error('Impossible de générer une référence de ticket unique');
 }
 
 // ── POST /tickets — création d'un ticket ────────────────────

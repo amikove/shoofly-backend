@@ -17,6 +17,7 @@ const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const { isValidSubcategory } = require('../constants/missionCategories');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
+const { generateUniqueReference } = require('../utils/ticketReference');
 
 
 async function getCommissionRate(db) {
@@ -1778,19 +1779,27 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
 
 
 // ── POST /missions/:id/transfer ── Œil signale empêchement ──
-router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
-  const db = getDb();
-  const emitToUser = req.app.get('emitToUser');
-  const io = req.app.get('io');
-  const { reason } = req.body;
+// ── Réutilisable : libère une mission vers le pool de remplacement ────────
+// Extrait de POST /:id/transfer (comportement strictement inchangé pour cet appelant) pour
+// être également réutilisé par le flux "Demander assistance" catégorie URGENCE (POST
+// /:id/assistance) — les deux cas sont fonctionnellement identiques (l'Œil ne peut plus honorer
+// la mission, un remplaçant doit être cherché immédiatement) et doivent donc appliquer
+// exactement la même mécanique (transitionMission + pénalité/cooldown + advanceCandidateCascade),
+// jamais une variante parallèle qui pourrait diverger silencieusement. oeilId est passé
+// explicitement (plutôt que lu sur req.user) pour rester appelable hors contexte HTTP direct.
+async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId, reason, options = {}) {
+  const {
+    historyNoteVerb = "Empêchement signalé par l'Œil",
+    clientAlertTitle = '⚠️ Changement sur votre mission',
+    clientAlertBody = null,
+    clientAlertTitleKey = 'missionChangeAlertTitle',
+    clientAlertBodyKey = 'missionChangeAlertBody',
+    systemMessageText = "L'Œil a signalé un empêchement. Mission remise en priorité.",
+    systemMessageKey = 'missionImpediment',
+  } = options;
 
-  if (!reason) return res.status(400).json({ error: 'La raison est obligatoire' });
-
-  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
-  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
-  if (!['assigned','en_route','active'].includes(mission.status)) {
-    return res.status(400).json({ error: 'Transfert impossible pour ce statut' });
+  if (!['assigned', 'en_route', 'active'].includes(mission.status)) {
+    return { ok: false, status: 400, error: 'Transfert impossible pour ce statut' };
   }
 
   const transferType = mission.status === 'assigned' ? 'before' : 'during';
@@ -1807,20 +1816,20 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   // remplaçant est désormais entièrement gérée par advanceCandidateCascade (appelée
   // plus bas) — replacement_preference n'est plus lu ici (neutralisé, contenu ignoré).
   try {
-    await transitionMission(db, mission.id, mission.status, 'pending', req.user.id, {
+    await transitionMission(db, mission.id, mission.status, 'pending', oeilId, {
       extraFields: {
         is_priority: true,
         transfer_type: transferType,
-        transferred_from: req.user.id,
+        transferred_from: oeilId,
         transfer_reason: reason,
         transfer_deadline: deadline,
         oeil_id: null,
       },
-      extraGuards: { oeil_id: req.user.id },
-      note: `Empêchement signalé par l'Œil (${transferType === 'before' ? 'avant démarrage' : 'en cours de mission'})`,
+      extraGuards: { oeil_id: oeilId },
+      note: `${historyNoteVerb} (${transferType === 'before' ? 'avant démarrage' : 'en cours de mission'})`,
     });
   } catch (e) {
-    if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+    if (e instanceof MissionTransitionError) return { ok: false, status: 409, error: e.message };
     throw e;
   }
 
@@ -1830,58 +1839,264 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
   // qu'il vient de signaler ne pas pouvoir honorer. Pour un transfert 'during', le cooldown
   // posé plus bas masque l'effet par accident ; pour 'before' (aucun cooldown posé), rien
   // d'autre ne l'empêchait — bug constaté empiriquement (audit scénario 2.9).
-  await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, req.user.id]);
+  await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, oeilId]);
 
-// Transfert pendant mission : ferme la ligne active de la chaîne (le nouvel Œil n'est pas
-    // encore connu à ce stade — la nouvelle ligne sera ouverte au moment où quelqu'un accepte
-    // effectivement cette mission remise en file prioritaire).
-    if (transferType === 'during') {
-      await db.query(
-        `UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`,
-        [mission.id]
-      );
-    }
-    // Cooldown si transfert pendant mission
-    if (transferType === 'during') {
-      const transferCooldownHours = await getSetting(db, 'transfer_cooldown_hours', 4);
-      await db.query(
-        `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $2::numeric, transfer_count=transfer_count+1 WHERE id=$1`,
-        [req.user.id, transferCooldownHours]
-      );
-    } else {
+  // Transfert pendant mission : ferme la ligne active de la chaîne (le nouvel Œil n'est pas
+  // encore connu à ce stade — la nouvelle ligne sera ouverte au moment où quelqu'un accepte
+  // effectivement cette mission remise en file prioritaire).
+  if (transferType === 'during') {
+    await db.query(
+      `UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`,
+      [mission.id]
+    );
+  }
+  // Cooldown si transfert pendant mission
+  if (transferType === 'during') {
+    const transferCooldownHours = await getSetting(db, 'transfer_cooldown_hours', 4);
+    await db.query(
+      `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $2::numeric, transfer_count=transfer_count+1 WHERE id=$1`,
+      [oeilId, transferCooldownHours]
+    );
+  } else {
     await db.query(
       `UPDATE users SET transfer_count=transfer_count+1 WHERE id=$1`,
-      [req.user.id]
+      [oeilId]
     );
   }
 
-// Pénalité fiabilité — sera recalculée précisément si pas de remplaçant (cron)
+  // Pénalité fiabilité — sera recalculée précisément si pas de remplaçant (cron)
   if (transferType === 'before') {
-    await logReliabilityEvent(db, req.user.id, mission.id, 5, 'Transfert avant démarrage avec remplaçant', false);
+    await logReliabilityEvent(db, oeilId, mission.id, 5, 'Transfert avant démarrage avec remplaçant', false);
   }
-
 
   // Notifications
   await notify(db, mission.client_id,
-    '⚠️ Changement sur votre mission',
-    `Votre Œil a signalé un empêchement pour "${mission.title}". Nous recherchons un remplaçant en urgence.`,
-    'mission', mission.id, emitToUser, null, 'missionChangeAlertTitle', 'missionChangeAlertBody', {missionTitle: mission.title}
+    clientAlertTitle,
+    clientAlertBody || `Votre Œil a signalé un empêchement pour "${mission.title}". Nous recherchons un remplaçant en urgence.`,
+    'mission', mission.id, emitToUser, null, clientAlertTitleKey, clientAlertBodyKey, {missionTitle: mission.title}
   );
 
   // Message système dans le chat
   await db.query(
     `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,$3,'system',$4)`,
-    [mission.id, req.user.id, `L'Œil a signalé un empêchement. Mission remise en priorité.`, 'missionImpediment']
+    [mission.id, oeilId, systemMessageText, systemMessageKey]
   );
 
-  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
-  io.to('room:admin').emit('mission_updated', { id: mission.id, is_priority: true });
+  if (io) {
+    io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
+    io.to('room:admin').emit('mission_updated', { id: mission.id, is_priority: true });
+  }
 
   // Lance la cascade de confirmation séquentielle sur le pool actuel de mission_interests
   // (l'intérêt propre de l'Œil transférant a déjà été supprimé ci-dessus).
   await advanceCandidateCascade(db, io, emitToUser, mission, {});
 
-  res.json({ ok: true, transfer_type: transferType, deadline });
+  return { ok: true, transferType, deadline };
+}
+
+router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+  const { reason } = req.body;
+
+  if (!reason) return res.status(400).json({ error: 'La raison est obligatoire' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+
+  const result = await releaseMissionForReplacement(db, io, emitToUser, mission, req.user.id, reason);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+
+  res.json({ ok: true, transfer_type: result.transferType, deadline: result.deadline });
+}));
+
+// ── POST /missions/:id/assistance ── "Demander assistance" — point d'entrée unique ──
+// Remplace, pour l'Œil assigné à une mission en cours, le recours direct à /refuse ou
+// /status{cancelled} (voir garde-fous du rapport de session : ces deux routes restent
+// aujourd'hui accessibles indépendamment — signalé comme point ouvert, non fermé ici).
+// category='urgence' (accident, agression/vol/menace, hospitalisation, situation dangereuse) :
+// aucune validation requise, recherche immédiate d'un remplaçant via le mécanisme de
+// /:id/transfer (releaseMissionForReplacement, réutilisé — même pénalité/cooldown, non
+// contourné : voir rapport, point tranché explicitement).
+// category='mission' (client absent/injoignable, mauvaise adresse, mission différente de la
+// description) : gèle la mission en sous_reclamation en attendant la réponse du client — voir
+// POST /:id/assistance/respond.
+router.post('/:id/assistance', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+  const { category, reason } = req.body;
+
+  if (!['urgence', 'mission'].includes(category)) {
+    return res.status(400).json({ error: 'Catégorie invalide (attendu: urgence ou mission)' });
+  }
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'Le motif est obligatoire' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+  if (!['assigned', 'en_route', 'active'].includes(mission.status)) {
+    return res.status(400).json({ error: 'Assistance impossible pour ce statut de mission' });
+  }
+
+  const trimmedReason = reason.trim();
+
+  if (category === 'urgence') {
+    const result = await releaseMissionForReplacement(db, io, emitToUser, mission, req.user.id, `Assistance urgence : ${trimmedReason}`, {
+      historyNoteVerb: "Assistance urgence déclenchée par l'Œil",
+      clientAlertTitle: '🚨 Urgence signalée sur votre mission',
+      clientAlertBody: `Votre Œil a signalé une urgence sur "${mission.title}". Nous recherchons immédiatement un remplaçant.`,
+      clientAlertTitleKey: 'assistanceUrgenceClientTitle',
+      clientAlertBodyKey: 'assistanceUrgenceClientBody',
+      systemMessageText: "L'Œil a signalé une urgence. Recherche d'un remplaçant en cours.",
+      systemMessageKey: 'assistanceUrgenceSystemMessage',
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+
+    const { rows: [assistanceRequest] } = await db.query(
+      `INSERT INTO mission_assistance_requests (mission_id, oeil_id, category, reason, status, transfer_type, responded_at)
+       VALUES ($1,$2,'urgence',$3,'triggered',$4,NOW()) RETURNING *`,
+      [mission.id, req.user.id, trimmedReason, result.transferType]
+    );
+
+    return res.json({ ok: true, category: 'urgence', assistance_request_id: assistanceRequest.id, transfer_type: result.transferType, deadline: result.deadline });
+  }
+
+  // category === 'mission' — le client doit valider ou contester la déclaration de l'Œil.
+  const clientValidationHours = await getSetting(db, 'client_validation_hours', 12);
+  const expiresAt = new Date(Date.now() + clientValidationHours * 3600 * 1000);
+
+  try {
+    await transitionMission(db, mission.id, mission.status, 'sous_reclamation', req.user.id, {
+      note: `Assistance mission déclarée par l'Œil : ${trimmedReason}`,
+    });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+    throw e;
+  }
+
+  const { rows: [assistanceRequest] } = await db.query(
+    `INSERT INTO mission_assistance_requests (mission_id, oeil_id, category, reason, status, expires_at)
+     VALUES ($1,$2,'mission',$3,'pending',$4) RETURNING *`,
+    [mission.id, req.user.id, trimmedReason, expiresAt]
+  );
+
+  await notify(db, mission.client_id,
+    '🆘 Votre Œil signale un problème',
+    `Votre Œil a signalé : "${trimmedReason}" sur la mission "${mission.title}". Merci de confirmer si vous validez sa déclaration (vous avez ${clientValidationHours}h).`,
+    'mission', mission.id, emitToUser, 'mission_view', 'assistanceMissionRequestClientTitle', 'assistanceMissionRequestClientBody',
+    { missionTitle: mission.title, reason: trimmedReason, hours: clientValidationHours }
+  );
+
+  await db.query(
+    `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key,params) VALUES ($1,$2,$3,'system',$4,$5)`,
+    [mission.id, req.user.id, `L'Œil signale : ${trimmedReason}. En attente de votre confirmation.`, 'assistanceMissionRequestSystemMessage', JSON.stringify({ reason: trimmedReason })]
+  );
+
+  if (io) {
+    io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'sous_reclamation' });
+    io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'sous_reclamation' });
+  }
+
+  res.json({ ok: true, category: 'mission', assistance_request_id: assistanceRequest.id, expires_at: expiresAt });
+}));
+
+// ── POST /missions/:id/assistance/respond ── Le client valide ou conteste ──
+// action='validate' : clôture la mission et paie l'Œil intégralement — réutilise directement
+// walletService.credit + transitionMission (mêmes primitifs que PUT /admin/claims/:missionId/
+// resolve, décision='oeil'), sans dupliquer de logique financière ni passer par une route admin.
+// action='dispute' : transforme la déclaration en ticket litige classique (support_tickets,
+// catégorie 'mission') ET en entrée `claims` — cette 2e écriture n'est PAS une duplication de
+// mécanisme mais un branchement volontaire sur l'arbitrage financier déjà existant : elle rend
+// le litige visible et résolvable tel quel via l'écran admin "Réclamations" existant (GET
+// /admin/claims, PUT /admin/claims/:missionId/resolve) SANS AUCUNE modification de cette route —
+// voir rapport de session pour la justification complète (mission_id UNIQUE sur claims vérifié
+// non conflictuel : les deux issues de résolution ferment définitivement ou marquent
+// validated_at, donc /:id/claim ne peut plus jamais réinsérer sur ce mission_id ensuite).
+router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+  const { action, comment } = req.body;
+
+  if (!['validate', 'dispute'].includes(action)) return res.status(400).json({ error: 'Action invalide (attendu: validate ou dispute)' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+
+  const { rows: [assistanceRequest] } = await db.query(
+    `SELECT * FROM mission_assistance_requests WHERE mission_id=$1 AND category='mission' AND status='pending' ORDER BY created_at DESC LIMIT 1`,
+    [mission.id]
+  );
+  if (!assistanceRequest) return res.status(404).json({ error: "Aucune demande d'assistance en attente pour cette mission" });
+  if (mission.status !== 'sous_reclamation') return res.status(409).json({ error: 'Cette demande a déjà été traitée' });
+
+  if (action === 'validate') {
+    try {
+      await walletService.withTransaction(db, async (client) => {
+        await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée par le client (paiement intégral)', mission.id);
+        await transitionMission(client, mission.id, 'sous_reclamation', 'completed', req.user.id, {
+          extraFields: { validated_at: 'NOW()', is_priority: false },
+          note: 'Assistance mission validée par le client',
+        });
+        await client.query(
+          `UPDATE mission_assistance_requests SET status='validated', responded_at=NOW(), client_comment=$1 WHERE id=$2`,
+          [comment?.trim() || null, assistanceRequest.id]
+        );
+      });
+    } catch (e) {
+      if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+      throw e;
+    }
+
+    await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé votre déclaration d'assistance sur "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceValidatedOeilTitle', 'assistanceValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
+    await notify(db, mission.client_id, '✅ Confirmé', `Vous avez validé la déclaration de l'Œil pour "${mission.title}".`, 'info', mission.id, emitToUser, null, 'assistanceValidatedClientTitle', 'assistanceValidatedClientBody', { missionTitle: mission.title });
+
+    if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'completed' });
+
+    return res.json({ ok: true, action: 'validated' });
+  }
+
+  // action === 'dispute'
+  if (!comment || !comment.trim()) return res.status(400).json({ error: 'Un commentaire est requis pour contester' });
+  const trimmedComment = comment.trim();
+
+  const ticketId = uuidv4();
+  const reference = await generateUniqueReference(db);
+  const { rows: [ticket] } = await db.query(
+    `INSERT INTO support_tickets (id, reference, user_id, user_role, category, subcategory, mission_id, initial_message, is_urgent, last_user_message_at)
+     VALUES ($1,$2,$3,'client','mission',$4,$5,$6,false,NOW()) RETURNING *`,
+    [ticketId, reference, req.user.id, assistanceRequest.reason, mission.id,
+     `[Litige assistance mission] L'Œil a déclaré : "${assistanceRequest.reason}". Le client conteste : "${trimmedComment}"`]
+  );
+  await db.query(
+    `INSERT INTO ticket_messages (ticket_id, sender_id, sender_role, content) VALUES ($1,$2,'client',$3)`,
+    [ticket.id, req.user.id, trimmedComment]
+  );
+  await db.query(`UPDATE missions SET under_surveillance=true, updated_at=NOW() WHERE id=$1`, [mission.id]);
+
+  // Entrée claims — branche ce litige sur l'arbitrage admin existant (PUT /admin/claims/
+  // :missionId/resolve), déjà valable ici car cette route ne dépend que de
+  // mission.status='sous_reclamation', pas de l'origine de la réclamation.
+  await db.query(`INSERT INTO claims (mission_id, client_id, comment) VALUES ($1,$2,$3)`, [mission.id, req.user.id, trimmedComment]);
+
+  await db.query(
+    `UPDATE mission_assistance_requests SET status='disputed', responded_at=NOW(), client_comment=$1, support_ticket_id=$2 WHERE id=$3`,
+    [trimmedComment, ticket.id, assistanceRequest.id]
+  );
+
+  const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`);
+  for (const admin of admins) {
+    await notify(db, admin.id, '🚨 Nouvelle réclamation', `Litige assistance sur la mission "${mission.title}" — contestée par le client.`, 'claim', mission.id, emitToUser, null, 'newClaimAdminTitle', 'newClaimAdminBody', { missionTitle: mission.title });
+  }
+  await notify(db, mission.oeil_id, 'Déclaration contestée', `Le client a contesté votre déclaration sur "${mission.title}". Un litige a été ouvert, un admin va trancher.`, 'info', mission.id, emitToUser, null, 'assistanceDisputedOeilTitle', 'assistanceDisputedOeilBody', { missionTitle: mission.title });
+
+  if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, under_surveillance: true });
+
+  res.json({ ok: true, action: 'disputed', ticket_reference: ticket.reference });
 }));
 
 // ── POST /missions/:id/confirm-presence ── L'Œil confirme sa présence ──
@@ -2878,8 +3093,61 @@ async function checkMissionEditRequestExpiry(db, emitToUser) {
   }
 }
 
+// ── Cron : expirer les demandes d'assistance MISSION sans réponse du client ──
+// (appelé depuis index.js via cron). Même principe que autoValidateMissions.js
+// (client_validation_hours réutilisé tel quel, même philosophie "silence du client = acceptation")
+// plutôt qu'un nouveau réglage dédié — voir rapport de session pour la justification.
+async function checkAssistanceRequestExpiry(db, emitToUser) {
+  const { rows: expired } = await db.query(`
+    SELECT * FROM mission_assistance_requests WHERE category='mission' AND status='pending' AND expires_at <= NOW()
+  `);
+
+  for (const ar of expired) {
+    const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [ar.mission_id]);
+
+    // La mission a pu quitter sous_reclamation par une autre voie (ex: admin résolvant
+    // directement via PUT /admin/claims/:missionId/resolve, valable dès que
+    // status='sous_reclamation' peu importe l'origine — voir rapport). On aligne alors le statut
+    // de la demande sur l'issue réelle plutôt que de la laisser 'pending' indéfiniment.
+    if (!mission || mission.status !== 'sous_reclamation') {
+      const resolvedStatus = mission?.status === 'completed' ? 'validated' : 'disputed';
+      await db.query(
+        `UPDATE mission_assistance_requests SET status=$1, responded_at=NOW() WHERE id=$2 AND status='pending'`,
+        [resolvedStatus, ar.id]
+      );
+      continue;
+    }
+
+    try {
+      await walletService.withTransaction(db, async (client) => {
+        const { rowCount } = await client.query(
+          `UPDATE mission_assistance_requests SET status='auto_validated', responded_at=NOW() WHERE id=$1 AND status='pending'`,
+          [ar.id]
+        );
+        if (rowCount === 0) return; // déjà traitée entre-temps (réponse client juste avant ce tick)
+
+        await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée automatiquement (délai client dépassé)', mission.id);
+        await transitionMission(client, mission.id, 'sous_reclamation', 'completed', null, {
+          extraFields: { validated_at: 'NOW()', is_priority: false },
+          note: 'Assistance mission auto-validée après délai sans réponse du client',
+        });
+      });
+    } catch (e) {
+      if (e instanceof MissionTransitionError) {
+        console.log(`ℹ️ checkAssistanceRequestExpiry: mission ${ar.mission_id} ignorée, statut déjà changé entre-temps`);
+        continue;
+      }
+      throw e;
+    }
+
+    await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedOeilTitle', 'assistanceAutoValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
+    await notify(db, mission.client_id, 'Mission clôturée automatiquement', `Vous n'avez pas répondu à temps concernant "${mission.title}" — la déclaration de l'Œil a été considérée comme acceptée.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedClientTitle', 'assistanceAutoValidatedClientBody', { missionTitle: mission.title });
+  }
+}
+
 router.checkTransferDeadlines = checkTransferDeadlines;
 router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
+router.checkAssistanceRequestExpiry = checkAssistanceRequestExpiry;
 router.checkPresenceConfirmationDeadlines = checkPresenceConfirmationDeadlines;
 router.hireOeilCore = hireOeilCore;
 router.advanceCandidateCascade = advanceCandidateCascade;

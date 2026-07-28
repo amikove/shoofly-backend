@@ -715,6 +715,38 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- routes/missions.js) ou, à défaut, après candidature_whatsapp_seuil_minutes depuis la
     -- première candidature (cron dédié, index.js). NULL = pas encore envoyé pour cette mission.
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS candidature_whatsapp_sent_at TIMESTAMPTZ;
+
+    -- Flux "Demander assistance" (2026-07-28) — point d'entrée unique pour un Œil assigné qui
+    -- ne peut pas honorer sa mission comme prévu, remplaçant l'accès direct à /refuse et
+    -- /status{cancelled}. Une ligne par déclaration : category='urgence' (accident, agression,
+    -- hospitalisation, situation dangereuse) déclenche IMMÉDIATEMENT advanceCandidateCascade
+    -- (via releaseMissionForReplacement, réutilisé de /:id/transfer) — status='triggered' posé
+    -- directement, aucune validation requise. category='mission' (client absent/injoignable,
+    -- mauvaise adresse, mission différente de la description) exige une validation du client :
+    -- status='pending' jusqu'à réponse (ou expiration, voir expires_at) ; POST /:id/assistance/
+    -- respond bascule vers 'validated' (mission clôturée, Œil payé intégralement) ou 'disputed'
+    -- (ticket litige + entrée claims créés, mission gelée en sous_reclamation jusqu'à arbitrage
+    -- admin via la route existante PUT /admin/claims/:missionId/resolve, réutilisée telle
+    -- quelle) ; 'auto_validated' si le délai expire sans réponse (voir
+    -- checkAssistanceRequestExpiry, routes/missions.js — même principe que
+    -- autoValidateMissions.js : silence du client = acceptation).
+    CREATE TABLE IF NOT EXISTS mission_assistance_requests (
+      id                SERIAL PRIMARY KEY,
+      mission_id        TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      oeil_id           TEXT NOT NULL REFERENCES users(id),
+      category          TEXT NOT NULL CHECK(category IN ('urgence','mission')),
+      reason            TEXT NOT NULL,
+      status            TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','validated','disputed','auto_validated','triggered')),
+      transfer_type     TEXT, -- 'before'/'during' — traçabilité du mécanisme utilisé (catégorie urgence uniquement)
+      support_ticket_id TEXT REFERENCES support_tickets(id),
+      client_comment    TEXT,
+      expires_at        TIMESTAMPTZ,
+      responded_at      TIMESTAMPTZ,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_assistance_requests_mission ON mission_assistance_requests(mission_id);
+    CREATE INDEX IF NOT EXISTS idx_assistance_requests_status_expires ON mission_assistance_requests(status, expires_at);
   `);
   console.log('✅ PostgreSQL schema ready');
 }
