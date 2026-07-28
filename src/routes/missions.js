@@ -2038,6 +2038,20 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
   // mission hériterait à tort d'un solicited_at/confirmed_at périmé.
   await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
 
+  // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
+  // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
+  if (mission.transfer_type === 'during') {
+    const { rows: [{ n: nextOrder }] } = await db.query(
+      `SELECT COALESCE(MAX(sequence_order), 0) + 1 AS n FROM mission_transfer_chain WHERE mission_id=$1`,
+      [mission.id]
+    );
+    await db.query(
+      `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
+       VALUES ($1, $2, NOW(), $3)`,
+      [mission.id, oeil_id, nextOrder]
+    );
+  }
+
   await notify(db, oeil_id,
     '📋 Mission assignée par admin',
     `L'admin vous a assigné la mission "${mission.title}". Vérifiez les détails.`,

@@ -52,10 +52,15 @@ async function lockBalance(client, userId, userType) {
   return row ? parseFloat(row.balance) : null;
 }
 
-async function credit(client, userId, userType, amount, reason, missionId = null) {
+// opts.countsAsEarning (défaut true) : à mettre à false quand le crédit restitue un solde déjà
+// comptabilisé (ex: rejet d'un retrait) plutôt qu'un nouveau gain — sinon total_earnings serait
+// gonflé en double (le montant a déjà été compté lors du gain initial ; debit() ne décrémente
+// jamais total_earnings, donc le recréditer via credit() sans ce garde-fou compterait deux fois).
+async function credit(client, userId, userType, amount, reason, missionId = null, opts = {}) {
   if (!(amount > 0)) throw new Error(`walletService.credit: montant invalide (${amount})`);
+  const { countsAsEarning = true } = opts;
   const { table, column } = resolveTarget(userType);
-  const extraSet = userType === 'oeil' ? ', total_earnings=total_earnings+$1' : '';
+  const extraSet = (userType === 'oeil' && countsAsEarning) ? ', total_earnings=total_earnings+$1' : '';
   const { rowCount } = await client.query(
     `UPDATE ${table} SET balance=balance+$1${extraSet} WHERE ${column}=$2`,
     [amount, userId]
