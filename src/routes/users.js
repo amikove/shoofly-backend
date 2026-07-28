@@ -1618,7 +1618,7 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), require
   if (!w) return res.status(404).json({ error: 'Introuvable' });
   await db.query(`UPDATE withdrawals SET status=$1,processed_by=$2,processed_at=NOW() WHERE id=$3`, [status, req.user.id, req.params.id]);
   if (status === 'rejected') {
-    await db.query('UPDATE oeil_profiles SET balance=balance+$1 WHERE user_id=$2', [w.amount, w.oeil_id]);
+    await walletService.credit(db, w.oeil_id, 'oeil', w.amount, 'Retrait refusé — solde recrédité', null, { countsAsEarning: false });
     const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Virement refusé','Votre demande a été refusée. Solde recrédité.','info','gains_page',$2,$3,$4) RETURNING *`, [w.oeil_id, 'withdrawalRejectedTitle', 'withdrawalRejectedBody', null]);
     if (emitToUser) emitToUser(w.oeil_id, 'notification', n.rows[0]);
   }
