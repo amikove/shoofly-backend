@@ -1168,68 +1168,26 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
 
 
 // ── POST /missions/:id/refuse ──────────────────────────────
+// Fermé pour l'Œil côté "mission assignée" (2026-07-28, correctif URGENCE/refuse) — défense en
+// profondeur derrière le retrait du bouton "Refuser" côté frontend (session séparée) : le
+// masquage à l'affichage seul n'est jamais suffisant sur ce projet. Seul appelant légitime
+// identifié pour ce chemin était ce bouton précis (grep exhaustif routes+frontend, voir rapport) ;
+// remplacé par POST /:id/assistance (urgence/mission), seul chemin restant pour un abandon avec
+// recherche de remplaçant. La branche ignore=true (décliner une mission encore pending/
+// disponible — boutons "Ignorer" de Missions.jsx/Dashboard.jsx) est un usage totalement distinct
+// de la même URL et reste intentionnellement ouverte, inchangée ci-dessous.
 router.post('/:id/refuse', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const io = req.app.get('io');
-  const emitToUser = req.app.get('emitToUser');
   const { ignore } = req.body;
-    if (ignore) {
-      // Mission disponible — juste ignorer
-      await db.query(
-        `INSERT INTO mission_ignored (oeil_id, mission_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-        [req.user.id, req.params.id]
-      );
-      return res.json({ ok: true });
-    }
-    // Mission assignée — refuser. Traitée comme les 3 autres causes de réattribution
-    // (transfert 'before'/'during', désactivation admin) : is_priority + transfer_deadline
-    // (délai de grâce existant, checkTransferDeadlines reste actif en parallèle, inchangé)
-    // + déclenchement de la cascade de confirmation séquentielle. transfer_type='before'
-    // (jamais 'during' ici : la mission n'a par définition pas encore démarré) → paiement
-    // intégral au remplaçant, pas de split.
-      const { rows: [missionBefore] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
-      if (!missionBefore) return res.status(404).json({ error: 'Mission introuvable' });
-
-      const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
-      const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
-      const graceMinutes = missionBefore.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
-      const transferDeadline = new Date(Date.now() + graceMinutes * 60 * 1000);
-
-      let mission;
-      try {
-        mission = await transitionMission(db, req.params.id, 'assigned', 'pending', req.user.id, {
-          extraFields: {
-            oeil_id: null,
-            is_priority: true,
-            transfer_type: 'before',
-            transferred_from: req.user.id,
-            transfer_reason: 'Refusée par l\'Œil',
-            transfer_deadline: transferDeadline,
-          },
-          extraGuards: { oeil_id: req.user.id },
-          note: 'Refusée par l\'Œil',
-        });
-      } catch (e) {
-        if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
-        throw e;
-      }
-
-      // Pénalité de fiabilité proportionnelle au délai avant la mission
-      const { points: penaltyPoints, reason: penaltyReason, isGrave } = computeLatePenalty(mission.scheduled_at, 'assignée refusée par l\'Œil');
-        await logReliabilityEvent(db, req.user.id, mission.id, penaltyPoints, penaltyReason, isGrave);
-        // Cooldown : empêche l'Œil d'accepter immédiatement une autre mission après avoir abandonné celle-ci
-        const transferCooldownHours = await getSetting(db, 'transfer_cooldown_hours', 4);
-        await db.query(
-          `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $1::numeric WHERE id=$2`,
-          [transferCooldownHours, req.user.id]
-        );
-
-        // Retire la propre candidature de l'Œil refusant sur cette mission (même correctif
-        // que POST /:id/transfer, cf. bug fantôme audit 2.9) avant de lancer la cascade.
-        await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, req.user.id]);
-        await advanceCandidateCascade(db, io, emitToUser, mission, {});
-
-        res.json({ mission });
+  if (ignore) {
+    // Mission disponible — juste ignorer
+    await db.query(
+      `INSERT INTO mission_ignored (oeil_id, mission_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [req.user.id, req.params.id]
+    );
+    return res.json({ ok: true });
+  }
+  return res.status(403).json({ error: "Le refus direct d'une mission assignée n'est plus disponible. Utilisez \"Demander assistance\" pour signaler un empêchement ou une urgence." });
 }));
 
 
@@ -1782,11 +1740,15 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
 // ── Réutilisable : libère une mission vers le pool de remplacement ────────
 // Extrait de POST /:id/transfer (comportement strictement inchangé pour cet appelant) pour
 // être également réutilisé par le flux "Demander assistance" catégorie URGENCE (POST
-// /:id/assistance) — les deux cas sont fonctionnellement identiques (l'Œil ne peut plus honorer
-// la mission, un remplaçant doit être cherché immédiatement) et doivent donc appliquer
-// exactement la même mécanique (transitionMission + pénalité/cooldown + advanceCandidateCascade),
-// jamais une variante parallèle qui pourrait diverger silencieusement. oeilId est passé
-// explicitement (plutôt que lu sur req.user) pour rester appelable hors contexte HTTP direct.
+// /:id/assistance) — les deux cas déclenchent la même mécanique de fond (transitionMission +
+// cooldown + advanceCandidateCascade), jamais une variante parallèle qui pourrait diverger
+// silencieusement. Seule la pénalité de fiabilité (5pts, transfer_type='before') est rendue
+// skippable via options.skipReliabilityPenalty — décision 2026-07-28 (correctif URGENCE) : un
+// Œil qui déclare une urgence réelle ne doit pas voir son score baisser, contrairement à un
+// transfert volontaire hors urgence (/transfer, qui ne passe jamais ce flag). Le cooldown n'est
+// PAS concerné par ce flag et garde son comportement exact d'origine (posé uniquement si
+// transferType==='during', jamais pour 'before' — voir le bloc plus bas, inchangé). oeilId est
+// passé explicitement (plutôt que lu sur req.user) pour rester appelable hors contexte HTTP direct.
 async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId, reason, options = {}) {
   const {
     historyNoteVerb = "Empêchement signalé par l'Œil",
@@ -1796,6 +1758,7 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
     clientAlertBodyKey = 'missionChangeAlertBody',
     systemMessageText = "L'Œil a signalé un empêchement. Mission remise en priorité.",
     systemMessageKey = 'missionImpediment',
+    skipReliabilityPenalty = false,
   } = options;
 
   if (!['assigned', 'en_route', 'active'].includes(mission.status)) {
@@ -1864,8 +1827,10 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
     );
   }
 
-  // Pénalité fiabilité — sera recalculée précisément si pas de remplaçant (cron)
-  if (transferType === 'before') {
+  // Pénalité fiabilité — sera recalculée précisément si pas de remplaçant (cron). Skippable
+  // via options.skipReliabilityPenalty (URGENCE uniquement, voir commentaire de la fonction) —
+  // /transfer ne passe jamais ce flag, donc son comportement reste strictement inchangé ici.
+  if (transferType === 'before' && !skipReliabilityPenalty) {
     await logReliabilityEvent(db, oeilId, mission.id, 5, 'Transfert avant démarrage avec remplaçant', false);
   }
 
@@ -1914,12 +1879,17 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
 
 // ── POST /missions/:id/assistance ── "Demander assistance" — point d'entrée unique ──
 // Remplace, pour l'Œil assigné à une mission en cours, le recours direct à /refuse ou
-// /status{cancelled} (voir garde-fous du rapport de session : ces deux routes restent
-// aujourd'hui accessibles indépendamment — signalé comme point ouvert, non fermé ici).
+// /status{cancelled}. Mise à jour 2026-07-28 (correctif URGENCE) : /:id/refuse est désormais
+// fermé pour l'Œil (403, voir plus bas) — ce flux est le seul chemin restant pour un abandon
+// avec recherche de remplaçant ; /status{cancelled} (annulation sans remplacement) reste ouvert
+// en parallèle, non modifié par ce correctif.
 // category='urgence' (accident, agression/vol/menace, hospitalisation, situation dangereuse) :
 // aucune validation requise, recherche immédiate d'un remplaçant via le mécanisme de
-// /:id/transfer (releaseMissionForReplacement, réutilisé — même pénalité/cooldown, non
-// contourné : voir rapport, point tranché explicitement).
+// /:id/transfer (releaseMissionForReplacement, réutilisé — même transitionMission/cooldown/
+// cascade que /transfer, mais pénalité de fiabilité SUPPRIMÉE via skipReliabilityPenalty : un
+// Œil qui déclare une urgence réelle ne doit pas voir son score baisser — décision explicite,
+// révisant le choix initial "non contourné" du rapport de la session précédente. Cooldown
+// inchangé dans les deux sens : ni ajouté, ni retiré, par rapport à /transfer).
 // category='mission' (client absent/injoignable, mauvaise adresse, mission différente de la
 // description) : gèle la mission en sous_reclamation en attendant la réponse du client — voir
 // POST /:id/assistance/respond.
@@ -1952,6 +1922,7 @@ router.post('/:id/assistance', authenticate, requireRole('oeil'), asyncHandler(a
       clientAlertBodyKey: 'assistanceUrgenceClientBody',
       systemMessageText: "L'Œil a signalé une urgence. Recherche d'un remplaçant en cours.",
       systemMessageKey: 'assistanceUrgenceSystemMessage',
+      skipReliabilityPenalty: true,
     });
     if (!result.ok) return res.status(result.status).json({ error: result.error });
 
