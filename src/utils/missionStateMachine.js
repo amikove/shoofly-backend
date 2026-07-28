@@ -17,11 +17,22 @@ const TRANSITIONS = {
   // pending -> cancelled : expiration sans remplaçant, annulation depuis la file d'attente
   pending:          ['assigned', 'cancelled'],
   // assigned -> pending : refus, transfert avant démarrage, edit-request refusée/expirée
-  assigned:         ['pending', 'en_route', 'cancelled'],
+  // assigned -> sous_reclamation : "Demander assistance" catégorie MISSION (POST
+  // /:id/assistance) déclarée avant même le démarrage de la mission — voir note sur
+  // en_route/active ci-dessous, même mécanique.
+  assigned:         ['pending', 'en_route', 'cancelled', 'sous_reclamation'],
   // en_route/active -> pending : transfert signalé en cours de route ou en cours de mission
   // (POST /:id/transfer autorise le transfert depuis ces 2 statuts, pas seulement 'assigned')
-  en_route:         ['pending', 'active', 'cancelled'],
-  active:           ['pending', 'completed', 'cancelled'],
+  // en_route/active -> sous_reclamation : "Demander assistance" catégorie MISSION (client absent/
+  // injoignable, mauvaise adresse, mission différente de la description) — réutilise l'arête
+  // sous_reclamation existante (jusqu'ici accessible uniquement depuis 'completed' via une
+  // réclamation client normale) plutôt que d'introduire un statut 'litige' dédié : la mission
+  // reste "gelée" en attente d'une décision (validation client ou arbitrage admin), exactement
+  // le rôle que sous_reclamation joue déjà. oeil_id N'EST PAS remis à NULL par cette transition
+  // (contrairement à pending) : contrairement à un transfert, aucun remplaçant n'est cherché, la
+  // mission reste rattachée à l'Œil pour le paiement éventuel. Voir POST /:id/assistance.
+  en_route:         ['pending', 'active', 'cancelled', 'sous_reclamation'],
+  active:           ['pending', 'completed', 'cancelled', 'sous_reclamation'],
   completed:        ['sous_reclamation'],
   sous_reclamation: ['completed', 'cancelled'],
   cancelled:        [],
