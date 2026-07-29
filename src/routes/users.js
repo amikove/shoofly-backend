@@ -1464,6 +1464,7 @@ const {
   candidate_batch_size, candidate_tiebreak_window_minutes,
   urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
   candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
+  whatsapp_retry_max_attempts,
 } = req.body
   const updates = {
     commission, min_price, five_star_bonus_active, five_star_bonus_percent,
@@ -1484,6 +1485,7 @@ const {
     candidate_batch_size, candidate_tiebreak_window_minutes,
     urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
     candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
+    whatsapp_retry_max_attempts,
   }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
@@ -1631,6 +1633,27 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), require
   res.json({ message: `Virement ${status}` });
 }));
 
+// ── GET /users/admin/whatsapp-failures — échecs d'envoi WhatsApp (visibilité + retry, voir
+// services/wasel.js et jobs/whatsappRetry.js) — pagination + filtre statut, mêmes conventions
+// que GET /tickets/admin/all ──
+router.get('/admin/whatsapp-failures', authenticate, requireRole('admin'), requirePermission('audit'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { status = 'unresolved', page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
+
+  let wc = '';
+  if (status === 'unresolved') wc = 'WHERE resolved_at IS NULL';
+  else if (status === 'resolved') wc = 'WHERE resolved_at IS NOT NULL';
+  else if (status !== 'all') return res.status(400).json({ error: 'Statut invalide (unresolved, resolved, all)' });
+
+  const { rows } = await db.query(
+    `SELECT * FROM whatsapp_send_failures ${wc} ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  const { rows: [{ n: total }] } = await db.query(`SELECT COUNT(*)::int AS n FROM whatsapp_send_failures ${wc}`);
+
+  res.json({ failures: rows, total, page: +page, pages: Math.ceil(total / limit) });
+}));
 
 // ── POST /users/oeil/identity — upload documents identité ──
 router.post('/oeil/identity', authenticate, requireRole('oeil'), uploadIdentity.fields([

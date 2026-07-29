@@ -13,7 +13,7 @@ function crashAndLog(kind, err) {
 process.on('uncaughtException', (err) => crashAndLog('uncaughtException', err));
 process.on('unhandledRejection', (reason) => crashAndLog('unhandledRejection', reason));
 
-// Diagnostic fuseau horaire — les 14 cron.schedule ci-dessous fixent explicitement
+// Diagnostic fuseau horaire — les 16 cron.schedule ci-dessous fixent explicitement
 // { timezone: 'Africa/Casablanca' } donc ne dépendent pas de ce réglage, mais ce log
 // confirme dans les logs Render quel fuseau le processus utilise par défaut (utile pour
 // tout code qui, lui, s'appuie encore sur l'horloge locale du process — voir RAPPORT_TIMEZONE_CRONS.md).
@@ -32,6 +32,7 @@ const { initDb, getDb, checkDbConnection } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
 const { runAutoValidateMissions } = require('./jobs/autoValidateMissions');
+const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
 const { sendWhatsAppTemplate } = require('./services/wasel');
 const waselTemplates = require('./config/waselTemplates');
 
@@ -324,6 +325,7 @@ initDb().then(() => {
   let cronPresenceConfirmationRunning = false;
   let cronUrgentWhatsAppWaveRunning = false;
   let cronCandidatureWhatsAppRunning = false;
+  let cronWhatsappRetryRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
   // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
@@ -1087,6 +1089,18 @@ initDb().then(() => {
       }
     } catch (e) { console.error('❌ Cron auto-résolution tickets error:', e.message); }
     finally { cronTicketAutoResolveRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron toutes les 15 min — Retry des échecs d'envoi WhatsApp non résolus ──
+  // Visibilité admin : GET /users/admin/whatsapp-failures. Voir jobs/whatsappRetry.js pour la
+  // limite de tentatives (whatsapp_retry_max_attempts, settings) et la logique de retry.
+  cron.schedule('*/15 * * * *', async () => {
+    if (cronWhatsappRetryRunning) { console.warn('⏭️ Cron retry WhatsApp déjà en cours, tick ignoré'); return; }
+    cronWhatsappRetryRunning = true;
+    try {
+      await runWhatsAppRetry(getDb());
+    } catch (e) { console.error('❌ Cron retry WhatsApp error:', e.message); }
+    finally { cronWhatsappRetryRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // Keep-alive pour Render plan gratuit
