@@ -780,8 +780,9 @@ initDb().then(() => {
     cronMissionEditExpiryRunning = true;
     try {
       const db = getDb();
+      const io = app.get('io');
       const emitToUser = app.get('emitToUser');
-      await checkMissionEditRequestExpiry(db, emitToUser);
+      await checkMissionEditRequestExpiry(db, io, emitToUser);
     } catch (e) { console.error('❌ Mission edit request expiry cron error:', e.message); }
     finally { cronMissionEditExpiryRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
