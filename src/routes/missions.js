@@ -1681,13 +1681,19 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
     return res.status(400).json({ error: 'Vous avez déjà une mission dans le même créneau.' })
   }
 
-  await db.query(
+  const { rowCount: interestInsertCount } = await db.query(
     `INSERT INTO mission_interests (mission_id, oeil_id, message)
      VALUES ($1, $2, $3) ON CONFLICT (mission_id, oeil_id) DO NOTHING`,
     [req.params.id, req.user.id, message || null]
   );
 
-  const emitToUser = req.app.get('emitToUser');
+  // Un retry (double-clic, ou nouvel essai après une erreur réseau qui masquait en fait un
+  // succès) ne crée pas de 2e ligne (ON CONFLICT DO NOTHING ci-dessus) et ne doit donc
+  // déclencher aucun effet de bord une 2e fois : ni notif client, ni recomptage du seuil
+  // WhatsApp, ni relance de cascade — tout ce bloc ne réagit qu'à une candidature réellement
+  // nouvelle.
+  if (interestInsertCount > 0) {
+    const emitToUser = req.app.get('emitToUser');
     const notifBody = `Un Œil est intéressé par votre mission : ${mission.title}`
     await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser, 'interests_modal', 'newOeilInterestTitle', 'newOeilInterestBody', {missionTitle: mission.title});
 
@@ -1729,8 +1735,9 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
       const io = req.app.get('io');
       await advanceCandidateCascade(db, io, emitToUser, mission, {});
     }
+  }
 
-    res.status(201).json({ ok: true });
+  res.status(201).json({ ok: true });
 }));
 
 
