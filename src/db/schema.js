@@ -279,7 +279,8 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('candidate_tiebreak_window_minutes', '5'),
         ('payment_attempt_abandoned_minutes', '30'),
         ('urgent_mission_whatsapp_batch_size', '10'),
-        ('urgent_mission_whatsapp_batch_delay_minutes', '30')
+        ('urgent_mission_whatsapp_batch_delay_minutes', '30'),
+        ('whatsapp_retry_max_attempts', '3')
       ON CONFLICT (key) DO NOTHING;
 
     -- Migration ponctuelle (chantier confirmation H-2/H-45) : le INSERT ci-dessus ne change
@@ -748,6 +749,27 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
     CREATE INDEX IF NOT EXISTS idx_assistance_requests_mission ON mission_assistance_requests(mission_id);
     CREATE INDEX IF NOT EXISTS idx_assistance_requests_status_expires ON mission_assistance_requests(status, expires_at);
+
+    -- Visibilité admin + retry automatique sur les échecs d'envoi WhatsApp (Wasel) — voir
+    -- sendWhatsAppTemplate (services/wasel.js) et le cron de retry (jobs/whatsappRetry.js).
+    -- Une ligne par tentative d'envoi ayant réellement échoué (HTTP en erreur ou exception
+    -- réseau) — jamais pour les gardes de configuration en amont (clé API absente, téléphone
+    -- manquant), qui ne sont pas de vraies tentatives d'envoi. retry_count compte les
+    -- RETENTATIVES du cron (pas la tentative initiale qui a créé la ligne) ; resolved_at est
+    -- posé dès qu'une retentative réussit — la ligne n'est jamais supprimée (trace conservée).
+    CREATE TABLE IF NOT EXISTS whatsapp_send_failures (
+      id            SERIAL PRIMARY KEY,
+      template_name TEXT NOT NULL,
+      phone         TEXT NOT NULL,
+      variables     JSONB NOT NULL DEFAULT '[]',
+      error_message TEXT NOT NULL,
+      retry_count   INTEGER NOT NULL DEFAULT 0,
+      resolved_at   TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    -- Index partiel : le cron de retry et la vue admin par défaut filtrent tous deux sur
+    -- resolved_at IS NULL — même principe que idx_missions_status_city (audit perf 2026-07-26).
+    CREATE INDEX IF NOT EXISTS idx_whatsapp_failures_unresolved ON whatsapp_send_failures(created_at) WHERE resolved_at IS NULL;
   `);
   console.log('✅ PostgreSQL schema ready');
 }
