@@ -853,16 +853,28 @@ router.post('/edit-requests/:id/reject', authenticate, requireRole('oeil'), asyn
   );
   if (rowCount === 0) return res.status(409).json({ error: 'Cette demande a changé de statut entre-temps, veuillez rafraîchir.' });
 
+  // Délai de grâce avant filet de sécurité (checkTransferDeadlines) — même réglages que
+  // /transfer, checkPresenceConfirmationDeadlines, etc. (RAPPORT_DIAGNOSTIC_REFUS_EDIT_REQUEST.md).
+  const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+  const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+  const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+  const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+
   let updatedMission;
   try {
     updatedMission = await transitionMission(db, mission.id, 'assigned', 'pending', req.user.id, {
-      extraFields: { oeil_id: null, is_priority: true, transfer_deadline: null },
+      extraFields: { oeil_id: null, is_priority: true, transfer_deadline: deadline },
       note: 'Demande de modification refusée par l\'Œil',
     });
   } catch (e) {
     if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
     throw e;
   }
+
+  // Supprime la propre candidature de l'Œil sur cette mission — sans ça, le cron de sélection
+  // automatique pourrait le réassigner à la mission qu'il vient de refuser (même correctif que
+  // POST /:id/transfer, ligne ~1813, et checkPresenceConfirmationDeadlines).
+  await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, req.user.id]);
 
   await notify(db, mission.client_id,
     'Mission remise en recherche',
@@ -878,6 +890,15 @@ router.post('/edit-requests/:id/reject', authenticate, requireRole('oeil'), asyn
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
   io.to('room:admin').emit('mission_updated', updatedMission);
+
+  // Relance la cascade de réattribution — alignement sur les 5 autres chemins qui remettent une
+  // mission en pending (POST /:id/refuse, POST /:id/transfer, désactivation admin, blocage
+  // anti-fraude, checkPresenceConfirmationDeadlines). transfer_type/transferred_from restent
+  // volontairement NULL (contrairement à ces 5 chemins) : les poser armerait la pénalité de
+  // fiabilité -10 de checkTransferDeadlines (branche transfer_type==='before') si aucun
+  // remplaçant n'est trouvé avant l'échéance — contraire à la règle explicite ci-dessus
+  // ("SANS pénalité ... ni une annulation ni un abandon").
+  await advanceCandidateCascade(db, io, emitToUser, updatedMission, {});
 
   res.json({ mission: updatedMission, edit_request: { ...editRequest, status: 'rejected' } });
 }));
@@ -3031,8 +3052,10 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandl
 // ── Cron : expirer les demandes de modification sans réponse de l'Œil ─────
 // (appelé depuis index.js via cron) — même logique que POST /edit-requests/:id/reject,
 // SANS pénalité, juste avec status='expired' plutôt que 'rejected' et un message
-// client différent ("l'Œil n'a pas répondu à temps" plutôt que "a refusé").
-async function checkMissionEditRequestExpiry(db, emitToUser) {
+// client différent ("l'Œil n'a pas répondu à temps" plutôt que "a refusé"). io ajouté en
+// paramètre (comme checkPresenceConfirmationDeadlines) pour pouvoir relayer advanceCandidateCascade
+// — RAPPORT_DIAGNOSTIC_REFUS_EDIT_REQUEST.md, même correctif que la route de refus manuel ci-dessus.
+async function checkMissionEditRequestExpiry(db, io, emitToUser) {
   const { rows: expired } = await db.query(`
     SELECT * FROM mission_edit_requests WHERE status='pending' AND expires_at <= NOW()
   `);
@@ -3047,10 +3070,17 @@ async function checkMissionEditRequestExpiry(db, emitToUser) {
     const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [editRequest.mission_id]);
     if (!mission) continue;
 
+    // Délai de grâce avant filet de sécurité (checkTransferDeadlines) — même réglages que
+    // POST /edit-requests/:id/reject ci-dessus.
+    const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+    const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+    const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+    const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+
     let updatedMission;
     try {
       updatedMission = await transitionMission(db, mission.id, 'assigned', 'pending', null, {
-        extraFields: { oeil_id: null, is_priority: true, transfer_deadline: null },
+        extraFields: { oeil_id: null, is_priority: true, transfer_deadline: deadline },
         note: 'Demande de modification expirée (délai dépassé sans réponse de l\'Œil)',
       });
     } catch (e) {
@@ -3060,6 +3090,11 @@ async function checkMissionEditRequestExpiry(db, emitToUser) {
       }
       throw e;
     }
+
+    // Même correctif que POST /edit-requests/:id/reject : retire la candidature de l'Œil sur
+    // sa propre mission avant de rouvrir la cascade (sinon le cron de sélection pourrait le
+    // réassigner à la mission qu'il vient de laisser expirer).
+    await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, mission.oeil_id]);
 
     await notify(db, mission.client_id,
       'Mission remise en recherche',
@@ -3072,6 +3107,11 @@ async function checkMissionEditRequestExpiry(db, emitToUser) {
     if (clientContact?.phone) {
       await sendWhatsAppTemplate(waselTemplates.edit_request_expired.template_name, clientContact.phone, [mission.title, 'Mission remise en recherche']);
     }
+
+    // Relance la cascade — transfer_type/transferred_from volontairement NULL, même
+    // justification que POST /edit-requests/:id/reject (éviter la pénalité -10 de
+    // checkTransferDeadlines pour une non-réponse qui n'est ni une annulation ni un abandon).
+    await advanceCandidateCascade(db, io, emitToUser, updatedMission, {});
   }
 }
 
