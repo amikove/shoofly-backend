@@ -254,7 +254,7 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('client_validation_hours', '12'),
         ('schedule_conflict_window_hours', '4'),
         ('transfer_cooldown_hours', '4'),
-        ('transfer_cooldown_before_hours', '2'),
+        ('transfer_cooldown_before_hours', '3'),
         ('abandon_during_mission_cooldown_hours', '48'),
         ('stale_mission_hours', '12'),
         ('stale_mission_min_lead_hours', '4'),
@@ -289,6 +289,15 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
     -- Gardée par "AND value='30'" : ne s'applique qu'une fois (idempotente) et ne touche jamais
     -- une valeur qu'un admin aurait déjà personnalisée volontairement.
     UPDATE settings SET value='45' WHERE key='reminder_before_mission_minutes_late' AND value='30';
+
+    -- Migration ponctuelle (correctif ancrage cooldown 'before', 2026-07-30) : ce réglage a changé
+    -- de sens, pas seulement de valeur (voir commentaire sur le cooldown 'before' dans
+    -- releaseMissionForReplacement, routes/missions.js) — il n'est plus une durée simple depuis
+    -- l'instant du clic mais une extension au-delà de l'ancre (scheduled_at - 1h, ou maintenant si
+    -- déjà dépassée). Même garde idempotente "AND value=ancien défaut" que la migration
+    -- reminder_before_mission_minutes_late ci-dessus : ne s'applique qu'une fois et ne touche
+    -- jamais une valeur qu'un admin aurait déjà personnalisée.
+    UPDATE settings SET value='3' WHERE key='transfer_cooldown_before_hours' AND value='2';
 
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS is_flagged BOOLEAN DEFAULT false;
 

@@ -1791,11 +1791,11 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
 // (skipReliabilityPenalty=false, "pénalité conservée") est donc devenue INATTEIGNABLE depuis
 // n'importe quelle route HTTP — code mort côté pénalité, laissé en l'état dans cette session
 // (fermeture de route demandée, pas nettoyage de cette fonction partagée ; voir rapport). Le
-// cooldown n'a PAS de flag équivalent : depuis le correctif 2026-07-28bis
-// (RAPPORT_DIAGNOSTIC_TRANSFER.md), il est posé pour les deux transferType (4h si 'during', 2h si
-// 'before' via transfer_cooldown_before_hours) et s'applique sans bypass possible, y compris
-// depuis le seul appelant restant. oeilId est passé explicitement (plutôt que lu sur req.user)
-// pour rester appelable hors contexte HTTP direct.
+// cooldown n'a PAS de flag équivalent : il est posé pour les deux transferType (4h si 'during'
+// via transfer_cooldown_hours, ancré sur scheduled_at si 'before' via transfer_cooldown_before_hours
+// — voir le commentaire détaillé au point où il est posé, plus bas) et s'applique sans bypass
+// possible, y compris depuis le seul appelant restant. oeilId est passé explicitement (plutôt que
+// lu sur req.user) pour rester appelable hors contexte HTTP direct.
 async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId, reason, options = {}) {
   const {
     historyNoteVerb = "Empêchement signalé par l'Œil",
@@ -1860,21 +1860,41 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
       [mission.id]
     );
   }
-  // Cooldown — posé pour les deux transferType désormais (correctif 2026-07-28bis, voir
-  // RAPPORT_DIAGNOSTIC_TRANSFER.md) : 'during' garde ses 4h historiques (transfer_cooldown_hours),
-  // 'before' obtient désormais 2h (transfer_cooldown_before_hours, plus léger — avant démarrage
-  // reste moins pénalisé que pendant la mission, même pattern que checkTransferDeadlines plus bas).
+  // Cooldown — posé pour les deux transferType. 'during' garde ses 4h historiques
+  // (transfer_cooldown_hours), ancrées sur l'instant du clic : la mission a déjà démarré, il n'y a
+  // pas d'heure future à protéger.
+  // 'before' est ANCRÉ SUR L'HEURE DE LA MISSION ABANDONNÉE, pas sur l'instant du clic (correctif
+  // 2026-07-30, RAPPORT_COOLDOWN_BEFORE_ANCRAGE.md — remplace l'ancrage NOW() du correctif
+  // 2026-07-28bis, RAPPORT_DIAGNOSTIC_TRANSFER.md). Ancrer sur NOW() laissait l'Œil annuler
+  // suffisamment à l'avance (même plusieurs jours avant) pour que le cooldown expire bien avant
+  // l'heure de la mission qu'il vient d'abandonner — aucune protection contre la substitution
+  // opportuniste (repérer une mission Y mieux payée au même créneau que sa mission X assignée,
+  // annuler X via URGENCE à l'avance, candidater sur Y une fois "now+2h" expiré). Formule :
+  // ancre = MAX(scheduled_at - 1h, maintenant) ; transfer_cooldown_until = ancre +
+  // transfer_cooldown_before_hours. Cas normal : fenêtre bloquée de 1h avant la mission jusqu'à
+  // (transfer_cooldown_before_hours - 1h) après son heure prévue, peu importe quand l'Œil a
+  // cliqué. Cas limite (mission déjà en retard au clic, scheduled_at-1h déjà dans le passé) :
+  // ancre = maintenant, comportement identique à l'ancien calcul faute d'heure future à protéger.
   // Décision produit : appliqué aux deux appelants SANS exception, URGENCE compris — contrairement
   // à la pénalité de fiabilité ci-dessous (skipReliabilityPenalty), ce cooldown n'a pas de flag de
   // bypass : une indisponibilité réelle rend l'Œil temporairement indisponible pour de nouvelles
   // missions, urgence authentique ou non.
-  const transferCooldownHours = transferType === 'during'
-    ? await getSetting(db, 'transfer_cooldown_hours', 4)
-    : await getSetting(db, 'transfer_cooldown_before_hours', 2);
-  await db.query(
-    `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $2::numeric, transfer_count=transfer_count+1 WHERE id=$1`,
-    [oeilId, transferCooldownHours]
-  );
+  if (transferType === 'during') {
+    const transferCooldownHours = await getSetting(db, 'transfer_cooldown_hours', 4);
+    await db.query(
+      `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $2::numeric, transfer_count=transfer_count+1 WHERE id=$1`,
+      [oeilId, transferCooldownHours]
+    );
+  } else {
+    const transferCooldownBeforeHours = await getSetting(db, 'transfer_cooldown_before_hours', 3);
+    await db.query(
+      `UPDATE users SET
+         transfer_cooldown_until = GREATEST($3::timestamptz - INTERVAL '1 hour', NOW()) + INTERVAL '1 hour' * $2::numeric,
+         transfer_count = transfer_count + 1
+       WHERE id=$1`,
+      [oeilId, transferCooldownBeforeHours, mission.scheduled_at]
+    );
+  }
 
   // Pénalité fiabilité — sera recalculée précisément si pas de remplaçant (cron). Skippable
   // via options.skipReliabilityPenalty (URGENCE uniquement, voir commentaire de la fonction) —
@@ -1937,8 +1957,9 @@ router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(asy
 // fermeture de /:id/transfer, ce flag est passé par le SEUL appelant restant de la fonction : la
 // branche "pénalité conservée" (skipReliabilityPenalty falsy) est de fait devenue inatteignable
 // depuis n'importe quelle route HTTP (constat, non traité ici — voir rapport de session prompt 18).
-// Cooldown TOUJOURS posé (aucun bypass) : depuis le correctif 2026-07-28bis, cela inclut le
-// cooldown 'before' (2h) — voir le commentaire de releaseMissionForReplacement.
+// Cooldown TOUJOURS posé (aucun bypass), y compris le cooldown 'before' (correctif 2026-07-30 :
+// ancré sur scheduled_at, pas sur l'instant du clic) — voir le commentaire de
+// releaseMissionForReplacement.
 // category='mission' (client absent/injoignable, mauvaise adresse, mission différente de la
 // description) : gèle la mission en sous_reclamation en attendant la réponse du client — voir
 // POST /:id/assistance/respond.
