@@ -1251,11 +1251,24 @@ router.post('/:id/status', authenticate, [
 
   // Seul l'Œil assigné fait progresser la mission dans le sens normal — le client
   // n'est jamais à l'origine de ces transitions, même s'il est partie prenante.
-  // L'annulation reste ouverte à l'Œil et au client, chacun sur ses propres missions.
   if (['en_route', 'active', 'completed'].includes(status)) {
     if (req.user.role !== 'oeil' || mission.oeil_id !== req.user.id) {
       return res.status(403).json({ error: 'Seul l\'Œil assigné peut faire progresser la mission.' });
     }
+  }
+
+  // Annulation directe fermée pour l'Œil sur une mission déjà assignée/en_route/active — même
+  // principe que la fermeture de /:id/refuse (e44af9f, 2026-07-28) : "Demander assistance"
+  // doit rester le seul chemin normal pour un Œil qui ne peut/veut pas honorer une mission
+  // déjà assignée (cherche un remplaçant), plutôt qu'une annulation sèche (remboursement
+  // client 100%, aucune tentative de remplacement). Chemin confirmé par écrit le 2026-07-11
+  // (1543ff2/f7db0cf) puis rouvert comme question par l'audit E2E du 07-28 (famille D,
+  // #24bis) sans être tranché depuis — tranché ici. pending->cancelled non concerné : oeil_id
+  // est toujours NULL tant que status='pending' (voir prepareMissionInsert), donc la garde
+  // ligne 1231 bloque déjà systématiquement un Œil à ce stade, avant même ce filtre. Reste
+  // ouvert pour le client sur ses propres missions à ces mêmes statuts (inchangé).
+  if (status === 'cancelled' && req.user.role === 'oeil' && ['assigned', 'en_route', 'active'].includes(mission.status)) {
+    return res.status(403).json({ error: 'L\'annulation directe d\'une mission assignée n\'est plus disponible pour l\'Œil. Utilisez "Demander assistance" pour signaler un empêchement ou une urgence.' });
   }
 
   // Bloquer si rapport non soumis pour audit ou airbnb
@@ -3172,6 +3185,7 @@ router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
 router.checkAssistanceRequestExpiry = checkAssistanceRequestExpiry;
 router.checkPresenceConfirmationDeadlines = checkPresenceConfirmationDeadlines;
 router.hireOeilCore = hireOeilCore;
+router.applyMissionEditChanges = applyMissionEditChanges;
 router.advanceCandidateCascade = advanceCandidateCascade;
 router.notify = notify;
 router.pricing = pricing;

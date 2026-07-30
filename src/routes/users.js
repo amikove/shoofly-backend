@@ -1384,6 +1384,27 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
       const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
       const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
       for (const mission of strandedMissions) {
+        // Une demande de modification pendante sur cette mission n'a plus de destinataire une
+        // fois l'Œil suspendu réattribué (mission_edit_requests ne stocke aucun oeil_id) —
+        // sans ça, elle resterait orpheline et pourrait réapparaître chez le nouvel Œil, qui
+        // n'a jamais négocié ces changements (angle mort diagnostiqué le 2026-07-30, voir
+        // RAPPORT_DIAGNOSTIC_2_POINTS_OUVERTS_E2E.md, Point 2 §4). On l'applique et on la
+        // clôture ici comme une approbation (mêmes effets que POST /edit-requests/:id/approve
+        // sur la mission, réutilise applyMissionEditChanges), AVANT la cascade de réattribution
+        // ci-dessous, pour que le nouvel Œil hérite d'une mission déjà à jour, sans demande en
+        // attente qui ne le concernerait pas. UPDATE...RETURNING atomique (au lieu d'un SELECT
+        // puis UPDATE) : ne fait rien si la demande a été résolue entre-temps par un autre
+        // chemin (ex. expiration), et n'ajoute aucune requête supplémentaire quand aucune
+        // demande n'est pendante.
+        const { rows: [appliedEditRequest] } = await db.query(
+          `UPDATE mission_edit_requests SET status='approved', resolved_at=NOW()
+           WHERE mission_id=$1 AND status='pending' RETURNING *`,
+          [mission.id]
+        );
+        if (appliedEditRequest) {
+          await missionRoutes.applyMissionEditChanges(db, mission.id, appliedEditRequest.proposed_changes);
+        }
+
         const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
         const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
         let updated;
