@@ -1777,20 +1777,25 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(asy
 
 
 
-// ── POST /missions/:id/transfer ── Œil signale empêchement ──
 // ── Réutilisable : libère une mission vers le pool de remplacement ────────
-// Extrait de POST /:id/transfer (comportement strictement inchangé pour cet appelant) pour
-// être également réutilisé par le flux "Demander assistance" catégorie URGENCE (POST
-// /:id/assistance) — les deux cas déclenchent la même mécanique de fond (transitionMission +
-// cooldown + advanceCandidateCascade), jamais une variante parallèle qui pourrait diverger
-// silencieusement. Seule la pénalité de fiabilité (5pts, transfer_type='before') est rendue
-// skippable via options.skipReliabilityPenalty — décision 2026-07-28 (correctif URGENCE) : un
-// Œil qui déclare une urgence réelle ne doit pas voir son score baisser, contrairement à un
-// transfert volontaire hors urgence (/transfer, qui ne passe jamais ce flag). Le cooldown n'a PAS
-// de flag équivalent : depuis le correctif 2026-07-28bis (RAPPORT_DIAGNOSTIC_TRANSFER.md), il est
-// posé pour les deux transferType (4h si 'during', 2h si 'before' via transfer_cooldown_before_hours)
-// et s'applique identiquement aux deux appelants, URGENCE comprise, sans bypass possible. oeilId est
-// passé explicitement (plutôt que lu sur req.user) pour rester appelable hors contexte HTTP direct.
+// À l'origine extraite de POST /:id/transfer pour être également réutilisée par le flux
+// "Demander assistance" catégorie URGENCE (POST /:id/assistance) — les deux cas déclenchaient la
+// même mécanique de fond (transitionMission + cooldown + advanceCandidateCascade), jamais une
+// variante parallèle qui pourrait diverger silencieusement. Seule la pénalité de fiabilité (5pts,
+// transfer_type='before') était rendue skippable via options.skipReliabilityPenalty — décision
+// 2026-07-28 (correctif URGENCE) : un Œil qui déclare une urgence réelle ne doit pas voir son
+// score baisser, contrairement à un transfert volontaire hors urgence (/transfer, qui ne passait
+// jamais ce flag). Mise à jour 2026-07-30 (prompt 18) : /:id/transfer est désormais fermé pour
+// l'Œil (403) — POST /:id/assistance{urgence} est le SEUL appelant HTTP restant de cette
+// fonction, et passe systématiquement skipReliabilityPenalty:true. La branche par défaut
+// (skipReliabilityPenalty=false, "pénalité conservée") est donc devenue INATTEIGNABLE depuis
+// n'importe quelle route HTTP — code mort côté pénalité, laissé en l'état dans cette session
+// (fermeture de route demandée, pas nettoyage de cette fonction partagée ; voir rapport). Le
+// cooldown n'a PAS de flag équivalent : depuis le correctif 2026-07-28bis
+// (RAPPORT_DIAGNOSTIC_TRANSFER.md), il est posé pour les deux transferType (4h si 'during', 2h si
+// 'before' via transfer_cooldown_before_hours) et s'applique sans bypass possible, y compris
+// depuis le seul appelant restant. oeilId est passé explicitement (plutôt que lu sur req.user)
+// pour rester appelable hors contexte HTTP direct.
 async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId, reason, options = {}) {
   const {
     historyNoteVerb = "Empêchement signalé par l'Œil",
@@ -1903,38 +1908,37 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
   return { ok: true, transferType, deadline };
 }
 
+// Fermé pour l'Œil (2026-07-30, prompt 18) — défense en profondeur derrière le remplacement de
+// l'ancien bouton "Signaler un empêchement" par "Demander assistance" côté frontend (session
+// séparée, Dashboard.jsx/Missions.jsx, PROMPT_17/cb8a083) : grep exhaustif shoofly-react
+// (missionsAPI.transfer) confirmé, plus aucun appelant. Même principe que la fermeture de
+// /:id/refuse (e44af9f) et /:id/status{cancelled} (53d4cd0) : POST /:id/assistance (catégorie
+// urgence) est désormais l'unique point d'entrée HTTP pour releaseMissionForReplacement
+// (réutilisée telle quelle, voir plus bas) — mécanique de libération/cascade/cooldown/chaîne
+// prorata strictement identique, seule la pénalité de fiabilité diffère (toujours supprimée
+// depuis ce chemin, skipReliabilityPenalty systématique).
 router.post('/:id/transfer', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
-  const db = getDb();
-  const emitToUser = req.app.get('emitToUser');
-  const io = req.app.get('io');
-  const { reason } = req.body;
-
-  if (!reason) return res.status(400).json({ error: 'La raison est obligatoire' });
-
-  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
-  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
-
-  const result = await releaseMissionForReplacement(db, io, emitToUser, mission, req.user.id, reason);
-  if (!result.ok) return res.status(result.status).json({ error: result.error });
-
-  res.json({ ok: true, transfer_type: result.transferType, deadline: result.deadline });
+  return res.status(403).json({ error: "Le transfert direct d'une mission assignée n'est plus disponible. Utilisez \"Demander assistance\" pour signaler un empêchement ou une urgence." });
 }));
 
 // ── POST /missions/:id/assistance ── "Demander assistance" — point d'entrée unique ──
-// Remplace, pour l'Œil assigné à une mission en cours, le recours direct à /refuse ou
+// Remplace, pour l'Œil assigné à une mission en cours, le recours direct à /refuse, /transfer ou
 // /status{cancelled}. Mise à jour 2026-07-28 (correctif URGENCE) : /:id/refuse est désormais
-// fermé pour l'Œil (403, voir plus bas) — ce flux est le seul chemin restant pour un abandon
-// avec recherche de remplaçant ; /status{cancelled} (annulation sans remplacement) reste ouvert
-// en parallèle, non modifié par ce correctif.
+// fermé pour l'Œil (403, voir plus bas). Mise à jour 2026-07-30 (prompt 18) : /:id/transfer est
+// à son tour fermé pour l'Œil (403, voir plus haut) — cette route est désormais le SEUL chemin
+// HTTP restant, pour tout rôle, vers releaseMissionForReplacement ; /status{cancelled}
+// (annulation sans remplacement) reste ouvert en parallèle, non concerné par ces fermetures.
 // category='urgence' (accident, agression/vol/menace, hospitalisation, situation dangereuse) :
-// aucune validation requise, recherche immédiate d'un remplaçant via le mécanisme de
-// /:id/transfer (releaseMissionForReplacement, réutilisé — même transitionMission/cooldown/
-// cascade que /transfer, mais pénalité de fiabilité SUPPRIMÉE via skipReliabilityPenalty : un
-// Œil qui déclare une urgence réelle ne doit pas voir son score baisser — décision explicite,
-// révisant le choix initial "non contourné" du rapport de la session précédente. Cooldown
-// TOUJOURS identique à /transfer (aucun bypass ajouté ici) : depuis le correctif 2026-07-28bis,
-// cela inclut désormais le cooldown 'before' (2h) — voir le commentaire de releaseMissionForReplacement.
+// aucune validation requise, recherche immédiate d'un remplaçant via releaseMissionForReplacement
+// (même fonction qu'utilisait l'ancien /:id/transfer avant sa fermeture — transitionMission/
+// cooldown/cascade identiques), avec pénalité de fiabilité SUPPRIMÉE via skipReliabilityPenalty :
+// un Œil qui déclare une urgence réelle ne doit pas voir son score baisser — décision explicite,
+// révisant le choix initial "non contourné" du rapport de la session précédente. Depuis la
+// fermeture de /:id/transfer, ce flag est passé par le SEUL appelant restant de la fonction : la
+// branche "pénalité conservée" (skipReliabilityPenalty falsy) est de fait devenue inatteignable
+// depuis n'importe quelle route HTTP (constat, non traité ici — voir rapport de session prompt 18).
+// Cooldown TOUJOURS posé (aucun bypass) : depuis le correctif 2026-07-28bis, cela inclut le
+// cooldown 'before' (2h) — voir le commentaire de releaseMissionForReplacement.
 // category='mission' (client absent/injoignable, mauvaise adresse, mission différente de la
 // description) : gèle la mission en sous_reclamation en attendant la réponse du client — voir
 // POST /:id/assistance/respond.
