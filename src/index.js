@@ -311,6 +311,7 @@ initDb().then(() => {
   // Verrous anti-chevauchement en mémoire — un flag par cron, empêche une exécution
   // de démarrer si la précédente n'est pas terminée (process unique, pas de verrou distribué).
   let cronReminderJ1Running = false;
+  let cronClientReminderH2Running = false;
   let cronRecapAdminRunning = false;
   let cronAlertHRunning = false;
   let cronExpiredMissionsRunning = false;
@@ -388,6 +389,55 @@ initDb().then(() => {
           console.warn(`[wasel] Œil ${m.oeil_id} sans téléphone renseigné — envoi ignoré (presence_confirmation_request_j1)`);
         }
         console.log(`⏰ Confirmation de présence demandée (J-1) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
+      }
+
+      // ── Rappel CLIENT J-1 — purement informatif, aucune confirmation attendue ──
+      // Étendu dans la MÊME passe cron (même verrou cronReminderJ1Running) plutôt qu'un cron
+      // séparé : même horaire (20h), même fréquence (une fois/jour) — aucune raison de payer
+      // un 2e tick pour ça. Garde anti-doublon dédiée (client_reminder_j1_sent_at)
+      // volontairement DÉCOUPLÉE de presence_confirmation_requested_at ci-dessus : les deux
+      // rappels ciblent des personnes et des besoins différents (le client n'a rien à
+      // confirmer), les coupler ferait dépendre silencieusement l'un de l'état interne de
+      // l'autre (ex: un Œil qui confirme sa présence en avance ne doit pas faire sauter le
+      // rappel du client). Cible délibérément plus large que le bloc Œil ci-dessus (pas de
+      // filtre sur presence_confirmed_at/presence_confirmation_requested_at) : le client doit
+      // être rappelé que la mission approche indépendamment de l'état de confirmation de l'Œil.
+      const { rows: clientMissionsJ1 } = await db.query(`
+        SELECT m.*, u.phone
+        FROM missions m
+        JOIN users u ON u.id = m.client_id
+        WHERE m.status = 'assigned'
+        AND DATE(m.scheduled_at) = $1
+        AND m.client_reminder_j1_sent_at IS NULL
+      `, [dateStr]);
+
+      for (const m of clientMissionsJ1) {
+        const missionTimeClient = new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
+
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+           VALUES ($1, $2, $3, 'mission', $4, 'mission_view', $5, $6, $7)`,
+          [m.client_id,
+           '📅 Rappel — mission demain',
+           `Votre mission "${m.title}" est prévue demain à ${missionTimeClient}.`,
+           m.id,
+           'clientReminderJ1Title',
+           'clientReminderJ1Body',
+           JSON.stringify({ missionTitle: m.title, time: missionTimeClient })]
+        );
+        if (emitToUser) emitToUser(m.client_id, 'notification', {
+          title: '📅 Rappel — mission demain',
+          body: `"${m.title}" — demain à ${missionTimeClient}`,
+          missionId: m.id,
+          type: 'mission'
+        });
+        if (m.phone) {
+          await sendWhatsAppTemplate(waselTemplates.mission_reminder_j1_client.template_name, m.phone, [m.title, missionTimeClient]);
+        } else {
+          console.warn(`[wasel] Client ${m.client_id} sans téléphone renseigné — envoi ignoré (mission_reminder_j1_client)`);
+        }
+        await db.query(`UPDATE missions SET client_reminder_j1_sent_at = NOW() WHERE id = $1`, [m.id]);
+        console.log(`📅 Rappel J-1 envoyé au client pour mission ${m.id}`);
       }
     } catch (e) { console.error('❌ Cron J-1 rappel error:', e.message); }
     finally { cronReminderJ1Running = false; }
@@ -762,14 +812,72 @@ initDb().then(() => {
     finally { cronPreMissionRemindersRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
+  // ── Cron rappel CLIENT H-2 — purement informatif, cron DÉDIÉ ──
+  // Volontairement séparé du cron H-2/H-45 Œil ci-dessus plutôt que fusionné dans sa boucle :
+  // ce cron-là est spécifiquement couplé à la mécanique de confirmation active de présence
+  // (deadline, pénalité en cas de non-réponse) — le détourner pour un rappel client purement
+  // informatif mélangerait deux obligations de nature différente (voir
+  // RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §1.3). Réutilise volontairement le
+  // réglage reminder_before_mission_minutes_early (déjà "2h avant la mission" pour l'Œil)
+  // plutôt que d'ajouter un réglage quasi-identique : un admin qui change ce délai le fait pour
+  // "2h avant la mission" au sens large, pas spécifiquement pour la mécanique de confirmation
+  // de l'Œil — pas de valeur codée en dur alors qu'un réglage équivalent existe déjà.
+  cron.schedule('*/30 * * * *', async () => {
+    if (cronClientReminderH2Running) { console.warn('⏭️ Cron rappel client H-2 déjà en cours, tick ignoré'); return; }
+    cronClientReminderH2Running = true;
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+      const reminderEarlyMinutes = await getSetting(db, 'reminder_before_mission_minutes_early', 120);
+
+      // Même marge ±10min que le bloc Œil H-2 (dimensionnée pour la fréquence */30 * * * *).
+      const { rows: clientMissionsH2 } = await db.query(`
+        SELECT m.*, u.phone FROM missions m
+        JOIN users u ON u.id = m.client_id
+        WHERE m.status = 'assigned'
+        AND m.scheduled_at BETWEEN NOW() + INTERVAL '1 minute' * $1::numeric AND NOW() + INTERVAL '1 minute' * $2::numeric
+        AND m.client_reminder_h2_sent_at IS NULL
+      `, [reminderEarlyMinutes - 10, reminderEarlyMinutes + 10]);
+
+      for (const m of clientMissionsH2) {
+        await db.query(
+          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+           VALUES ($1, $2, $3, 'mission', $4, 'mission_view', $5, $6, $7)`,
+          [m.client_id,
+           '📅 Rappel — mission bientôt',
+           `Votre mission "${m.title}" est prévue dans environ ${reminderEarlyMinutes} minutes.`,
+           m.id,
+           'clientReminderH2Title',
+           'clientReminderH2Body',
+           JSON.stringify({ missionTitle: m.title, minutes: reminderEarlyMinutes })]
+        );
+        if (emitToUser) emitToUser(m.client_id, 'notification', {
+          title: '📅 Rappel — mission bientôt',
+          body: `"${m.title}" — dans environ ${reminderEarlyMinutes} minutes`,
+          missionId: m.id,
+          type: 'mission'
+        });
+        if (m.phone) {
+          await sendWhatsAppTemplate(waselTemplates.mission_reminder_h2_client.template_name, m.phone, [m.title, String(reminderEarlyMinutes)]);
+        } else {
+          console.warn(`[wasel] Client ${m.client_id} sans téléphone renseigné — envoi ignoré (mission_reminder_h2_client)`);
+        }
+        await db.query(`UPDATE missions SET client_reminder_h2_sent_at = NOW() WHERE id = $1`, [m.id]);
+        console.log(`📅 Rappel H-2 envoyé au client pour mission ${m.id}`);
+      }
+    } catch (e) { console.error('❌ Cron rappel client H-2 error:', e.message); }
+    finally { cronClientReminderH2Running = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
   // Vérifier deadlines transfert toutes les 5 minutes
   cron.schedule('*/5 * * * *', async () => {
     if (cronTransferDeadlineRunning) { console.warn('⏭️ Cron deadlines transfert déjà en cours, tick ignoré'); return; }
     cronTransferDeadlineRunning = true;
     try {
       const db = getDb();
+      const io = app.get('io');
       const emitToUser = app.get('emitToUser');
-      await checkTransferDeadlines(db, emitToUser);
+      await checkTransferDeadlines(db, io, emitToUser);
     } catch (e) { console.error('❌ Transfer deadline cron error:', e.message); }
     finally { cronTransferDeadlineRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
@@ -794,8 +902,9 @@ initDb().then(() => {
     cronAssistanceRequestExpiryRunning = true;
     try {
       const db = getDb();
+      const io = app.get('io');
       const emitToUser = app.get('emitToUser');
-      await checkAssistanceRequestExpiry(db, emitToUser);
+      await checkAssistanceRequestExpiry(db, io, emitToUser);
     } catch (e) { console.error('❌ Assistance request expiry cron error:', e.message); }
     finally { cronAssistanceRequestExpiryRunning = false; }
   }, { timezone: 'Africa/Casablanca' });

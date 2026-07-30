@@ -217,4 +217,23 @@ module.exports = {
     variableCount: 1,
     note: '{{1}} titre de la mission',
   },
+
+  // Cron rappel client J-1 20h (index.js) — rappel purement informatif envoyé au CLIENT,
+  // aucune confirmation attendue (contrairement aux templates presence_confirmation_request_*
+  // ci-dessus, qui ciblent l'Œil avec une deadline de réponse). Même horaire que le cron de
+  // confirmation Œil, mais garde anti-doublon et déclenchement indépendants.
+  mission_reminder_j1_client: {
+    template_name: 'rappel_mission_j1_client',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} heure de la mission (ex: "14h30")',
+  },
+
+  // Cron rappel client H-2 (index.js) — second palier informatif, cron dédié distinct du H-2/
+  // H-45 Œil ci-dessus (qui pose une deadline de confirmation active — mécanique différente,
+  // volontairement pas réutilisée pour le client).
+  mission_reminder_h2_client: {
+    template_name: 'rappel_mission_h2_client',
+    variableCount: 2,
+    note: '{{1}} titre de la mission, {{2}} délai en minutes avant la mission (ex: "120")',
+  },
 };

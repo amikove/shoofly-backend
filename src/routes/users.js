@@ -1605,6 +1605,7 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   // Notifications APRÈS le commit — jamais dans la transaction (règle de périmètre :
   // pas d'appel réseau/lent pendant qu'une connexion DB est retenue).
   const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
   const notify = async (userId, title, body, titleKey = null, bodyKey = null, params = null) => {
     await db.query(
       `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'info',$4,'mission_view',$5,$6,$7)`,
@@ -1620,6 +1621,13 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
     await notify(mission.client_id, '✅ Réclamation résolue', `${refund} MAD crédités sur votre portefeuille.`, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', { amount: refund });
     await notify(mission.oeil_id, 'Réclamation résolue', 'Résolue en faveur du client.', 'claimResolvedClientLoseTitle', 'claimResolvedOeilLoseBody', null);
   }
+
+  // Les deux issues (decision='oeil'|'client') transitionnent sous_reclamation -> completed/
+  // cancelled sans passer par POST /:id/status (voir
+  // RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.3) — fermeture de room répliquée
+  // ici pour cette même raison. missionRoutes réutilisé tel quel (déjà importé plus haut pour
+  // la cascade de réattribution), même pattern que router.checkTransferDeadlines etc.
+  missionRoutes.closeMissionChatRoom(io, mission.id);
 
   res.json({ ok: true });
 }));

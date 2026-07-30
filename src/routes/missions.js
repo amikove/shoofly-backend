@@ -39,6 +39,22 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 }
 
+// Évince tous les sockets actuellement dans la room mission:<id> — appelé à chaque transition
+// vers 'completed'/'cancelled', quel que soit le chemin emprunté (POST /:id/status,
+// /:id/assistance/respond, PUT /admin/claims/:missionId/resolve, checkTransferDeadlines,
+// checkAssistanceRequestExpiry — voir RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.3).
+// N'affecte ni mission_messages (historique jamais purgé) ni un futur re-join : join_mission
+// (index.js) ne vérifie aucun statut, donc une mission qui repasse par sous_reclamation
+// redevient normalement joignable sans rien de plus ici. Appeler APRÈS tout db.query/emit qui
+// doit encore atteindre les participants actuellement dans la room (ex: le message système de
+// clôture) — l'ordre d'appel fait foi, socketsLeave() est synchrone. Double optional chaining
+// délibéré (pas juste io?.) : un stub de test (ex. lib.ioStub, _audit/e2e/lib.js) n'implémente
+// pas forcément socketsLeave — no-op silencieux plutôt qu'un crash sur un appelant qui n'a de
+// toute façon aucun socket réel à évincer.
+function closeMissionChatRoom(io, missionId) {
+  io?.socketsLeave?.(`mission:${missionId}`);
+}
+
 // ── Réutilisable : validation + tarification d'une soumission de formulaire mission ──
 // Extrait de POST /missions pour être partagé avec POST /payments/payzone/init
 // (routes/payments.js — paiement PayZone). Ne fait AUCUNE écriture DB (uniquement des
@@ -1451,6 +1467,10 @@ router.post('/:id/status', authenticate, [
     [mission.id, req.user.id, sysMsg[status], sysMsgKey[status]]);
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status });
+  // Room fermée APRÈS la diffusion ci-dessus (ordre important, voir closeMissionChatRoom) :
+  // les participants encore connectés reçoivent bien la bulle système de clôture avant d'être
+  // évincés de la room.
+  if (['completed', 'cancelled'].includes(status)) closeMissionChatRoom(io, mission.id);
   io.to('room:admin').emit('mission_updated', updated);
 
   res.json({ mission: updated });
@@ -1521,6 +1541,19 @@ router.post('/:id/messages', authenticate, asyncHandler(async (req, res) => {
   const isAdmin  = req.user.role === 'admin';
   if (!isClient && !isOeil && !isAdmin) {
     return res.status(403).json({ error: 'Accès refusé' });
+  }
+
+  // Chat fermé une fois la mission clôturée — sous_reclamation reste ouvert (litige en cours,
+  // communication encore nécessaire) et tous les autres statuts sont inchangés. 400, pas
+  // 403/409 : cohérent avec le reste du projet pour "action refusée à cause du statut actuel de
+  // la mission" (ex. POST /api/media/:missionId, POST /:id/validate, /:id/claim — tous en 400
+  // sur un blocage de statut ; 409 est réservé ici aux vraies courses de concurrence
+  // optimistes). isAdmin exempté : MessagesSuspects.jsx (modération anti-fraude) réutilise
+  // cette même route pour répondre à un message flaggé, y compris sur une mission déjà close —
+  // accès volontairement inconditionnel pour ce rôle (voir
+  // RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.5, dernière ligne du tableau).
+  if (!isAdmin && ['completed', 'cancelled'].includes(mission.status)) {
+    return res.status(400).json({ error: 'Cette mission est clôturée, le chat n\'est plus disponible.' });
   }
 
 const cleanContent = content.trim()
@@ -2096,7 +2129,13 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
     await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé votre déclaration d'assistance sur "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceValidatedOeilTitle', 'assistanceValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
     await notify(db, mission.client_id, '✅ Confirmé', `Vous avez validé la déclaration de l'Œil pour "${mission.title}".`, 'info', mission.id, emitToUser, null, 'assistanceValidatedClientTitle', 'assistanceValidatedClientBody', { missionTitle: mission.title });
 
-    if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'completed' });
+    if (io) {
+      io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'completed' });
+      // Ce chemin transitionne sous_reclamation -> completed sans passer par POST /:id/status
+      // (voir RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.3) — fermeture de room
+      // répliquée ici pour cette même raison.
+      closeMissionChatRoom(io, mission.id);
+    }
 
     return res.json({ ok: true, action: 'validated' });
   }
@@ -2351,7 +2390,7 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
 
 // ── Cron : vérifier deadlines transfert expirées ──────────
 // (appelé depuis index.js via cron)
-async function checkTransferDeadlines(db, emitToUser) {
+async function checkTransferDeadlines(db, io, emitToUser) {
   const { rows: expired } = await db.query(`
     SELECT * FROM missions
     WHERE status='pending' AND is_priority=true
@@ -2377,6 +2416,11 @@ async function checkTransferDeadlines(db, emitToUser) {
       }
       throw e;
     }
+
+    // Ce chemin transitionne vers 'cancelled' sans passer par POST /:id/status (voir
+    // RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.3) — fermeture de room répliquée
+    // ici pour cette même raison.
+    closeMissionChatRoom(io, mission.id);
 
     // Pénalité aggravée sur l'Œil 1 si pendant mission
 if (mission.transfer_type === 'during' && mission.transferred_from) {
@@ -3157,7 +3201,7 @@ async function checkMissionEditRequestExpiry(db, io, emitToUser) {
 // (appelé depuis index.js via cron). Même principe que autoValidateMissions.js
 // (client_validation_hours réutilisé tel quel, même philosophie "silence du client = acceptation")
 // plutôt qu'un nouveau réglage dédié — voir rapport de session pour la justification.
-async function checkAssistanceRequestExpiry(db, emitToUser) {
+async function checkAssistanceRequestExpiry(db, io, emitToUser) {
   const { rows: expired } = await db.query(`
     SELECT * FROM mission_assistance_requests WHERE category='mission' AND status='pending' AND expires_at <= NOW()
   `);
@@ -3202,6 +3246,12 @@ async function checkAssistanceRequestExpiry(db, emitToUser) {
 
     await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedOeilTitle', 'assistanceAutoValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
     await notify(db, mission.client_id, 'Mission clôturée automatiquement', `Vous n'avez pas répondu à temps concernant "${mission.title}" — la déclaration de l'Œil a été considérée comme acceptée.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedClientTitle', 'assistanceAutoValidatedClientBody', { missionTitle: mission.title });
+
+    // Ce chemin transitionne sous_reclamation -> completed sans passer par POST /:id/status
+    // (voir RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.3) — fermeture de room
+    // répliquée ici pour cette même raison. Après le commit, même règle que les notify()
+    // ci-dessus.
+    closeMissionChatRoom(io, mission.id);
   }
 }
 
@@ -3213,6 +3263,7 @@ router.hireOeilCore = hireOeilCore;
 router.applyMissionEditChanges = applyMissionEditChanges;
 router.advanceCandidateCascade = advanceCandidateCascade;
 router.notify = notify;
+router.closeMissionChatRoom = closeMissionChatRoom;
 router.pricing = pricing;
 router.prepareMissionInsert = prepareMissionInsert;
 router.insertMissionRecord = insertMissionRecord;
