@@ -779,6 +779,14 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- Index partiel : le cron de retry et la vue admin par défaut filtrent tous deux sur
     -- resolved_at IS NULL — même principe que idx_missions_status_city (audit perf 2026-07-26).
     CREATE INDEX IF NOT EXISTS idx_whatsapp_failures_unresolved ON whatsapp_send_failures(created_at) WHERE resolved_at IS NULL;
+
+    -- Rappels client avant mission (2026-07-30) — purement informatifs, sans deadline de
+    -- confirmation (contrairement aux colonnes presence_confirmation_* ci-dessus, qui sont
+    -- spécifiques au mécanisme de présence de l'Œil). Une colonne dédiée par palier, même
+    -- principe que stale_notified_at / candidature_whatsapp_sent_at : NULL = jamais envoyé,
+    -- posée après l'envoi pour empêcher un doublon si le cron retombe sur la même fenêtre.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS client_reminder_j1_sent_at TIMESTAMPTZ;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS client_reminder_h2_sent_at TIMESTAMPTZ;
   `);
   console.log('✅ PostgreSQL schema ready');
 }
