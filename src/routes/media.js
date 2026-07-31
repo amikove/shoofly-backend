@@ -5,6 +5,7 @@ const { CloudinaryStorage } = require('../utils/cloudinaryStorage');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
+const { chatAccessExpiresAt } = require('./missions');
 
 // ── Config Cloudinary ─────────────────────────────────────
 cloudinary.config({
@@ -91,6 +92,12 @@ router.post('/:missionId', authenticate, upload.array('files', 10), asyncHandler
 }));
 
 // ── GET /api/media/:missionId ─────────────────────────────
+// Route indépendante du chargement de la mission (missions.js GET /:id) — c'est elle que
+// ChatModal.jsx (mediaAPI.list) appelle en parallèle pour fusionner les photos/vidéos dans
+// le fil du chat. Délai de grâce de 24h après clôture (missions.js, chatAccessExpiresAt) :
+// passé ce délai, bloquée entièrement (403) pour client/Œil — contrairement à GET /:id, cette
+// route ne sert QUE des médias (rien d'équivalent au reste de la mission à garder accessible),
+// un blocage total est donc cohérent ici sans rien casser d'autre. Admin toujours exempté.
 router.get('/:missionId', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
 
@@ -103,6 +110,13 @@ router.get('/:missionId', authenticate, asyncHandler(async (req, res) => {
     || mission.client_id === req.user.id
     || mission.oeil_id === req.user.id;
   if (!canView) return res.status(403).json({ error: 'Accès refusé' });
+
+  if (req.user.role !== 'admin') {
+    const expiresAt = chatAccessExpiresAt(mission);
+    if (expiresAt !== null && Date.now() > new Date(expiresAt).getTime()) {
+      return res.status(403).json({ error: 'Le délai de consultation de cette conversation est dépassé.' });
+    }
+  }
 
   const { rows } = await db.query(
     `SELECT m.*, u.first_name||' '||u.last_name AS uploader_name

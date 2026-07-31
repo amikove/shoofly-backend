@@ -80,6 +80,19 @@ async function transitionMission(db, missionId, fromStatus, toStatus, actor, opt
   const setClauses = ['status=$1', 'updated_at=NOW()'];
   const values = [toStatus];
   let p = 2;
+
+  // Délai de grâce lecture seule sur le chat après clôture (voir schema.js, colonne
+  // closed_at) : posé ICI plutôt qu'en extraFields à chaque site d'appel, car cette
+  // fonction est le seul point que TOUTE transition traverse (voir en-tête de fichier) —
+  // un extraFields dupliqué à chaque site aurait la même fragilité que completed_at/
+  // cancelled_at ci-dessous, qui ne sont posés de façon fiable que sur 2 des 6 sites
+  // appelant transitionMission vers completed/cancelled. Écrase toute valeur précédente
+  // à chaque (ré)clôture (ex: sous_reclamation -> completed après un premier passage par
+  // completed) : la fenêtre de grâce doit repartir de la clôture la plus récente.
+  if (['completed', 'cancelled'].includes(toStatus)) {
+    setClauses.push('closed_at=NOW()');
+  }
+
   for (const [column, value] of Object.entries(extraFields)) {
     if (value === 'NOW()') {
       setClauses.push(`${column}=NOW()`);

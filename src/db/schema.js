@@ -787,6 +787,18 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- posée après l'envoi pour empêcher un doublon si le cron retombe sur la même fenêtre.
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS client_reminder_j1_sent_at TIMESTAMPTZ;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS client_reminder_h2_sent_at TIMESTAMPTZ;
+
+    -- Délai de grâce lecture seule sur le chat après clôture (2026-07-31). Posée par
+    -- transitionMission() (missionStateMachine.js) à CHAQUE transition vers completed/cancelled,
+    -- quel que soit le chemin (6 sites d'appel / 5 chemins produit) plutôt qu'en extraFields
+    -- dupliqué par site : completed_at/cancelled_at ci-dessus ont justement démontré cette
+    -- fragilité (posés de façon fiable sur seulement 2 des 6 sites avant ce correctif — les 4
+    -- autres n'écrivaient que validated_at/is_priority). Ré-écrite à chaque (ré)clôture, y
+    -- compris après un passage par sous_reclamation, pour repartir de la clôture la plus
+    -- récente. Exposée en API sous chat_access_expires_at (closed_at + 24h — voir GET /:id,
+    -- GET /missions, GET /missions/inbox). POST /:id/messages (blocage d'envoi) reste inchangé,
+    -- aucun lien avec cette colonne.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

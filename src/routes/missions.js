@@ -55,6 +55,25 @@ function closeMissionChatRoom(io, missionId) {
   io?.socketsLeave?.(`mission:${missionId}`);
 }
 
+// Délai de grâce lecture seule sur le chat après clôture (2026-07-31) — voir schema.js
+// (colonne missions.closed_at, posée par transitionMission à chaque transition vers
+// completed/cancelled) et prompt de session dédié. N'affecte QUE la lecture : l'envoi
+// reste bloqué immédiatement à la clôture (POST /:id/messages, inchangé) et la room
+// socket reste fermée immédiatement aussi (closeMissionChatRoom ci-dessus, inchangé).
+const CHAT_READ_GRACE_PERIOD_MS = 24 * 60 * 60 * 1000;
+
+// Calcule la date de fin de grâce à exposer en API — null tant que la mission n'a
+// jamais été close, ET si elle a été rouverte depuis (sous_reclamation) : closed_at
+// n'est alors qu'un vestige de la clôture précédente, pas la limite de lecture en
+// vigueur (voir transitionMission — closed_at n'est jamais effacé sur réouverture,
+// seulement réécrit à la prochaine (re)clôture). Le frontend n'a ainsi qu'à tester la
+// présence de ce champ, sans dupliquer la règle "completed/cancelled uniquement" ni la
+// durée de 24h.
+function chatAccessExpiresAt(mission) {
+  if (!mission.closed_at || !['completed', 'cancelled'].includes(mission.status)) return null;
+  return new Date(new Date(mission.closed_at).getTime() + CHAT_READ_GRACE_PERIOD_MS).toISOString();
+}
+
 // ── Réutilisable : validation + tarification d'une soumission de formulaire mission ──
 // Extrait de POST /missions pour être partagé avec POST /payments/payzone/init
 // (routes/payments.js — paiement PayZone). Ne fait AUCUNE écriture DB (uniquement des
@@ -438,7 +457,7 @@ router.get('/inbox', authenticate, asyncHandler(async (req, res) => {
 
   const { rows } = await db.query(`
     SELECT
-      m.id, m.title, m.type, m.status,
+      m.id, m.title, m.type, m.status, m.closed_at,
       c.first_name || ' ' || c.last_name AS client_name,
       o.first_name || ' ' || o.last_name AS oeil_name,
       last_msg.content                   AS last_message,
@@ -465,6 +484,17 @@ router.get('/inbox', authenticate, asyncHandler(async (req, res) => {
     ORDER BY last_msg.created_at DESC NULLS LAST
   `, [userId]);
 
+  // Route intrinsèquement client/Œil (WHERE client_id=$1 OR oeil_id=$1 ci-dessus, jamais
+  // admin) — pas de garde isAdmin nécessaire ici, contrairement à GET /:id. last_message est
+  // un aperçu du CONTENU du dernier message : même règle que messages/media sur GET /:id,
+  // sous peine de laisser fuir par un autre chemin exactement ce que le délai de grâce est
+  // censé fermer.
+  rows.forEach(m => {
+    m.chat_access_expires_at = chatAccessExpiresAt(m);
+    if (m.chat_access_expires_at !== null && Date.now() > new Date(m.chat_access_expires_at).getTime()) {
+      m.last_message = null;
+    }
+  });
   res.json({ inbox: rows });
 }));
 
@@ -603,6 +633,7 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
     if (!(req.user.role === 'admin' || m.oeil_id === req.user.id)) {
       m.client_phone = null;
     }
+    m.chat_access_expires_at = chatAccessExpiresAt(m);
   });
   res.json({ missions, total, page: +page, pages: Math.ceil(total / limit) });
 }));
@@ -1029,17 +1060,40 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   if (req.user.role === 'client' && mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
   if (req.user.role === 'oeil' && mission.oeil_id !== req.user.id && mission.status !== 'pending') return res.status(403).json({ error: 'Accès refusé' });
 
-  const [{ rows: media }, { rows: messages }, { rows: [report] }, { rows: [rating] }] = await Promise.all([
-    db.query('SELECT * FROM mission_media WHERE mission_id=$1 ORDER BY created_at DESC', [req.params.id]),
-    db.query(`SELECT mm.*, u.first_name||' '||u.last_name AS sender_name, u.role AS sender_role
-              FROM mission_messages mm JOIN users u ON u.id=mm.sender_id
-              WHERE mm.mission_id=$1 ORDER BY mm.created_at ASC`, [req.params.id]),
+  mission.chat_access_expires_at = chatAccessExpiresAt(mission);
+
+  // Délai de grâce dépassé : la mission continue de se charger normalement (titre/statut/
+  // prix/note/rapport...) mais messages/media sont renvoyés vides pour client/Œil — admin
+  // (MessagesSuspects.jsx, via ce même ChatModal.jsx partagé) toujours exempté, accès
+  // illimité. report/rating restent hors de cette règle : ce ne sont pas des artefacts du
+  // CHAT (mission_reports = rapport d'audit de l'Œil, ratings = note du client), aucun
+  // rapport avec la conversation ou les photos qu'elle contient.
+  const isAdmin = req.user.role === 'admin';
+  const chatGraceExpired = !isAdmin && mission.chat_access_expires_at !== null
+    && Date.now() > new Date(mission.chat_access_expires_at).getTime();
+
+  const [{ rows: [report] }, { rows: [rating] }] = await Promise.all([
     db.query('SELECT * FROM mission_reports WHERE mission_id=$1', [req.params.id]),
     db.query('SELECT * FROM ratings WHERE mission_id=$1', [req.params.id]),
   ]);
 
-  // Mark messages as read
-  await db.query(`UPDATE mission_messages SET is_read=true WHERE mission_id=$1 AND sender_id!=$2`, [req.params.id, req.user.id]);
+  let media = [];
+  let messages = [];
+  if (!chatGraceExpired) {
+    const [mediaRes, messagesRes] = await Promise.all([
+      db.query('SELECT * FROM mission_media WHERE mission_id=$1 ORDER BY created_at DESC', [req.params.id]),
+      db.query(`SELECT mm.*, u.first_name||' '||u.last_name AS sender_name, u.role AS sender_role
+                FROM mission_messages mm JOIN users u ON u.id=mm.sender_id
+                WHERE mm.mission_id=$1 ORDER BY mm.created_at ASC`, [req.params.id]),
+    ]);
+    media = mediaRes.rows;
+    messages = messagesRes.rows;
+
+    // Mark messages as read — sauté quand le chat est inaccessible (délai de grâce dépassé) :
+    // rien n'est réellement vu par cet appel dans cette branche, pas de raison de marquer quoi
+    // que ce soit lu.
+    await db.query(`UPDATE mission_messages SET is_read=true WHERE mission_id=$1 AND sender_id!=$2`, [req.params.id, req.user.id]);
+  }
 
   // Le client voit le profil d'un tiers (l'Œil assigné) : un débutant (< 10 missions)
   // n'a pas assez d'historique pour qu'une note affichée soit significative.
@@ -3264,6 +3318,7 @@ router.applyMissionEditChanges = applyMissionEditChanges;
 router.advanceCandidateCascade = advanceCandidateCascade;
 router.notify = notify;
 router.closeMissionChatRoom = closeMissionChatRoom;
+router.chatAccessExpiresAt = chatAccessExpiresAt;
 router.pricing = pricing;
 router.prepareMissionInsert = prepareMissionInsert;
 router.insertMissionRecord = insertMissionRecord;
