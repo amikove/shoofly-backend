@@ -31,6 +31,7 @@ const jwt = require('jsonwebtoken');
 const { initDb, getDb, checkDbConnection } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
+const walletService = require('./services/walletService');
 const { runAutoValidateMissions } = require('./jobs/autoValidateMissions');
 const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
 const { sendWhatsAppTemplate } = require('./services/wasel');
@@ -585,12 +586,18 @@ initDb().then(() => {
           [transferCooldownHours, m.oeil_id]
         );
         // Le débit journalisé doit être plafonné au solde réel de l'Œil — sinon la ligne
-        // wallet_transactions affiche -100 alors que balance (clampée par GREATEST) n'a
-        // baissé que du solde disponible, cassant la réconciliation SUM(wallet_transactions) == balance.
-        const { rows: [oeilBalRow] } = await db.query('SELECT balance FROM oeil_profiles WHERE user_id=$1', [m.oeil_id]);
-        const deducted = Math.min(100, parseFloat(oeilBalRow?.balance || 0));
-        await db.query(`INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',$2,'Pénalité — mission non démarrée à l''heure',$3)`, [m.oeil_id, deducted, m.id]);
-        await db.query(`UPDATE oeil_profiles SET balance=GREATEST(0,balance-100) WHERE user_id=$1`, [m.oeil_id]);
+        // wallet_transactions afficherait -100 alors que balance n'a baissé que du solde
+        // disponible, cassant la réconciliation SUM(wallet_transactions) == balance. lockBalance
+        // + debit() dans la même transaction (plutôt qu'un débit de 100 fixe) : le montant passé
+        // à debit() est déjà borné au solde verrouillé, donc INSUFFICIENT_BALANCE n'est jamais
+        // levée ici ; si le solde est déjà à 0, on ne journalise rien (pas de ligne à 0 MAD).
+        await walletService.withTransaction(db, async (client) => {
+          const currentBalance = await walletService.lockBalance(client, m.oeil_id, 'oeil');
+          const deducted = Math.min(100, currentBalance || 0);
+          if (deducted > 0) {
+            await walletService.debit(client, m.oeil_id, 'oeil', deducted, 'Pénalité — mission non démarrée à l\'heure', m.id);
+          }
+        });
         await logReliabilityEvent(db, m.oeil_id, m.id, -20, 'Mission non démarrée à l\'heure (H+30)', true);
 
         // Transfert automatique
