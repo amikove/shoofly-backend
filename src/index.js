@@ -1227,12 +1227,16 @@ initDb().then(() => {
   // auto-résolution tickets, missions expirées) — une désync financière n'a pas besoin d'une
   // détection temps réel (le verrou balance ci-dessus empêche déjà toute NOUVELLE désync via
   // UPDATE), mais ne doit pas non plus rester invisible une journée entière. Visibilité admin :
-  // GET /users/admin/wallet-reconciliation-alerts. Voir jobs/walletReconciliation.js.
+  // notification live dès qu'un NOUVEL écart est détecté (notify()+room:admin, voir
+  // jobs/walletReconciliation.js), plus consultation à la demande via GET
+  // /users/admin/wallet-reconciliation-alerts.
   cron.schedule('0 * * * *', async () => {
     if (cronWalletReconciliationRunning) { console.warn('⏭️ Cron réconciliation wallet déjà en cours, tick ignoré'); return; }
     cronWalletReconciliationRunning = true;
     try {
-      await runWalletReconciliation(getDb());
+      const io = app.get('io');
+      const emitToUser = app.get('emitToUser');
+      await runWalletReconciliation(getDb(), io, emitToUser);
     } catch (e) { console.error('❌ Cron réconciliation wallet error:', e.message); }
     finally { cronWalletReconciliationRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
