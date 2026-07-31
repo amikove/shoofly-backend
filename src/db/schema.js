@@ -834,6 +834,37 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       BEFORE UPDATE OF balance ON users
       FOR EACH ROW WHEN (NEW.balance IS DISTINCT FROM OLD.balance)
       EXECUTE FUNCTION enforce_wallet_balance_guard();
+
+    -- Réconciliation automatique du solde (2026-07-31, suite au verrou ci-dessus) — le trigger
+    -- empêche une NOUVELLE désynchronisation via UPDATE, mais ne détecte pas une désync déjà
+    -- présente (ex: séquelle du bug FAIL1 avant son correctif, ou une INSERT avec solde non nul
+    -- comme seed.js, volontairement hors périmètre du trigger — voir walletService.js). Ce cron
+    -- (jobs/walletReconciliation.js) compare périodiquement, pour chaque utilisateur, SUM(credit)-
+    -- SUM(debit) (wallet_transactions) à son solde stocké (oeil_profiles.balance ou users.balance,
+    -- selon BALANCE_TABLE — voir walletService.js) et journalise tout écart, SANS jamais corriger
+    -- automatiquement balance/wallet_transactions (lecture seule — une désync financière doit être
+    -- investiguée par un humain avant toute correction, voir jobs/walletReconciliation.js).
+    -- discrepancy = stored_balance - ledger_balance (positif = solde stocké supérieur au ledger,
+    -- négatif = inférieur). Une ligne par écart NOUVELLEMENT détecté — pas de doublon tant qu'une
+    -- ligne non résolue existe déjà pour le même utilisateur (vérifié via NOT EXISTS avant l'INSERT
+    -- côté jobs/walletReconciliation.js). resolved_at n'est JAMAIS posé automatiquement par ce cron,
+    -- même quand l'écart disparaît au run suivant (solde corrigé entre-temps) — uniquement par
+    -- action admin explicite (PUT .../resolve) : que les montants se recroisent à nouveau ne prouve
+    -- pas qu'un humain a compris et validé la cause, seulement qu'ils correspondent de nouveau
+    -- (potentiellement via une nouvelle anomalie qui masquerait la première).
+    CREATE TABLE IF NOT EXISTS wallet_reconciliation_alerts (
+      id              SERIAL PRIMARY KEY,
+      user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_type       TEXT NOT NULL CHECK(user_type IN ('oeil','client')),
+      ledger_balance  NUMERIC(10,2) NOT NULL,
+      stored_balance  NUMERIC(10,2) NOT NULL,
+      discrepancy     NUMERIC(10,2) NOT NULL,
+      detected_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      resolved_at     TIMESTAMPTZ
+    );
+    -- Index partiel : le cron (anti-doublon NOT EXISTS) et la vue admin par défaut filtrent tous
+    -- deux sur resolved_at IS NULL — même principe que idx_whatsapp_failures_unresolved ci-dessus.
+    CREATE INDEX IF NOT EXISTS idx_wallet_reconciliation_unresolved ON wallet_reconciliation_alerts(detected_at) WHERE resolved_at IS NULL;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

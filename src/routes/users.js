@@ -1673,6 +1673,45 @@ router.get('/admin/whatsapp-failures', authenticate, requireRole('admin'), requi
   res.json({ failures: rows, total, page: +page, pages: Math.ceil(total / limit) });
 }));
 
+// ── GET /users/admin/wallet-reconciliation-alerts — écarts solde/ledger détectés (voir
+// jobs/walletReconciliation.js et schema.js) — pagination + filtre statut, mêmes conventions que
+// GET /users/admin/whatsapp-failures ci-dessus. Permission 'finance' (pas 'audit') : contrairement
+// aux échecs WhatsApp, c'est une donnée financière — même bucket que GET /admin/withdrawals et
+// PUT /admin/claims/:missionId/resolve ──
+router.get('/admin/wallet-reconciliation-alerts', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { status = 'unresolved', page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
+
+  let wc = '';
+  if (status === 'unresolved') wc = 'WHERE resolved_at IS NULL';
+  else if (status === 'resolved') wc = 'WHERE resolved_at IS NOT NULL';
+  else if (status !== 'all') return res.status(400).json({ error: 'Statut invalide (unresolved, resolved, all)' });
+
+  const { rows } = await db.query(
+    `SELECT * FROM wallet_reconciliation_alerts ${wc} ORDER BY detected_at DESC LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  const { rows: [{ n: total }] } = await db.query(`SELECT COUNT(*)::int AS n FROM wallet_reconciliation_alerts ${wc}`);
+
+  res.json({ alerts: rows, total, page: +page, pages: Math.ceil(total / limit) });
+}));
+
+// ── PUT /users/admin/wallet-reconciliation-alerts/:id/resolve — clôture explicite d'un écart par
+// un admin. resolved_at n'est JAMAIS posé automatiquement par le cron (jobs/walletReconciliation.js),
+// même quand l'écart cesse d'être détecté à un run suivant (solde corrigé entre-temps) — voir
+// commentaire schema.js sur wallet_reconciliation_alerts pour la justification. Cette route ne
+// recalcule ni ne corrige balance/wallet_transactions — marque seulement qu'un humain a investigué ──
+router.put('/admin/wallet-reconciliation-alerts/:id/resolve', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows: [alert] } = await db.query(
+    `UPDATE wallet_reconciliation_alerts SET resolved_at = NOW() WHERE id = $1 AND resolved_at IS NULL RETURNING *`,
+    [req.params.id]
+  );
+  if (!alert) return res.status(404).json({ error: 'Alerte introuvable ou déjà résolue' });
+  res.json({ alert });
+}));
+
 // ── POST /users/oeil/identity — upload documents identité ──
 router.post('/oeil/identity', authenticate, requireRole('oeil'), uploadIdentity.fields([
   { name: 'cin_recto', maxCount: 1 },
