@@ -799,6 +799,41 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- GET /missions, GET /missions/inbox). POST /:id/messages (blocage d'envoi) reste inchangé,
     -- aucun lien avec cette colonne.
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+
+    -- Verrou structurel sur balance (2026-07-31, suite audit externe "ledger-only") : jusqu'ici
+    -- rien n'empêchait une route d'écrire UPDATE oeil_profiles/users SET balance=... directement,
+    -- sans passer par walletService (c'est exactement le bug FAIL1 déjà corrigé une fois — retrait
+    -- refusé recrédité par UPDATE brut, sans ligne wallet_transactions correspondante). Plutôt que
+    -- de compter sur la discipline de chaque futur appelant, ce trigger rejette toute écriture sur
+    -- balance qui n'a pas posé au préalable SET LOCAL app.wallet_write_allowed='true' dans la même
+    -- transaction — flag posé uniquement par walletService.credit()/debit() (services/walletService.js),
+    -- jamais exposé ailleurs. SET LOCAL se réinitialise automatiquement à la fin de la transaction
+    -- (COMMIT ou ROLLBACK), donc aucune remise à zéro manuelle n'est nécessaire. current_setting(...,
+    -- true) renvoie NULL (jamais une erreur) si le flag n'a jamais été posé dans la session — c'est
+    -- le cas par défaut, donc le comportement est bien "refusé sauf autorisation explicite".
+    -- Portée volontairement limitée à UPDATE (le vecteur de FAIL1 et de la demande d'audit) : un
+    -- INSERT avec un solde non nul (seed.js, dev uniquement, jamais en production) reste hors
+    -- périmètre de ce trigger — voir RAPPORT_VERROUILLAGE_BALANCE.md pour la justification.
+    CREATE OR REPLACE FUNCTION enforce_wallet_balance_guard() RETURNS trigger AS $$
+    BEGIN
+      IF current_setting('app.wallet_write_allowed', true) IS DISTINCT FROM 'true' THEN
+        RAISE EXCEPTION 'balance ne peut être modifiée que via walletService.credit()/debit() (table %)', TG_TABLE_NAME;
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    DROP TRIGGER IF EXISTS oeil_profiles_balance_guard ON oeil_profiles;
+    CREATE TRIGGER oeil_profiles_balance_guard
+      BEFORE UPDATE OF balance ON oeil_profiles
+      FOR EACH ROW WHEN (NEW.balance IS DISTINCT FROM OLD.balance)
+      EXECUTE FUNCTION enforce_wallet_balance_guard();
+
+    DROP TRIGGER IF EXISTS users_balance_guard ON users;
+    CREATE TRIGGER users_balance_guard
+      BEFORE UPDATE OF balance ON users
+      FOR EACH ROW WHEN (NEW.balance IS DISTINCT FROM OLD.balance)
+      EXECUTE FUNCTION enforce_wallet_balance_guard();
   `);
   console.log('✅ PostgreSQL schema ready');
 }
