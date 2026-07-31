@@ -216,28 +216,17 @@ router.post('/oeil/withdraw', authenticate, requireRole('oeil'), asyncHandler(as
   const { amount, bank_info } = req.body;
   if (!amount || amount < 100) return res.status(400).json({ error: 'Minimum 100 MAD' });
 
-  // Transaction + verrou de ligne : évite que deux retraits simultanés passent
-  // tous les deux la vérification de solde avant que le premier ne soit committé.
-  const client = await db.connect();
+  // Transaction + verrou de ligne (walletService.debit() fait le SELECT ... FOR UPDATE +
+  // vérification + update + ledger) : évite que deux retraits simultanés passent tous les
+  // deux la vérification de solde avant que le premier ne soit committé.
   try {
-    await client.query('BEGIN');
-    const { rows: [p] } = await client.query('SELECT balance FROM oeil_profiles WHERE user_id=$1 FOR UPDATE', [req.user.id]);
-    if (!p || p.balance < amount) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Solde insuffisant' });
-    }
-    await client.query('UPDATE oeil_profiles SET balance=balance-$1 WHERE user_id=$2', [amount, req.user.id]);
-    await client.query('INSERT INTO withdrawals (oeil_id,amount,bank_info) VALUES ($1,$2,$3)', [req.user.id, amount, JSON.stringify(bank_info)]);
-    await client.query(
-      `INSERT INTO wallet_transactions (user_id, type, amount, reason) VALUES ($1, 'debit', $2, 'Retrait bancaire')`,
-      [req.user.id, amount]
-    );
-    await client.query('COMMIT');
+    await walletService.withTransaction(db, async (client) => {
+      await walletService.debit(client, req.user.id, 'oeil', amount, 'Retrait bancaire');
+      await client.query('INSERT INTO withdrawals (oeil_id,amount,bank_info) VALUES ($1,$2,$3)', [req.user.id, amount, JSON.stringify(bank_info)]);
+    });
   } catch (e) {
-    await client.query('ROLLBACK');
+    if (e.code === 'INSUFFICIENT_BALANCE') return res.status(400).json({ error: 'Solde insuffisant' });
     throw e;
-  } finally {
-    client.release();
   }
 
   res.status(201).json({ message: `Virement de ${amount} MAD soumis. Traitement sous 48h.` });

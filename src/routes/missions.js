@@ -1432,11 +1432,7 @@ router.post('/:id/status', authenticate, [
       const pct = Math.max(0, Math.min(parseFloat(req.body.refund_percent) || 0, 100));
       refund = Math.round(mission.price * pct / 100 * 100) / 100;
       if (refund > 0) {
-        await db.query(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [refund, mission.client_id]);
-        await db.query(
-          `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'credit',$2,$3,$4)`,
-          [mission.client_id, refund, 'Remboursement — montant fixé par l\'administrateur', mission.id]
-        );
+        await walletService.credit(db, mission.client_id, 'client', refund, 'Remboursement — montant fixé par l\'administrateur', mission.id);
       }
       await notify(db, mission.client_id, '💰 Remboursement', `${refund} MAD crédités sur votre portefeuille suite à l'annulation de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'fullRefundTitle', 'fullRefundBody', {amount: refund});
       if (mission.oeil_id) {
@@ -2478,14 +2474,16 @@ async function checkTransferDeadlines(db, io, emitToUser) {
 
     // Pénalité aggravée sur l'Œil 1 si pendant mission
 if (mission.transfer_type === 'during' && mission.transferred_from) {
-        const { rows: [before] } = await db.query(
-          'SELECT balance FROM oeil_profiles WHERE user_id=$1', [mission.transferred_from]
-        );
-        const deducted = Math.min(100, parseFloat(before?.balance || 0));
-        await db.query(
-          `UPDATE oeil_profiles SET balance=GREATEST(0, balance-100) WHERE user_id=$1`,
-          [mission.transferred_from]
-        );
+        // Débit plafonné au solde réel (voir même pattern commenté en détail dans le cron H+30,
+        // index.js) : lockBalance + debit() dans la même transaction pour que le montant journalisé
+        // ne dépasse jamais ce qui a réellement été déduit.
+        await walletService.withTransaction(db, async (client) => {
+          const currentBalance = await walletService.lockBalance(client, mission.transferred_from, 'oeil');
+          const deducted = Math.min(100, currentBalance || 0);
+          if (deducted > 0) {
+            await walletService.debit(client, mission.transferred_from, 'oeil', deducted, 'Pénalité — aucun remplaçant trouvé', mission.id);
+          }
+        });
         const abandonCooldownHours = await getSetting(db, 'abandon_during_mission_cooldown_hours', 48);
         await db.query(`
           UPDATE users SET
@@ -2494,10 +2492,6 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
           WHERE id=$1
         `, [mission.transferred_from, abandonCooldownHours]);
         await logReliabilityEvent(db, mission.transferred_from, mission.id, -70, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
-        await db.query(
-          `INSERT INTO wallet_transactions (user_id,type,amount,reason,mission_id) VALUES ($1,'debit',$2,'Pénalité — aucun remplaçant trouvé',$3)`,
-          [mission.transferred_from, deducted, mission.id]
-        );
 
       await emitToUser?.(mission.transferred_from, 'notification', {
         title: '⚠️ Pénalité appliquée',
