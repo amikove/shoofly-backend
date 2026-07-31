@@ -13,7 +13,7 @@ function crashAndLog(kind, err) {
 process.on('uncaughtException', (err) => crashAndLog('uncaughtException', err));
 process.on('unhandledRejection', (reason) => crashAndLog('unhandledRejection', reason));
 
-// Diagnostic fuseau horaire — les 16 cron.schedule ci-dessous fixent explicitement
+// Diagnostic fuseau horaire — les 17 cron.schedule ci-dessous fixent explicitement
 // { timezone: 'Africa/Casablanca' } donc ne dépendent pas de ce réglage, mais ce log
 // confirme dans les logs Render quel fuseau le processus utilise par défaut (utile pour
 // tout code qui, lui, s'appuie encore sur l'horloge locale du process — voir RAPPORT_TIMEZONE_CRONS.md).
@@ -34,6 +34,7 @@ const { getSetting } = require('./utils/settings');
 const walletService = require('./services/walletService');
 const { runAutoValidateMissions } = require('./jobs/autoValidateMissions');
 const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
+const { runWalletReconciliation } = require('./jobs/walletReconciliation');
 const { sendWhatsAppTemplate } = require('./services/wasel');
 const waselTemplates = require('./config/waselTemplates');
 
@@ -328,6 +329,7 @@ initDb().then(() => {
   let cronUrgentWhatsAppWaveRunning = false;
   let cronCandidatureWhatsAppRunning = false;
   let cronWhatsappRetryRunning = false;
+  let cronWalletReconciliationRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
   // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
@@ -1218,6 +1220,21 @@ initDb().then(() => {
       await runWhatsAppRetry(getDb());
     } catch (e) { console.error('❌ Cron retry WhatsApp error:', e.message); }
     finally { cronWhatsappRetryRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron toutes les heures — Réconciliation solde vs ledger ──
+  // Fréquence choisie par alignement sur les autres crons horaires du projet (auto-validation,
+  // auto-résolution tickets, missions expirées) — une désync financière n'a pas besoin d'une
+  // détection temps réel (le verrou balance ci-dessus empêche déjà toute NOUVELLE désync via
+  // UPDATE), mais ne doit pas non plus rester invisible une journée entière. Visibilité admin :
+  // GET /users/admin/wallet-reconciliation-alerts. Voir jobs/walletReconciliation.js.
+  cron.schedule('0 * * * *', async () => {
+    if (cronWalletReconciliationRunning) { console.warn('⏭️ Cron réconciliation wallet déjà en cours, tick ignoré'); return; }
+    cronWalletReconciliationRunning = true;
+    try {
+      await runWalletReconciliation(getDb());
+    } catch (e) { console.error('❌ Cron réconciliation wallet error:', e.message); }
+    finally { cronWalletReconciliationRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // Keep-alive pour Render plan gratuit
