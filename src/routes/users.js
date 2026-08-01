@@ -253,7 +253,7 @@ router.get('/admin/all', authenticate, requireRole('admin'), asyncHandler(async 
 router.get('/admin/profile/:userId', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { userId } = req.params;
-  const { page = 1, limit = 20 } = req.query;
+  const { page = 1, limit = 20, date_from, date_to } = req.query;
   const offset = (page - 1) * limit;
 
   const { rows: [user] } = await db.query(`
@@ -300,9 +300,21 @@ router.get('/admin/profile/:userId', authenticate, requireRole('admin'), asyncHa
   };
 
   // ── Onglet Financier ──
+  // date_from/date_to optionnels, même convention (bornes incluses) que /admin/dashboard/financier
+  // (BETWEEN) — ici en >=/<= séparés pour rester rétro-compatible quand un seul des deux est fourni.
+  const walletParams = [userId];
+  let walletDateFilter = '';
+  if (date_from) {
+    walletParams.push(date_from);
+    walletDateFilter += ` AND created_at >= $${walletParams.length}`;
+  }
+  if (date_to) {
+    walletParams.push(date_to);
+    walletDateFilter += ` AND created_at <= $${walletParams.length}`;
+  }
   const { rows: walletTransactions } = await db.query(
-    `SELECT id, type, amount, reason, mission_id, created_at FROM wallet_transactions WHERE user_id=$1 ORDER BY created_at DESC`,
-    [userId]
+    `SELECT id, type, amount, reason, mission_id, created_at FROM wallet_transactions WHERE user_id=$1${walletDateFilter} ORDER BY created_at DESC`,
+    walletParams
   );
 
   let financial;
