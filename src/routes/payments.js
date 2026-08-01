@@ -10,6 +10,7 @@ const asyncHandler = require('../middleware/asyncHandler');
 const walletService = require('../services/walletService');
 const { getSetting } = require('../utils/settings');
 const { buildPaywallPayload, verifyCallbackSignature } = require('../services/payzone');
+const cashplusService = require('../services/cashplus');
 
 // Réutilise les validateurs, la tarification (pricing()) et la logique de création de
 // mission déjà écrites pour POST /missions (routes/missions.js) — jamais dupliquées ici.
@@ -20,6 +21,7 @@ const {
   prepareMissionInsert,
   insertMissionRecord,
   notifyNewMission,
+  notify,
 } = missionRoutesModule;
 
 // ── POST /payments/payzone/init ── Client démarre un paiement pour une nouvelle mission ──
@@ -237,6 +239,82 @@ router.post('/payzone/retry/:attemptId', missionCreateLimiter, authenticate, req
     payload: payloadString,
     signature,
   });
+}));
+
+// ── POST /payments/cashplus/callback ── Webhook CashPlus (PUBLIC) ──────────
+// Voir RECAP_INTEGRATION_CASHPLUS.md. Contrairement à PayZone (signature sur le corps brut
+// entier, ci-dessus), le HMAC CashPlus ne porte que sur request_id+secret_key (voir services/
+// cashplus.js) — req.body parsé normalement (json ou urlencoded, voir index.js) suffit, pas
+// besoin d'express.raw() ici. Réponse TOUJOURS en texte brut "OK"/"NOK" (jamais JSON, exigé par
+// CashPlus) — la doc résumée fournie ne précise aucune sémantique de statut HTTP par cas
+// (contrairement à PayZone, dont la doc distinguait explicitement 403 signature invalide / 200
+// KO métier) : HTTP 200 est donc utilisé pour tout rejet "métier" (request_id inconnu), seul un
+// HMAC invalide renvoie 403 — par analogie directe avec verifyCallbackSignature ci-dessus,
+// signalé comme hypothèse dans le rapport de session faute de précision équivalente pour CashPlus.
+router.post('/cashplus/callback', asyncHandler(async (req, res) => {
+  const sendPlain = (status, text) => res.status(status).type('text/plain').send(text);
+  const { request_id: requestId, hmac, amount: payloadAmount } = req.body || {};
+
+  if (!cashplusService.verifyCallbackHmac(requestId, hmac)) {
+    console.error(`[cashplus] Callback rejeté — HMAC invalide ou champs manquants (request_id=${requestId || '(absent)'})`);
+    return sendPlain(403, 'NOK');
+  }
+
+  const db = getDb();
+  const { rows: [request] } = await db.query(`SELECT * FROM cashplus_recharge_requests WHERE request_id=$1`, [requestId]);
+  if (!request) {
+    console.error(`[cashplus] Callback pour request_id inconnu: ${requestId}`);
+    return sendPlain(200, 'NOK');
+  }
+
+  // L'amount du payload callback n'est PAS authentifié par le HMAC (voir services/cashplus.js)
+  // — jamais utilisé pour le crédit, uniquement comparé pour signaler toute divergence. Le
+  // crédit ci-dessous se base systématiquement sur `locked.amount` (valeur stockée à la
+  // génération, verrouillée par la transaction), jamais sur payloadAmount.
+  if (payloadAmount !== undefined && payloadAmount !== null && Number(payloadAmount) !== Number(request.amount)) {
+    console.error(`[cashplus] Divergence de montant — request_id=${requestId} stocké=${request.amount} payload=${payloadAmount}. Crédit basé sur le montant stocké (source de vérité, jamais le payload).`);
+  }
+
+  try {
+    await walletService.withTransaction(db, async (client) => {
+      // Idempotence + auto-guérison d'une expiration prématurée du cron (jobs/cashplusExpiry.js) :
+      // un callback HMAC-valide fait toujours foi sur un statut local 'expired' (le paiement a
+      // réellement eu lieu selon CashPlus, l'estimation optimiste du cron doit céder) — seul
+      // 'completed' bloque un second crédit. Garde d'idempotence posée sur l'UPDATE lui-même
+      // (WHERE status IN (...)), pas une SELECT préalable — même pattern que le callback PayZone
+      // ci-dessus, pour éviter toute course entre deux callbacks concurrents.
+      const { rows: [locked] } = await client.query(
+        `UPDATE cashplus_recharge_requests SET status='completed', completed_at=NOW()
+         WHERE request_id=$1 AND status IN ('pending','expired') RETURNING *`,
+        [requestId]
+      );
+      if (!locked) {
+        const err = new Error('ALREADY_PROCESSED');
+        err.code = 'ALREADY_PROCESSED';
+        throw err;
+      }
+      await walletService.credit(client, locked.oeil_id, 'oeil', Number(locked.amount), 'Recharge wallet CashPlus', null);
+    });
+  } catch (e) {
+    if (e.code === 'ALREADY_PROCESSED') return sendPlain(200, 'OK'); // rejeu — idempotent, aucun second crédit
+    throw e;
+  }
+
+  // Notification APRÈS le commit (règle du projet : jamais de notify() dans une transaction) —
+  // même contrat que notifyNewMission ci-dessus. action_type 'gains_page' réutilisé tel quel
+  // (même destination Œil que les notifications de virement, routes/users.js PUT /admin/
+  // withdrawals/:id) plutôt qu'une nouvelle valeur non câblée côté frontend.
+  const emitToUser = req.app.get('emitToUser');
+  await notify(
+    db, request.oeil_id,
+    '💰 Recharge effectuée',
+    `Votre wallet a été crédité de ${Number(request.amount).toFixed(2)} MAD suite à votre recharge CashPlus.`,
+    'info', null, emitToUser, 'gains_page',
+    'cashplusRechargeCompletedTitle', 'cashplusRechargeCompletedBody',
+    { amount: Number(request.amount) }
+  );
+
+  return sendPlain(200, 'OK');
 }));
 
 module.exports = router;

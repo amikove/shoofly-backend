@@ -35,6 +35,7 @@ const walletService = require('./services/walletService');
 const { runAutoValidateMissions } = require('./jobs/autoValidateMissions');
 const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
 const { runWalletReconciliation } = require('./jobs/walletReconciliation');
+const { runCashplusExpiry } = require('./jobs/cashplusExpiry');
 const { sendWhatsAppTemplate } = require('./services/wasel');
 const waselTemplates = require('./config/waselTemplates');
 
@@ -152,6 +153,14 @@ const skipForPayzoneCallback = (middleware) => (req, res, next) => (
   req.path === PAYZONE_CALLBACK_PATH ? next() : middleware(req, res, next)
 );
 app.use(skipForPayzoneCallback(express.json({ limit: '5mb' })));
+// Callback CashPlus (routes/payments.js, POST /cashplus/callback) : contrairement à PayZone,
+// son HMAC ne porte que sur request_id+secret_key (pas sur le corps entier, voir services/
+// cashplus.js) — pas besoin d'express.raw() dédié. L'encodage exact utilisé par CashPlus pour
+// CE callback entrant n'est pas garanti par la doc résumée fournie (form-urlencoded vs JSON,
+// voir services/cashplus.js) : express.urlencoded() est ajouté ici en complément de
+// express.json() déjà présent, pour couvrir les deux cas sans deviner lequel CashPlus utilise
+// réellement (à confirmer au premier callback réel reçu en sandbox).
+app.use(skipForPayzoneCallback(express.urlencoded({ extended: true, limit: '5mb' })));
 app.use(skipForPayzoneCallback(xss()));
 app.use(skipForPayzoneCallback(hpp()));
 app.use(skipForPayzoneCallback(mongoSanitize()));
@@ -330,6 +339,7 @@ initDb().then(() => {
   let cronCandidatureWhatsAppRunning = false;
   let cronWhatsappRetryRunning = false;
   let cronWalletReconciliationRunning = false;
+  let cronCashplusExpiryRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
   // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
@@ -1239,6 +1249,18 @@ initDb().then(() => {
       await runWalletReconciliation(getDb(), io, emitToUser);
     } catch (e) { console.error('❌ Cron réconciliation wallet error:', e.message); }
     finally { cronWalletReconciliationRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron toutes les 5 min — Expiration des demandes de recharge CashPlus ──
+  // Même fréquence que les autres vérifications de deadline du projet (transfert, edit-request,
+  // assistance) — voir jobs/cashplusExpiry.js. Purement informatif (aucune action financière).
+  cron.schedule('*/5 * * * *', async () => {
+    if (cronCashplusExpiryRunning) { console.warn('⏭️ Cron expiration CashPlus déjà en cours, tick ignoré'); return; }
+    cronCashplusExpiryRunning = true;
+    try {
+      await runCashplusExpiry(getDb());
+    } catch (e) { console.error('❌ Cron expiration CashPlus error:', e.message); }
+    finally { cronCashplusExpiryRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // Keep-alive pour Render plan gratuit

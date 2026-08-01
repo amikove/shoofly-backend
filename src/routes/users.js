@@ -1,11 +1,13 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const { refundOnCancellation } = require('../utils/refund');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const walletService = require('../services/walletService');
+const cashplusService = require('../services/cashplus');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
 const { getSetting, invalidateSettingsCache } = require('../utils/settings');
@@ -230,6 +232,38 @@ router.post('/oeil/withdraw', authenticate, requireRole('oeil'), asyncHandler(as
   }
 
   res.status(201).json({ message: `Virement de ${amount} MAD soumis. Traitement sous 48h.` });
+}));
+
+// ── Oeil: recharge wallet via CashPlus (paiement cash en agence) ────────────
+// Voir RECAP_INTEGRATION_CASHPLUS.md et services/cashplus.js. amount/fees sont calculés et
+// figés ICI, jamais recalculés depuis un payload externe plus tard (callback ou ailleurs) —
+// même principe que prepareMissionInsert/PayZone (routes/payments.js) pour le prix d'une
+// mission. Aucune ligne cashplus_recharge_requests n'est créée si l'appel CashPlus échoue : rien
+// à suivre pour une tentative qui n'a jamais existé côté CashPlus (l'Œil peut simplement
+// réessayer, un nouveau request_id sera généré).
+router.post('/oeil/cashplus/generate-token', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const amount = Number(req.body.amount);
+  if (!cashplusService.ALLOWED_AMOUNTS.includes(amount)) {
+    return res.status(400).json({ error: `Montant invalide — valeurs autorisées : ${cashplusService.ALLOWED_AMOUNTS.join(', ')} MAD` });
+  }
+
+  const fees = cashplusService.computeFees(amount);
+  const requestId = crypto.randomUUID();
+  const dateExpiration = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+  const result = await cashplusService.callGenerateToken({ requestId, amount, fees, dateExpiration });
+  if (!result.ok) {
+    return res.status(502).json({ error: result.message || 'Échec de la génération du token CashPlus' });
+  }
+
+  const db = getDb();
+  await db.query(
+    `INSERT INTO cashplus_recharge_requests (request_id, oeil_id, amount, fees, token, date_expiration, status)
+     VALUES ($1,$2,$3,$4,$5,$6,'pending')`,
+    [requestId, req.user.id, amount, fees, result.token, dateExpiration]
+  );
+
+  res.status(201).json({ requestId, token: result.token, dateExpiration, amount, fees });
 }));
 
 // ══ ADMIN ══════════════════════════════════════════════════
