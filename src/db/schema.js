@@ -865,6 +865,34 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- Index partiel : le cron (anti-doublon NOT EXISTS) et la vue admin par défaut filtrent tous
     -- deux sur resolved_at IS NULL — même principe que idx_whatsapp_failures_unresolved ci-dessus.
     CREATE INDEX IF NOT EXISTS idx_wallet_reconciliation_unresolved ON wallet_reconciliation_alerts(detected_at) WHERE resolved_at IS NULL;
+
+    -- Intégration CashPlus (2026-08-01) — recharge volontaire du wallet Œil en cash via agence,
+    -- voir RECAP_INTEGRATION_CASHPLUS.md et services/cashplus.js. Une ligne par demande de
+    -- génération de token, nécessaire pour l'idempotence du callback (POST /payments/cashplus/
+    -- callback ne doit jamais créditer deux fois) et pour distinguer une demande jamais honorée
+    -- (token simplement expiré, aucune action financière) d'une demande complétée. amount/fees
+    -- sont figés ICI au moment de la génération et ne sont plus jamais recalculés ni fait
+    -- confiance depuis le payload du callback ensuite — même principe que mission_payment_attempts
+    -- pour PayZone : la source de vérité du montant crédité reste toujours ce que Shoofly a décidé,
+    -- jamais un payload externe reçu plus tard. token/date_expiration sont nullable (posés
+    -- seulement après réponse SUCCESS de CashPlus — voir routes/users.js, aucune ligne insérée
+    -- si l'appel échoue, rien à suivre pour une tentative qui n'a jamais existé côté CashPlus).
+    CREATE TABLE IF NOT EXISTS cashplus_recharge_requests (
+      id              SERIAL PRIMARY KEY,
+      request_id      TEXT UNIQUE NOT NULL,
+      oeil_id         TEXT NOT NULL REFERENCES users(id),
+      amount          NUMERIC(10,2) NOT NULL,
+      fees            NUMERIC(10,2) NOT NULL,
+      token           TEXT,
+      date_expiration TIMESTAMPTZ,
+      status          TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','completed','expired')),
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      completed_at    TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_cashplus_requests_oeil ON cashplus_recharge_requests(oeil_id);
+    -- Index partiel : le cron d'expiration (jobs/cashplusExpiry.js) filtre exclusivement sur
+    -- status='pending' — même principe que idx_whatsapp_failures_unresolved ci-dessus.
+    CREATE INDEX IF NOT EXISTS idx_cashplus_requests_pending_expiry ON cashplus_recharge_requests(date_expiration) WHERE status='pending';
   `);
   console.log('✅ PostgreSQL schema ready');
 }
