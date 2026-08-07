@@ -65,7 +65,7 @@ const ticketRoutes = require('./routes/tickets');
 const paymentRoutes = require('./routes/payments');
 
 // ── CORS — liste blanche unique, source de vérité partagée par Express et Socket.IO ──
-const productionOrigins = ['https://shoofly.ma', 'https://www.shoofly.ma', 'https://shoofly.netlify.app', 'https://shoofly-react.vercel.app'];
+const productionOrigins = ['https://shoofly.ma', 'https://www.shoofly.ma', 'https://shoofly-react.vercel.app'];
 const devOrigins = ['http://localhost:5173', 'http://127.0.0.1:5173'];
 const allowedOrigins = [...productionOrigins, ...devOrigins];
 
