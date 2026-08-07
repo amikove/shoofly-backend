@@ -1,16 +1,19 @@
 // Intégration CashPlus (recharge wallet Œil en cash via agence) — voir
 // RECAP_INTEGRATION_CASHPLUS.md pour les décisions métier tranchées. Doc CashPlus fournie par
-// le prestataire (résumé, pas la doc complète) : endpoint ColdFusion classique
-// (index.cfm?endpoint=/generate_token) — d'où le format de date "yyyy-mm-dd HH:nn:ss" (masque
-// ColdFusion, nn=minutes) plutôt qu'ISO 8601, et l'hypothèse form-urlencoded ci-dessous (une
-// gateway index.cfm de ce type lit typiquement le scope FORM ; le champ optionnel "json_data"
-// documenté séparément — une valeur JSON encapsulée dans UN champ plat — renforce cette lecture :
-// si la requête entière était déjà du JSON, ce champ n'aurait pas besoin d'exister à part).
-// Point resté ambigu après lecture du seul résumé fourni, signalé dans le rapport de session :
-// confirmer ce point contre la doc complète ou un premier test réel en sandbox avant prod.
+// le prestataire (résumé, pas la doc complète) : endpoint ColdFusion classique. Format d'URL
+// CORRIGÉ le 2026-08-04 contre un exemple concret fourni par CashPlus : le endpoint est un
+// segment de chemin après index.cfm (index.cfm/generate_token), PAS un paramètre de requête
+// (index.cfm?endpoint=/generate_token) comme le résumé initial le laissait supposer. Le format
+// de date "yyyy-mm-dd HH:nn:ss" (masque ColdFusion, nn=minutes) plutôt qu'ISO 8601, et
+// l'hypothèse form-urlencoded ci-dessous restent des hypothèses non contredites par cet exemple
+// (une gateway index.cfm de ce type lit typiquement le scope FORM ; le champ optionnel
+// "json_data" documenté séparément — une valeur JSON encapsulée dans UN champ plat — renforce
+// cette lecture : si la requête entière était déjà du JSON, ce champ n'aurait pas besoin
+// d'exister à part). Points restés ambigus après lecture du seul résumé fourni, signalés dans le
+// rapport de session : confirmer contre la doc complète ou un test réel en sandbox avant prod.
 const crypto = require('crypto');
 
-const GENERATE_TOKEN_PATH = '/cpws/cpmarchand/index.cfm?endpoint=/generate_token';
+const GENERATE_TOKEN_PATH = '/cpws/cpmarchand/index.cfm/generate_token';
 
 // Montants de recharge autorisés — RECAP §3, pas de montant libre. Validée côté serveur avant
 // tout appel CashPlus (routes/users.js) : jamais de confiance dans un montant envoyé tel quel
