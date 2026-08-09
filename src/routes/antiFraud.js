@@ -486,7 +486,20 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
 // ── POST /anti-fraud/hold-withdrawal/:id ─────────────────
 router.post('/hold-withdrawal/:id', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
-  await db.query(`UPDATE withdrawals SET status='pending', processed_by=NULL WHERE id=$1`, [req.params.id]);
+  // Même garde d'idempotence que PUT /admin/withdrawals/:id (users.js) : un virement déjà
+  // 'paid'/'rejected' est un état terminal — le remettre en 'pending' rouvrirait la porte à
+  // un double crédit (paid -> [remis pending] -> rejected recrédite alors que l'argent est
+  // déjà parti par virement bancaire).
+  const { rows: [w] } = await db.query(
+    `UPDATE withdrawals SET status='pending', processed_by=NULL
+     WHERE id=$1 AND status IN ('pending','approved') RETURNING *`,
+    [req.params.id]
+  );
+  if (!w) {
+    const { rows: [existing] } = await db.query('SELECT id FROM withdrawals WHERE id=$1', [req.params.id]);
+    if (!existing) return res.status(404).json({ error: 'Introuvable' });
+    return res.status(409).json({ error: 'Ce virement a déjà été traité, impossible de le remettre en attente' });
+  }
   res.json({ message: 'Virement mis en attente de vérification' });
 }));
 
