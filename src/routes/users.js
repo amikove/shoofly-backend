@@ -1695,9 +1695,21 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), require
   const emitToUser = req.app.get('emitToUser');
   const { status } = req.body;
   if (!['approved','paid','rejected'].includes(status)) return res.status(400).json({ error: 'Statut invalide' });
-  const { rows: [w] } = await db.query('SELECT * FROM withdrawals WHERE id=$1', [req.params.id]);
-  if (!w) return res.status(404).json({ error: 'Introuvable' });
-  await db.query(`UPDATE withdrawals SET status=$1,processed_by=$2,processed_at=NOW() WHERE id=$3`, [status, req.user.id, req.params.id]);
+
+  // Garde d'idempotence sur l'UPDATE lui-même (WHERE status IN ('pending','approved')) — même
+  // pattern que le callback PayZone (payments.js) : rejouer un changement de statut, ou
+  // inverser payé/rejeté depuis un état déjà terminal, ne fait plus rien (rowCount=0) au lieu
+  // de recréditer en double.
+  const { rows: [w] } = await db.query(
+    `UPDATE withdrawals SET status=$1,processed_by=$2,processed_at=NOW()
+     WHERE id=$3 AND status IN ('pending','approved') RETURNING *`,
+    [status, req.user.id, req.params.id]
+  );
+  if (!w) {
+    const { rows: [existing] } = await db.query('SELECT id FROM withdrawals WHERE id=$1', [req.params.id]);
+    if (!existing) return res.status(404).json({ error: 'Introuvable' });
+    return res.status(409).json({ error: 'Ce virement a déjà été traité' });
+  }
   if (status === 'rejected') {
     await walletService.credit(db, w.oeil_id, 'oeil', w.amount, 'Retrait refusé — solde recrédité', null, { countsAsEarning: false });
     const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Virement refusé','Votre demande a été refusée. Solde recrédité.','info','gains_page',$2,$3,$4) RETURNING *`, [w.oeil_id, 'withdrawalRejectedTitle', 'withdrawalRejectedBody', null]);
