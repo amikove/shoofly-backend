@@ -68,6 +68,10 @@ function signGenerateToken(amount) {
 function verifyCallbackHmac(requestId, receivedHmac) {
   if (!requestId || !receivedHmac || typeof receivedHmac !== 'string') return false;
   const secretKey = process.env.CASHPLUS_SECRET_KEY;
+  // POINT 4 audit sécurité global 08-09 : sans cette garde, un secretKey undefined est coercé
+  // par le template literal en la chaîne "undefined" au lieu de faire échouer la vérification —
+  // fail-open sous cette misconfiguration précise plutôt que fail-closed.
+  if (!secretKey) return false;
   const expectedHex = crypto.createHash('sha256').update(`${requestId}${secretKey}`).digest('hex').toUpperCase();
 
   const expected = Buffer.from(expectedHex, 'utf8');
