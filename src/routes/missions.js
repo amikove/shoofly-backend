@@ -644,6 +644,13 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
     if (!(req.user.role === 'admin' || m.oeil_id === req.user.id)) {
       m.client_phone = null;
     }
+    // Même règle que canSeeChat (GET /:id) — voir sa justification là-bas (POINT 2 audit
+    // sécurité global 08-09). role==='client' est sûr ici : le WHERE ci-dessus filtre déjà
+    // cette liste sur m.client_id=req.user.id pour ce rôle, chaque ligne lui appartient.
+    if (!(req.user.role === 'admin' || req.user.role === 'client' || m.oeil_id === req.user.id)) {
+      m.transfer_reason = null;
+      m.transferred_from = null;
+    }
     m.chat_access_expires_at = chatAccessExpiresAt(m);
   });
   res.json({ missions, total, page: +page, pages: Math.ceil(total / limit) });
@@ -1092,6 +1099,15 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   // n'a aucune raison de voir (faille corrigée le 2026-08-09, cf. audit sécurité : upstream,
   // le seul garde-fou était `mission.status !== 'pending'`, sans lien avec l'appartenance).
   const canSeeChat = isAdmin || req.user.role === 'client' || mission.oeil_id === req.user.id;
+
+  // transfer_reason/transferred_from révèlent qu'un collègue précédent a été bloqué/suspendu,
+  // ou son motif d'urgence en texte libre — même cercle de confiance que canSeeChat ci-dessus
+  // (POINT 2 audit sécurité global 08-09 : jusqu'ici exposés à tout Œil via SELECT m.*, y
+  // compris un simple candidat à la reprise browsant le pool 'pending').
+  if (!canSeeChat) {
+    mission.transfer_reason = null;
+    mission.transferred_from = null;
+  }
 
   const [{ rows: [report] }, { rows: [rating] }] = await Promise.all([
     db.query('SELECT * FROM mission_reports WHERE mission_id=$1', [req.params.id]),
