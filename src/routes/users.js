@@ -110,7 +110,9 @@ router.get('/oeils/:id', authenticate, asyncHandler(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store')
   const db = getDb();
   const { rows: [oeil] } = await db.query(`
-    SELECT u.id,u.first_name,u.last_name,u.city,u.avatar_url,u.created_at,u.reliability_score,p.*
+    SELECT u.id,u.first_name,u.last_name,u.city,u.avatar_url,u.created_at,u.reliability_score,
+      p.bio,p.coverage_zone,p.is_verified,p.is_available,p.rating_avg,p.rating_count,p.total_missions,
+      p.id_verified_at,p.total_earnings,p.balance,p.rejection_reason,p.has_bank_account
     FROM users u JOIN oeil_profiles p ON p.user_id=u.id WHERE u.id=$1 AND u.role='oeil'
   `, [req.params.id]);
   if (!oeil) return res.status(404).json({ error: 'Introuvable' });
@@ -123,13 +125,24 @@ router.get('/oeils/:id', authenticate, asyncHandler(async (req, res) => {
   // assez d'historique pour qu'un score/note affiché soit significatif — on masque
   // les valeurs brutes plutôt que de compter sur le frontend pour respecter le flag.
   // L'admin et l'Œil consultant sa propre fiche voient toujours le vrai score.
-  const showRealScore = req.user.role === 'admin' || oeil.id === req.user.id;
+  const isSelfOrAdmin = req.user.role === 'admin' || oeil.id === req.user.id;
   const newOeilThreshold = await getSetting(db, 'new_oeil_mission_threshold', 10);
   oeil.is_new_oeil = isNewOeil(oeil.total_missions, newOeilThreshold);
-  if (!showRealScore && oeil.is_new_oeil) {
+  if (!isSelfOrAdmin && oeil.is_new_oeil) {
     oeil.reliability_score = null;
     oeil.rating_avg = null;
     oeil.rating_count = null;
+  }
+
+  // Champs financiers/internes — jamais visibles par un tiers (client ou autre Œil),
+  // seulement par l'Œil consultant sa propre fiche ou un admin (faille corrigée le
+  // 2026-08-09 : ce SELECT utilisait p.* et exposait balance/total_earnings à tout
+  // utilisateur authentifié, cf. audit sécurité).
+  if (!isSelfOrAdmin) {
+    delete oeil.total_earnings;
+    delete oeil.balance;
+    delete oeil.rejection_reason;
+    delete oeil.has_bank_account;
   }
 
   // Temps de réponse moyen : métrique indépendante du statut "débutant" —
