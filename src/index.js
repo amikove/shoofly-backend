@@ -139,6 +139,18 @@ const registerLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Rate limit dédié sur le changement de mot de passe (POINT 1 audit sécurité global 08-09) —
+// seule la limite globale 300/15min s'appliquait jusqu'ici, malgré une comparaison du mot de
+// passe actuel côté serveur. Aligné sur registerLimiter (même ordre de grandeur qu'une action
+// sensible légitime mais peu fréquente).
+const passwordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Trop de tentatives de changement de mot de passe. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // Callback PayZone (webhook serveur-à-serveur) : la vérification de signature HMAC (voir
@@ -169,6 +181,7 @@ app.use('/uploads', express.static(path.resolve(process.env.UPLOAD_DIR || './upl
 // ── Routes ────────────────────────────────────────────────
 app.use('/api/auth/login',    loginLimiter);
 app.use('/api/auth/register', registerLimiter);
+app.use('/api/auth/password', passwordLimiter);
 app.use('/api/media',         uploadLimiter);
 app.use('/api/auth',     authRoutes);
 app.use('/api/missions', missionRoutes);
