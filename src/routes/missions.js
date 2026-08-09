@@ -157,6 +157,17 @@ async function prepareMissionInsert(db, clientId, body) {
     commission = 0;
   }
 
+  // Plancher tarifaire serveur (POINT 3 audit sécurité global 08-09) — jusqu'ici min_price
+  // existait en base (settings, seedé à 80 MAD) sans être lu par aucune logique métier ; seule
+  // la validation structurelle isFloat({min:0}) s'appliquait (missionCreateValidators),
+  // acceptant n'importe quel prix >= 0. Exempté pour une mission gratuite via code promo déjà
+  // validée ci-dessus (freePromo non-null) : ce 0 MAD est volontaire, ce n'est pas un tarif
+  // client à plancher.
+  if (!freePromo) {
+    const minPrice = await getSetting(db, 'min_price', 80);
+    if (+price < minPrice) return { error: `Le prix minimum est de ${minPrice} MAD` };
+  }
+
   const status = oeil_id ? 'assigned' : 'pending';
 
   return {
