@@ -47,7 +47,12 @@ function buildPaywallPayload({ customerId, chargeId, price, description, custome
 // falsifiable si on recalculait sur une forme normalisée par nos soins).
 function verifyCallbackSignature(rawBody, signatureHeader) {
   if (!signatureHeader || typeof signatureHeader !== 'string') return false;
-  const expectedHex = crypto.createHmac('sha256', process.env.PAYZONE_NOTIFICATION_KEY).update(rawBody).digest('hex');
+  const notificationKey = process.env.PAYZONE_NOTIFICATION_KEY;
+  // POINT 4 audit sécurité global 08-09 : crypto.createHmac accepte une clé vide ('') sans
+  // broncher — sans cette garde, cette misconfiguration précise vérifierait un HMAC calculé
+  // avec une clé vide au lieu de faire échouer la vérification (fail-open plutôt que fail-closed).
+  if (!notificationKey) return false;
+  const expectedHex = crypto.createHmac('sha256', notificationKey).update(rawBody).digest('hex');
 
   const expected = Buffer.from(expectedHex, 'hex');
   let provided;
