@@ -1072,6 +1072,16 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   const chatGraceExpired = !isAdmin && mission.chat_access_expires_at !== null
     && Date.now() > new Date(mission.chat_access_expires_at).getTime();
 
+  // Le chat/média reste privé au client propriétaire, à l'Œil ACTUELLEMENT assigné et à
+  // l'admin — indépendamment de la garde ci-dessus qui, elle, laisse volontairement tout
+  // Œil consulter les détails publics (titre/prix/adresse...) d'une mission 'pending' pour
+  // décider d'y candidater. Une mission repassée en pending (urgence, refus, expiration de
+  // présence, suspension, blocage anti-fraude) garde l'historique de conversation/médias du
+  // ou des Œil(s) précédent(s) — jamais purgé — qu'un Œil simplement candidat à la reprise
+  // n'a aucune raison de voir (faille corrigée le 2026-08-09, cf. audit sécurité : upstream,
+  // le seul garde-fou était `mission.status !== 'pending'`, sans lien avec l'appartenance).
+  const canSeeChat = isAdmin || req.user.role === 'client' || mission.oeil_id === req.user.id;
+
   const [{ rows: [report] }, { rows: [rating] }] = await Promise.all([
     db.query('SELECT * FROM mission_reports WHERE mission_id=$1', [req.params.id]),
     db.query('SELECT * FROM ratings WHERE mission_id=$1', [req.params.id]),
@@ -1079,7 +1089,7 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
 
   let media = [];
   let messages = [];
-  if (!chatGraceExpired) {
+  if (canSeeChat && !chatGraceExpired) {
     const [mediaRes, messagesRes] = await Promise.all([
       db.query('SELECT * FROM mission_media WHERE mission_id=$1 ORDER BY created_at DESC', [req.params.id]),
       db.query(`SELECT mm.*, u.first_name||' '||u.last_name AS sender_name, u.role AS sender_role
