@@ -57,6 +57,7 @@ const checkPresenceConfirmationDeadlines = missionRoutesModule.checkPresenceConf
 const advanceCandidateCascade = missionRoutesModule.advanceCandidateCascade;
 const hireOeilCore = missionRoutesModule.hireOeilCore;
 const notify = missionRoutesModule.notify;
+const detectSensitiveContent = missionRoutesModule.detectSensitiveContent;
 const sendUrgentWhatsAppWave = missionRoutesModule.sendUrgentWhatsAppWave;
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
@@ -219,18 +220,75 @@ app.use((err, req, res, next) => {
 // Map: userId → Set of socket ids
 const userSockets = new Map();
 
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   const token = socket.handshake.auth?.token;
   if (!token) return next(new Error('Auth manquante'));
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
+    // Même relecture DB qu'au niveau REST (middleware/auth.js authenticate, requêtée à chaque
+    // requête) — un JWT cryptographiquement valide ne suffit pas : un compte bloqué pour
+    // fraude, suspendu, ou dont le mot de passe a changé depuis l'émission du token ne doit
+    // pas pouvoir établir de connexion WebSocket alors qu'il ne peut déjà plus appeler l'API.
+    const db = getDb();
+    const { rows: [user] } = await db.query(
+      'SELECT is_active, is_suspended, password_changed_at FROM users WHERE id=$1', [payload.id]
+    );
+    if (!user || !user.is_active || user.is_suspended) return next(new Error('Compte introuvable ou suspendu'));
+    if (user.password_changed_at && payload.iat * 1000 < new Date(user.password_changed_at).getTime()) {
+      return next(new Error('Session expirée suite à un changement de mot de passe'));
+    }
     socket.userId = payload.id;
     socket.userRole = payload.role;
+    socket.tokenIat = payload.iat;
     next();
   } catch {
     next(new Error('Token invalide'));
   }
 });
+
+function disconnectAllSocketsForUser(uid) {
+  const ids = userSockets.get(uid);
+  if (!ids) return;
+  for (const sid of ids) {
+    io.sockets.sockets.get(sid)?.disconnect(true);
+  }
+}
+
+// Le handshake ci-dessus ne protège que l'instant de la connexion — une connexion WebSocket
+// peut rester ouverte des heures, bien au-delà du prochain appel REST de l'utilisateur (qui,
+// lui, revalide à chaque requête). Cette relecture périodique couvre un blocage/changement de
+// mot de passe survenant APRÈS l'établissement de la connexion. Intervalle configurable pour
+// les tests ; 5 min par défaut, même granularité que la majorité des cron.schedule ci-dessous.
+const SOCKET_REVALIDATION_INTERVAL_MS = parseInt(process.env.SOCKET_REVALIDATION_INTERVAL_MS) || 5 * 60 * 1000;
+let socketRevalidationRunning = false;
+setInterval(async () => {
+  if (socketRevalidationRunning) return;
+  socketRevalidationRunning = true;
+  try {
+    const db = getDb();
+    for (const [socketUid, socketIds] of userSockets) {
+      if (!socketIds.size) continue;
+      const { rows: [user] } = await db.query(
+        'SELECT is_active, is_suspended, password_changed_at FROM users WHERE id=$1', [socketUid]
+      );
+      if (!user || !user.is_active || user.is_suspended) {
+        disconnectAllSocketsForUser(socketUid);
+        continue;
+      }
+      if (user.password_changed_at) {
+        const changedAtMs = new Date(user.password_changed_at).getTime();
+        for (const sid of socketIds) {
+          const s = io.sockets.sockets.get(sid);
+          if (s && s.tokenIat * 1000 < changedAtMs) s.disconnect(true);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('WS revalidation error:', e.message);
+  } finally {
+    socketRevalidationRunning = false;
+  }
+}, SOCKET_REVALIDATION_INTERVAL_MS);
 
 io.on('connection', (socket) => {
   const uid = socket.userId;
@@ -269,9 +327,17 @@ io.on('connection', (socket) => {
       const canMsg = [m.client_id, m.oeil_id].includes(uid) || socket.userRole === 'admin';
       if (!canMsg) return;
 
+      // Même blocage que POST /:id/messages (REST, routes/missions.js) : chat fermé une fois
+      // la mission clôturée — admin exempté (modération sur une mission déjà close, voir
+      // MessagesSuspects.jsx qui réutilise la même route REST).
+      if (socket.userRole !== 'admin' && ['completed', 'cancelled'].includes(m.status)) return;
+
+      const cleanContent = content.trim();
+      const isFlagged = detectSensitiveContent(cleanContent);
+
       const result = await db.query(
-        `INSERT INTO mission_messages (mission_id,sender_id,content,type) VALUES ($1,$2,$3,'text') RETURNING *`,
-        [missionId, uid, content.trim()]
+        `INSERT INTO mission_messages (mission_id,sender_id,content,type,is_flagged) VALUES ($1,$2,$3,'text',$4) RETURNING *`,
+        [missionId, uid, cleanContent, isFlagged]
       );
       const sender = await db.query('SELECT first_name, last_name, role FROM users WHERE id=$1', [uid]);
       const msg = {
@@ -288,8 +354,22 @@ io.on('connection', (socket) => {
       if (recipientId && !userSockets.get(recipientId)?.size) {
         await db.query(
           `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'message',$4,'chat',$5,$6,$7)`,
-          [recipientId, `Message de ${sender.rows[0].first_name}`, content.trim().slice(0, 80), missionId, 'newMessageTitle', null, JSON.stringify({ senderName: sender.rows[0].first_name })]
+          [recipientId, `Message de ${sender.rows[0].first_name}`, cleanContent.slice(0, 80), missionId, 'newMessageTitle', null, JSON.stringify({ senderName: sender.rows[0].first_name })]
         );
+      }
+
+      // Notifier l'admin si message suspect — même pattern que POST /:id/messages (REST).
+      if (isFlagged) {
+        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`);
+        const senderName = `${sender.rows[0].first_name} ${sender.rows[0].last_name}`;
+        const emitToUser = app.get('emitToUser');
+        for (const admin of admins) {
+          await db.query(
+            `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'warning',$4,'admin_messages_suspects',$5,$6,$7)`,
+            [admin.id, '⚠️ Message suspect détecté', `${senderName} a peut-être partagé un contact externe dans la mission "${m.title}"`, missionId, 'suspiciousMessageAdminTitle', 'suspiciousMessageAdminBody', JSON.stringify({ senderName, missionTitle: m.title })]
+          );
+          if (emitToUser) emitToUser(admin.id, 'notification', { title: '⚠️ Message suspect détecté', body: `${senderName} — mission "${m.title}"`, missionId });
+        }
       }
     } catch (e) { console.error('WS message error:', e.message); }
   });
@@ -299,10 +379,14 @@ io.on('connection', (socket) => {
     if (!missionId || !lat || !lng) return;
     try {
       const db = getDb();
-      await db.query(
+      const result = await db.query(
         `UPDATE missions SET oeil_lat=$1, oeil_lng=$2, oeil_location_at=NOW() WHERE id=$3 AND oeil_id=$4`,
         [lat, lng, missionId, uid]
       );
+      // Ne diffuser que si la ligne a réellement été mise à jour — sinon n'importe quel Œil
+      // authentifié pouvait injecter de fausses coordonnées GPS dans une room qui n'est pas la
+      // sienne (même correctif que POST /:id/location, routes/missions.js).
+      if (result.rowCount === 0) return;
       // Broadcast to mission room (client sees it live)
       io.to(`mission:${missionId}`).emit('location_update', { lat, lng, oeil_id: uid, timestamp: new Date() });
     } catch (e) { console.error('WS location error:', e.message); }
