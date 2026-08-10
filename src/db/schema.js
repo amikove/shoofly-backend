@@ -893,6 +893,30 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- Index partiel : le cron d'expiration (jobs/cashplusExpiry.js) filtre exclusivement sur
     -- status='pending' — même principe que idx_whatsapp_failures_unresolved ci-dessus.
     CREATE INDEX IF NOT EXISTS idx_cashplus_requests_pending_expiry ON cashplus_recharge_requests(date_expiration) WHERE status='pending';
+
+    -- "Mot de passe oublié" (2026-08-10) — 2 colonnes sur users plutôt qu'une table dédiée : au
+    -- plus UN token actif par utilisateur à la fois (règle métier "dernier token demandé = seul
+    -- valide"), donc une simple paire nullable suffit et rend cette invariante STRUCTURELLE
+    -- plutôt qu'à faire respecter par une requête — une nouvelle demande écrase directement
+    -- l'ancien hash/expiration (UPDATE), aucun DELETE explicite des anciens tokens nécessaire.
+    -- Jamais le token en clair en base : password_reset_token_hash stocke un SHA-256 hex du
+    -- token (généré via crypto.randomBytes côté route). PAS bcrypt comme pour les mots de passe
+    -- utilisateur : bcrypt sale aléatoirement à chaque hash, ce qui empêche tout lookup direct
+    -- (WHERE password_reset_token_hash=$1 ; il faudrait comparer ligne par ligne). SHA-256
+    -- convient ici précisément parce que le token est déjà à haute entropie (32 octets
+    -- crypto.randomBytes, jamais choisi/deviné par un humain) — la propriété recherchée est
+    -- l'irréversibilité en cas de fuite de la base, pas la résistance au brute-force qui
+    -- justifie un hash lent pour un mot de passe. Voir routes/auth.js (hashResetToken) et
+    -- services/email.js (sendPasswordResetEmail). IMPORTANT : safe() dans routes/auth.js strip
+    -- ces 2 colonnes de toute réponse — ne jamais les exposer via SELECT * + safe() sans vérifier
+    -- que le strip est toujours en place si safe() est un jour modifié.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token_hash TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ;
+    -- Unique + partiel (comme idx_whatsapp_failures_unresolved) : accélère le lookup par token
+    -- (reset-password) et garantit qu'une collision SHA-256 entre 2 utilisateurs — astronomiquement
+    -- improbable mais pas structurellement impossible — échouerait bruyamment plutôt que de
+    -- laisser un des deux tokens écraser silencieusement l'autre en recherche.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_password_reset_token_hash ON users(password_reset_token_hash) WHERE password_reset_token_hash IS NOT NULL;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

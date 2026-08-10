@@ -1,19 +1,29 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
+const { sendPasswordResetEmail } = require('../services/email');
 const {
   PROFIL_OPTIONS, SITUATION_OPTIONS, MOTIVATION_OPTIONS,
   USAGE_REASON_OPTIONS, USAGE_FREQUENCY_OPTIONS, DISPONIBILITE_OPTIONS,
 } = require('../constants/registrationOptions');
 
 const makeToken = (user) => jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
-const safe = ({ password, ...u }) => u;
+// password_reset_token_hash/password_reset_expires_at (db/schema.js) strippés ici au même titre
+// que password : ce sont des colonnes internes (hash SHA-256 + expiration d'un token de
+// réinitialisation), jamais à exposer même à l'utilisateur propriétaire du compte.
+const safe = ({ password, password_reset_token_hash, password_reset_expires_at, ...u }) => u;
+// SHA-256 hex, PAS bcrypt — voir le commentaire détaillé sur password_reset_token_hash dans
+// db/schema.js (bcrypt sale aléatoirement, ce qui rend impossible un lookup par
+// `WHERE password_reset_token_hash=$1`; SHA-256 convient précisément parce que le token en
+// entrée est déjà à haute entropie, jamais un secret choisi par un humain).
+const hashResetToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
 
 router.post('/register', [
   body('email').isEmail().normalizeEmail(),
@@ -197,6 +207,82 @@ router.put('/password', authenticate, asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Mot de passe actuel incorrect' });
   await db.query('UPDATE users SET password=$1, password_changed_at=NOW() WHERE id=$2', [bcrypt.hashSync(req.body.new_password, 10), req.user.id]);
   res.json({ message: 'Mot de passe modifié' });
+}));
+
+// Message et code HTTP strictement IDENTIQUES que l'email corresponde à un compte ou non — même
+// principe que /login (message générique "Email ou mot de passe incorrect", jamais "email
+// inconnu"). La réponse est envoyée sans attendre la fin de l'envoi de l'email (fire-and-forget,
+// voir plus bas) : si on l'attendait, le round-trip réseau vers Resend rendrait la branche
+// "email existant" mesurablement plus lente que la branche "email inconnu" (qui ne fait qu'un
+// SELECT), ce qui serait exactement l'oracle de timing que ce endpoint doit éviter.
+router.post('/forgot-password', [
+  body('email').isEmail().normalizeEmail(),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const db = getDb();
+  const { rows: [user] } = await db.query('SELECT id, first_name FROM users WHERE email=$1', [req.body.email]);
+
+  if (user) {
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = hashResetToken(rawToken);
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1h
+
+    // Écrase directement tout token précédent encore valide pour cet utilisateur — l'invariant
+    // "dernier token demandé = seul valide" est structurel ici (une seule paire de colonnes par
+    // utilisateur), aucun DELETE explicite d'anciens tokens n'est nécessaire (voir db/schema.js).
+    await db.query(
+      'UPDATE users SET password_reset_token_hash=$1, password_reset_expires_at=$2 WHERE id=$3',
+      [tokenHash, expiresAt, user.id]
+    );
+
+    // Fire-and-forget délibéré (voir commentaire au-dessus de la route) — sendPasswordResetEmail
+    // (services/email.js) ne lance déjà jamais d'erreur (même contrat que sendWhatsAppTemplate),
+    // le .catch() ici est un filet de sécurité supplémentaire : une exception non interceptée
+    // dans une promesse non attendue deviendrait un unhandledRejection global, qui CRASHE le
+    // process entier (voir le handler process.on('unhandledRejection') dans index.js).
+    sendPasswordResetEmail(req.body.email, user.first_name, rawToken)
+      .catch((err) => console.error('[forgot-password] échec inattendu de l\'envoi email', err?.message));
+  }
+
+  res.json({ message: 'Si un compte existe avec cet email, un lien de réinitialisation a été envoyé.' });
+}));
+
+router.post('/reset-password', [
+  body('token').notEmpty(),
+  body('newPassword').isLength({ min: 6 }),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const db = getDb();
+  const tokenHash = hashResetToken(req.body.token);
+
+  // UPDATE atomique unique plutôt que SELECT puis UPDATE séparés : le WHERE porte à la fois sur
+  // le hash ET l'expiration, et RETURNING id dit si une ligne a réellement matché. Ceci rend la
+  // consommation du token intrinsèquement à usage unique même sous concurrence — si deux requêtes
+  // arrivent avec le même token valide en même temps, Postgres sérialise les deux UPDATE sur la
+  // même ligne ; la première gagne et vide password_reset_token_hash, la seconde ne trouve alors
+  // plus aucune ligne correspondante (rowCount=0) et échoue proprement, sans fenêtre de double-usage.
+  const { rows: [user] } = await db.query(
+    `UPDATE users SET
+       password=$1,
+       password_changed_at=NOW(),
+       password_reset_token_hash=NULL,
+       password_reset_expires_at=NULL
+     WHERE password_reset_token_hash=$2 AND password_reset_expires_at > NOW()
+     RETURNING id`,
+    [bcrypt.hashSync(req.body.newPassword, 10), tokenHash]
+  );
+
+  if (!user) return res.status(400).json({ error: 'Lien invalide ou expiré. Veuillez refaire une demande de réinitialisation.' });
+
+  // password_changed_at vient d'être posé — réutilise le mécanisme d'invalidation JWT déjà en
+  // place (middleware/auth.js + revalidation Socket.IO périodique dans index.js) : toute session
+  // ouverte avant cet instant (y compris via le mot de passe qu'on vient de remplacer) devient
+  // invalide au prochain appel, sans code supplémentaire à écrire ici.
+  res.json({ message: 'Mot de passe réinitialisé avec succès.' });
 }));
 
 module.exports = router;
