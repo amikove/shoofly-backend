@@ -152,6 +152,32 @@ const passwordLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Rate limit dédié sur "mot de passe oublié" (2026-08-10) — DEUX limiteurs empilés, pas un
+// seul : un attaquant qui change d'IP (proxy/botnet) doit rester bloqué par email demandé, sinon
+// il peut spammer la boîte mail d'un tiers indéfiniment en tournant les IP ; à l'inverse, limiter
+// seulement par email laisserait un attaquant énumérer des emails variés depuis une IP fixe sans
+// jamais être freiné. Même ordre de grandeur (5/15min) que registerLimiter/passwordLimiter
+// ci-dessus — action sensible mais légitimement peu fréquente. keyGenerator de
+// forgotPasswordEmailLimiter lit req.body.email : sûr ici car ce middleware est monté (plus bas)
+// après express.json() global, donc le body est déjà parsé au moment où il s'exécute — repli sur
+// req.ip si l'email est absent du payload pour ne jamais partager un seau unique "unknown" entre
+// requêtes sans email.
+const forgotPasswordIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Trop de demandes de réinitialisation. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const forgotPasswordEmailLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => (req.body?.email || req.ip || 'unknown').toString().trim().toLowerCase(),
+  message: { error: 'Trop de demandes de réinitialisation pour cet email. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // Callback PayZone (webhook serveur-à-serveur) : la vérification de signature HMAC (voir
@@ -183,6 +209,7 @@ app.use('/uploads', express.static(path.resolve(process.env.UPLOAD_DIR || './upl
 app.use('/api/auth/login',    loginLimiter);
 app.use('/api/auth/register', registerLimiter);
 app.use('/api/auth/password', passwordLimiter);
+app.use('/api/auth/forgot-password', forgotPasswordIpLimiter, forgotPasswordEmailLimiter);
 app.use('/api/media',         uploadLimiter);
 app.use('/api/auth',     authRoutes);
 app.use('/api/missions', missionRoutes);
