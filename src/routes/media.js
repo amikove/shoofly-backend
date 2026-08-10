@@ -30,15 +30,19 @@ const upload = multer({
 fileFilter: (req, file, cb) => {
     file.originalname = file.originalname.replace(/[&<>"'`%;()]/g, '')
     const allowed = /jpeg|jpg|png|webp|mp4|mov/;
-    if (allowed.test(file.mimetype) || allowed.test(file.originalname)) cb(null, true);
+    if (allowed.test(file.mimetype) && allowed.test(file.originalname)) cb(null, true);
     else cb(new Error('Type de fichier non supporté'));
   }
 });
 
 // ── POST /api/media/:missionId ────────────────────────────
-router.post('/:missionId', authenticate, upload.array('files', 10), asyncHandler(async (req, res) => {
+// L'autorisation doit être vérifiée AVANT tout upload Cloudinary — sinon n'importe quel
+// utilisateur authentifié force un envoi réel (consommation de stockage) sur une mission qui
+// n'est pas la sienne, avant même de savoir si la requête sera acceptée. `upload.array`
+// déclenche l'upload dès le traitement multer (CloudinaryStorage._handleFile), pas après —
+// donc ce middleware doit être placé AVANT lui dans la chaîne, jamais après.
+async function checkMissionUploadAuthorization(req, res, next) {
   const db = getDb();
-
   const { rows: [mission] } = await db.query(
     'SELECT * FROM missions WHERE id=$1', [req.params.missionId]
   );
@@ -53,6 +57,13 @@ router.post('/:missionId', authenticate, upload.array('files', 10), asyncHandler
     return res.status(400).json({ error: 'Mission non active' });
   }
 
+  req.mission = mission;
+  next();
+}
+
+router.post('/:missionId', authenticate, asyncHandler(checkMissionUploadAuthorization), upload.array('files', 10), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const mission = req.mission;
   const inserted = [];
 
   for (const file of req.files || []) {
