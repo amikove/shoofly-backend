@@ -1573,10 +1573,15 @@ router.post('/:id/location', authenticate, requireRole('oeil'), [
 
   const db = getDb();
   const { lat, lng } = req.body;
-  await db.query(
+  const result = await db.query(
     `UPDATE missions SET oeil_lat=$1, oeil_lng=$2, oeil_location_at=NOW() WHERE id=$3 AND oeil_id=$4`,
     [lat, lng, req.params.id, req.user.id]
   );
+  // Ne diffuser que si la ligne a réellement été mise à jour (mission existante ET appelant
+  // bien l'Œil assigné) — sinon n'importe quel Œil authentifié pouvait injecter de fausses
+  // coordonnées GPS dans une room qui n'est pas la sienne, la mise à jour DB étant silencieuse
+  // (0 ligne affectée) alors que la diffusion socket, elle, partait quand même.
+  if (result.rowCount === 0) return res.status(403).json({ error: 'Accès refusé' });
   // Also broadcast via socket
   req.app.get('io').to(`mission:${req.params.id}`).emit('location_update', { lat, lng, timestamp: new Date() });
   res.json({ lat, lng });
@@ -1610,6 +1615,31 @@ router.post('/:id/report', authenticate, requireRole('oeil','admin'), [
   res.status(201).json({ report });
 }));
 
+
+// Détection de contenu sensible — module-level (pas nichée dans la route) pour être réutilisable
+// par le handler socket send_message (index.js), qui doit appliquer exactement la même règle.
+function detectSensitiveContent(text) {
+  const normalized = text
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/[.\-_\/\\|]/g, '')
+    .replace(/zero/g, '0').replace(/zéro/g, '0')
+    .replace(/un/g, '1').replace(/deux/g, '2')
+    .replace(/trois/g, '3').replace(/quatre/g, '4')
+    .replace(/cinq/g, '5').replace(/six/g, '6')
+    .replace(/sept/g, '7').replace(/huit/g, '8')
+    .replace(/neuf/g, '9')
+
+  const patterns = [
+    /0[567]\d{8}/,
+    /\+212\d{9}/,
+    /\d{10}/,
+    /@(gmail|hotmail|yahoo|outlook|live|icloud)/,
+    /(whatsapp|telegram|instagram|facebook|tiktok|snapchat|signal)/,
+    /(http|www\.|\.com|\.ma|\.net|\.org)/,
+  ]
+  return patterns.some(p => p.test(normalized))
+}
 
 // ── POST /:id/messages ─────────────────────────────────
 router.post('/:id/messages', authenticate, asyncHandler(async (req, res) => {
@@ -1645,30 +1675,7 @@ router.post('/:id/messages', authenticate, asyncHandler(async (req, res) => {
 
 const cleanContent = content.trim()
 
-// Détection de contenu sensible
-function detectSensitiveContent(text) {
-  const normalized = text
-    .toLowerCase()
-    .replace(/\s+/g, '')
-    .replace(/[.\-_\/\\|]/g, '')
-    .replace(/zero/g, '0').replace(/zéro/g, '0')
-    .replace(/un/g, '1').replace(/deux/g, '2')
-    .replace(/trois/g, '3').replace(/quatre/g, '4')
-    .replace(/cinq/g, '5').replace(/six/g, '6')
-    .replace(/sept/g, '7').replace(/huit/g, '8')
-    .replace(/neuf/g, '9')
-
-  const patterns = [
-    /0[567]\d{8}/,
-    /\+212\d{9}/,
-    /\d{10}/,
-    /@(gmail|hotmail|yahoo|outlook|live|icloud)/,
-    /(whatsapp|telegram|instagram|facebook|tiktok|snapchat|signal)/,
-    /(http|www\.|\.com|\.ma|\.net|\.org)/,
-  ]
-  return patterns.some(p => p.test(normalized))
-}
-
+// Détection de contenu sensible (fonction module-level ci-dessus)
 const isFlagged = detectSensitiveContent(cleanContent)
 
 const { rows: [msg] } = await db.query(
@@ -3357,4 +3364,5 @@ router.notifyNewMission = notifyNewMission;
 router.sendUrgentWhatsAppWave = sendUrgentWhatsAppWave;
 router.missionCreateValidators = missionCreateValidators;
 router.missionCreateLimiter = missionCreateLimiter;
+router.detectSensitiveContent = detectSensitiveContent;
 module.exports = router;
