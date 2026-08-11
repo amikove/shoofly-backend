@@ -1827,6 +1827,36 @@ router.get('/admin/identity-requests', authenticate, requireRole('admin'), requi
   const db = getDb();
   const { status = 'pending' } = req.query;
 
+  // status=pending seulement : élargie pour inclure aussi les Œils inscrits n'ayant encore soumis
+  // aucun document (sinon structurellement invisibles ici bien que badgés "En attente" côté onglet
+  // Œils — RAPPORT_DIAGNOSTIC_QUARTIERS_VIDES_ET_OEIL_EN_ATTENTE.md, Bug 2). Tout autre status
+  // retombe ci-dessous sur la requête d'origine, strictement inchangée.
+  if (status === 'pending') {
+    const { rows } = await db.query(`
+        SELECT d.id, d.user_id, d.cin_recto, d.cin_verso, d.selfie, d.status, d.rejected_reason,
+               d.reviewed_by, d.reviewed_at, d.created_at,
+               u.first_name, u.last_name, u.email, u.phone, u.city, u.avatar_url,
+               'pending' AS request_status
+        FROM identity_documents d
+        JOIN users u ON u.id=d.user_id
+        WHERE d.status=$1
+
+        UNION ALL
+
+        SELECT NULL::integer, u.id, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+               NULL::text, NULL::timestamptz, u.created_at,
+               u.first_name, u.last_name, u.email, u.phone, u.city, u.avatar_url,
+               'not_submitted' AS request_status
+        FROM users u
+        LEFT JOIN oeil_profiles p ON p.user_id=u.id
+        WHERE u.role='oeil' AND COALESCE(p.is_verified, false)=false
+          AND NOT EXISTS (SELECT 1 FROM identity_documents d2 WHERE d2.user_id=u.id)
+
+        ORDER BY created_at ASC
+      `, [status]);
+    return res.json({ requests: rows });
+  }
+
   const { rows } = await db.query(`
       SELECT d.*, u.first_name, u.last_name, u.email, u.phone, u.city, u.avatar_url
       FROM identity_documents d
@@ -1834,8 +1864,8 @@ router.get('/admin/identity-requests', authenticate, requireRole('admin'), requi
       WHERE d.status=$1
       ORDER BY d.created_at ASC
     `, [status]);
-    res.json({ requests: rows });
-  }));
+  res.json({ requests: rows });
+}));
 
 // ── POST /users/admin/identity-requests/:id/approve ──
 router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
