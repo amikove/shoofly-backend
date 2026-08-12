@@ -1960,6 +1960,7 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
         transferred_from: oeilId,
         transfer_reason: reason,
         transfer_deadline: deadline,
+        transfer_no_penalty: skipReliabilityPenalty,
         oeil_id: null,
       },
       extraGuards: { oeil_id: oeilId },
@@ -2516,18 +2517,34 @@ async function checkTransferDeadlines(db, io, emitToUser) {
     // ici pour cette même raison.
     closeMissionChatRoom(io, mission.id);
 
-    // Pénalité aggravée sur l'Œil 1 si pendant mission
+    // Pénalité aggravée sur l'Œil 1 si pendant mission — la pénalité (financière + fiabilité)
+    // est sautée quand la libération d'origine est marquée transfer_no_penalty (URGENCE,
+    // suspension admin, confirmation de présence non reçue — voir les 3 sites qui posent ce flag
+    // et RAPPORT_CORRECTIF_PENALITE_DIFFEREE.md). Le cooldown et transfer_no_replacement_count
+    // restent posés SANS EXCEPTION dans tous les cas (même principe que le cooldown de
+    // releaseMissionForReplacement, 2026-07-30 : une indisponibilité réelle rend l'Œil
+    // temporairement indisponible pour de nouvelles missions, urgence authentique ou non — seule
+    // la pénalité financière/fiabilité est conditionnée par transfer_no_penalty).
 if (mission.transfer_type === 'during' && mission.transferred_from) {
-        // Débit plafonné au solde réel (voir même pattern commenté en détail dans le cron H+30,
-        // index.js) : lockBalance + debit() dans la même transaction pour que le montant journalisé
-        // ne dépasse jamais ce qui a réellement été déduit.
-        await walletService.withTransaction(db, async (client) => {
-          const currentBalance = await walletService.lockBalance(client, mission.transferred_from, 'oeil');
-          const deducted = Math.min(100, currentBalance || 0);
-          if (deducted > 0) {
-            await walletService.debit(client, mission.transferred_from, 'oeil', deducted, 'Pénalité — aucun remplaçant trouvé', mission.id);
-          }
-        });
+        if (!mission.transfer_no_penalty) {
+          // Débit plafonné au solde réel (voir même pattern commenté en détail dans le cron H+30,
+          // index.js) : lockBalance + debit() dans la même transaction pour que le montant journalisé
+          // ne dépasse jamais ce qui a réellement été déduit.
+          await walletService.withTransaction(db, async (client) => {
+            const currentBalance = await walletService.lockBalance(client, mission.transferred_from, 'oeil');
+            const deducted = Math.min(100, currentBalance || 0);
+            if (deducted > 0) {
+              await walletService.debit(client, mission.transferred_from, 'oeil', deducted, 'Pénalité — aucun remplaçant trouvé', mission.id);
+            }
+          });
+          await logReliabilityEvent(db, mission.transferred_from, mission.id, -70, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
+
+          await emitToUser?.(mission.transferred_from, 'notification', {
+            title: '⚠️ Pénalité appliquée',
+            body: `Aucun remplaçant n'a été trouvé pour "${mission.title}". -100 MAD déduits.`,
+            type: 'warning'
+          });
+        }
         const abandonCooldownHours = await getSetting(db, 'abandon_during_mission_cooldown_hours', 48);
         await db.query(`
           UPDATE users SET
@@ -2535,17 +2552,9 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
             transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $2::numeric
           WHERE id=$1
         `, [mission.transferred_from, abandonCooldownHours]);
-        await logReliabilityEvent(db, mission.transferred_from, mission.id, -70, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
-
-      await emitToUser?.(mission.transferred_from, 'notification', {
-        title: '⚠️ Pénalité appliquée',
-        body: `Aucun remplaçant n'a été trouvé pour "${mission.title}". -100 MAD déduits.`,
-        type: 'warning'
-      });
-      
-       } else if (mission.transfer_type === 'before' && mission.transferred_from) {
+       } else if (mission.transfer_type === 'before' && mission.transferred_from && !mission.transfer_no_penalty) {
       await logReliabilityEvent(db, mission.transferred_from, mission.id, -10, 'Transfert avant démarrage sans remplaçant trouvé', true);
-   
+
     }
 
 // Remboursement client — annulation par le système (aucun remplaçant trouvé), non imputable au client : intégral
@@ -2614,6 +2623,7 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
           transferred_from: oeilId,
           transfer_reason: 'Confirmation de présence non reçue avant expiration du délai',
           transfer_deadline: deadline,
+          transfer_no_penalty: true,
           oeil_id: null,
           presence_confirmed_at: null,
           presence_confirmation_requested_at: null,

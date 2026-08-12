@@ -1464,6 +1464,7 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
               transferred_from: req.params.id,
               transfer_reason: 'Compte prestataire suspendu par un administrateur',
               transfer_deadline: deadline,
+              transfer_no_penalty: true,
               oeil_id: null,
             },
             note: 'Réattribution automatique — Œil suspendu par un admin',
