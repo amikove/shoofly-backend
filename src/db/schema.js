@@ -376,6 +376,12 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS transferred_from TEXT REFERENCES users(id);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_reason TEXT;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_deadline TIMESTAMPTZ;
+    -- Distingue une libération "sans faute" (URGENCE, suspension admin, confirmation de présence
+    -- non reçue) d'un abandon ordinaire — checkTransferDeadlines lit ce flag pour ne jamais
+    -- pénaliser (score ni argent) une mission qui provient d'un de ces 3 chemins, même si aucun
+    -- remplaçant n'est trouvé avant l'échéance (RAPPORT_CORRECTIF_PENALITE_DIFFEREE.md). Flag
+    -- explicite plutôt qu'une déduction depuis transferred_from : plus robuste, plus auditable.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_no_penalty BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS oeil2_id TEXT REFERENCES users(id);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS replacement_preference TEXT NOT NULL DEFAULT 'fast' CHECK(replacement_preference IN ('fast','choose'));
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS candidate_window_ends_at TIMESTAMPTZ;
