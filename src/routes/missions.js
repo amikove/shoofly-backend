@@ -1461,6 +1461,12 @@ router.post('/:id/status', authenticate, [
   }
 
   if (status === 'cancelled' && req.user.role === 'admin' && req.body.refund_percent !== undefined) {
+    // Mission cash (2026-08-13) : Shoofly n'a jamais encaissé le client, quel que soit le
+    // pourcentage demandé — aucun montant à rembourser. Vérifié avant la permission finance
+    // ci-dessous : une règle d'intégrité financière absolue, indépendante de qui la demande.
+    if (mission.payment_method === 'cash') {
+      return res.status(400).json({ error: 'refund_percent indisponible sur une mission cash : Shoofly n\'a jamais encaissé le client, il n\'y a rien à rembourser.' });
+    }
     const hasFinancePermission = req.user.is_super_admin ||
       (Array.isArray(req.user.permissions) && req.user.permissions.includes('finance'));
     if (!hasFinancePermission) {
