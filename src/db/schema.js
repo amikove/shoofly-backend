@@ -923,6 +923,51 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- improbable mais pas structurellement impossible — échouerait bruyamment plutôt que de
     -- laisser un des deux tokens écraser silencieusement l'autre en recherche.
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_password_reset_token_hash ON users(password_reset_token_hash) WHERE password_reset_token_hash IS NOT NULL;
+
+    -- Modèle de paiement cash (2026-08-13) — voir RAPPORT_DIAGNOSTIC_COHERENCE_CASH_VS_PAYZONE.md.
+    -- 'cash' : le client paie l'Œil directement en espèces, Shoofly n'encaisse jamais rien en
+    -- ligne — au lieu de créditer oeil_earning à la validation (comme pour 'payzone'), Shoofly
+    -- DÉBITE sa commission du wallet Œil (voir settleCashCommission, utils/cashCommission.js,
+    -- appelée depuis POST /:id/validate et les autres points de validation, routes/missions.js).
+    -- 'payzone' : comportement hérité strictement inchangé (paiement en ligne réel, jamais
+    -- confirmé opérationnel en prod à ce jour — voir diagnostic cité ci-dessus).
+    -- Nullable (pas de valeur par défaut, pas de backfill) : les missions déjà existantes avant
+    -- cette migration restent à NULL, hors périmètre de cette session — seule la création de
+    -- NOUVELLES missions impose cette valeur, en 400 côté API (prepareMissionInsert), jamais via
+    -- une contrainte NOT NULL ici (même raisonnement que users_profil_check plus haut : ne jamais
+    -- bloquer le démarrage sur des lignes historiques). CHECK ci-dessous : IN() laisse NULL passer
+    -- (logique ternaire SQL), donc n'entrave pas les lignes historiques tout en bloquant déjà
+    -- toute valeur future hors 'cash'/'payzone' — même motif que missions.transfer_type ci-dessus.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS payment_method TEXT CHECK(payment_method IN ('cash','payzone'));
+
+    -- Manque à gagner sur la commission cash (2026-08-13) — décision produit : un solde Œil
+    -- insuffisant à la validation ne bloque JAMAIS la mission (voir settleCashCommission) ; le
+    -- débit est plafonné au solde disponible (jamais négatif — la contrainte CHECK(balance>=0)
+    -- sur oeil_profiles, ci-dessus, reste intacte et n'a pas besoin d'être affaiblie) et toute
+    -- différence entre la commission due et la commission réellement collectée est journalisée
+    -- ici pour rester visible côté admin (voir GET/PUT .../admin/commission-shortfalls,
+    -- routes/users.js) au lieu de rester invisible dans les seuls logs serveur. Volontairement
+    -- une table séparée de wallet_reconciliation_alerts plutôt qu'une réutilisation : cette
+    -- dernière signale un solde stocké qui NE CORRESPOND PAS au ledger (une anomalie/bug à
+    -- investiguer) — un manque à gagner cash ne crée aucune divergence de ce type (balance et
+    -- ledger avancent ensemble, du même montant réellement débité), ce serait donc sémantiquement
+    -- faux d'y mélanger les deux et risquerait de noyer de vraies anomalies dans du bruit attendu.
+    -- resolved_at : même contrat que wallet_reconciliation_alerts (jamais posé automatiquement,
+    -- seulement par action admin explicite).
+    CREATE TABLE IF NOT EXISTS mission_commission_shortfalls (
+      id                    SERIAL PRIMARY KEY,
+      mission_id            TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      oeil_id               TEXT NOT NULL REFERENCES users(id),
+      commission_due        NUMERIC(10,2) NOT NULL,
+      commission_collected  NUMERIC(10,2) NOT NULL,
+      shortfall             NUMERIC(10,2) NOT NULL,
+      created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      resolved_at           TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_commission_shortfalls_oeil ON mission_commission_shortfalls(oeil_id);
+    -- Index partiel : même principe que idx_wallet_reconciliation_unresolved ci-dessus (le cron/
+    -- la vue admin par défaut filtrent tous deux sur resolved_at IS NULL).
+    CREATE INDEX IF NOT EXISTS idx_commission_shortfalls_unresolved ON mission_commission_shortfalls(created_at) WHERE resolved_at IS NULL;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

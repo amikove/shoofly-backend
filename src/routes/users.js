@@ -7,6 +7,7 @@ const { requirePermission } = require('../middleware/permissions');
 const { refundOnCancellation } = require('../utils/refund');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const walletService = require('../services/walletService');
+const { settleCashCommission } = require('../utils/cashCommission');
 const cashplusService = require('../services/cashplus');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
@@ -1619,18 +1620,31 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   // contre deux admins résolvant la même réclamation simultanément (la 2e requête
   // reçoit STALE_STATE -> 409, aucune double écriture possible).
   let refund;
+  // Rempli uniquement pour decision='oeil' + payment_method='cash' — voir
+  // routes/missions.js POST /:id/validate pour la même logique et sa justification détaillée.
+  let cashSettlement = null;
   try {
     await walletService.withTransaction(db, async (client) => {
       if (decision === 'oeil') {
-        await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Mission validée après réclamation', mission.id);
+        if (mission.payment_method === 'payzone') {
+          await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Mission validée après réclamation', mission.id);
+        } else {
+          cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (réclamation résolue en faveur de l\'Œil)');
+        }
         await transitionMission(client, mission.id, 'sous_reclamation', 'completed', req.user.id, {
           extraFields: { validated_at: 'NOW()', is_priority: false },
           note: 'Réclamation résolue en faveur de l\'Œil',
         });
         await client.query(`UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
       } else {
-        // Réclamation gagnée par le client, non imputable à lui : remboursement intégral
-        refund = await refundOnCancellation(client, mission, false, 'Remboursement suite à réclamation');
+        // Réclamation gagnée par le client, non imputable à lui : remboursement intégral —
+        // uniquement pour 'payzone' (Shoofly a réellement encaissé le client en ligne). Pour
+        // 'cash', refundOnCancellation n'est jamais appelée : le client a payé l'Œil directement
+        // en espèces, Shoofly n'a jamais rien à lui recréditer (garde-fou explicite de la
+        // session — refund.js reste intact, seul ce point d'appel est conditionné).
+        refund = mission.payment_method === 'payzone'
+          ? await refundOnCancellation(client, mission, false, 'Remboursement suite à réclamation')
+          : 0;
         await transitionMission(client, mission.id, 'sous_reclamation', 'cancelled', req.user.id, {
           extraFields: { is_priority: false },
           note: 'Réclamation résolue en faveur du client',
@@ -1664,10 +1678,18 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   }
 
   if (decision === 'oeil') {
-    await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.', 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
+    if (cashSettlement) {
+      await notify(mission.oeil_id, '✅ Réclamation résolue', `Résolue en votre faveur. ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { amount: cashSettlement.collected });
+    } else {
+      await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.', 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
+    }
     await notify(mission.client_id, 'Réclamation résolue', 'Résolue en faveur de l\'Œil.', 'claimResolvedClientLoseTitle', 'claimResolvedClientLoseBody', null);
   } else {
-    await notify(mission.client_id, '✅ Réclamation résolue', `${refund} MAD crédités sur votre portefeuille.`, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', { amount: refund });
+    if (mission.payment_method === 'cash') {
+      await notify(mission.client_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Mission annulée.', 'claimResolvedClientWinCashTitle', 'claimResolvedClientWinCashBody', null);
+    } else {
+      await notify(mission.client_id, '✅ Réclamation résolue', `${refund} MAD crédités sur votre portefeuille.`, 'claimResolvedOeilWinTitle', 'claimResolvedClientWinBody', { amount: refund });
+    }
     await notify(mission.oeil_id, 'Réclamation résolue', 'Résolue en faveur du client.', 'claimResolvedClientLoseTitle', 'claimResolvedOeilLoseBody', null);
   }
 
@@ -1782,6 +1804,50 @@ router.put('/admin/wallet-reconciliation-alerts/:id/resolve', authenticate, requ
   );
   if (!alert) return res.status(404).json({ error: 'Alerte introuvable ou déjà résolue' });
   res.json({ alert });
+}));
+
+// ── GET /users/admin/commission-shortfalls — manques à gagner sur la commission cash (voir
+// schema.js, mission_commission_shortfalls, et settleCashCommission, utils/cashCommission.js) —
+// pagination + filtre statut, mêmes conventions que GET .../wallet-reconciliation-alerts
+// ci-dessus. Volontairement une route/table séparée plutôt qu'une réutilisation de
+// wallet-reconciliation-alerts : cette dernière signale un solde stocké qui NE CORRESPOND PAS
+// au ledger (anomalie à investiguer) — un manque à gagner cash n'en crée aucune (balance et
+// ledger avancent ensemble), ce serait donc sémantiquement faux de les mélanger. Permission
+// 'finance' (même bucket que la réconciliation wallet et les réclamations) : donnée financière.
+router.get('/admin/commission-shortfalls', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { status = 'unresolved', page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
+
+  let wc = '';
+  if (status === 'unresolved') wc = 'WHERE s.resolved_at IS NULL';
+  else if (status === 'resolved') wc = 'WHERE s.resolved_at IS NOT NULL';
+  else if (status !== 'all') return res.status(400).json({ error: 'Statut invalide (unresolved, resolved, all)' });
+
+  const { rows } = await db.query(
+    `SELECT s.*, m.title AS mission_title
+     FROM mission_commission_shortfalls s
+     JOIN missions m ON m.id = s.mission_id
+     ${wc} ORDER BY s.created_at DESC LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  const { rows: [{ n: total }] } = await db.query(`SELECT COUNT(*)::int AS n FROM mission_commission_shortfalls s ${wc}`);
+
+  res.json({ shortfalls: rows, total, page: +page, pages: Math.ceil(total / limit) });
+}));
+
+// ── PUT /users/admin/commission-shortfalls/:id/resolve — clôture explicite d'un manque à gagner
+// par un admin (ex: l'Œil a régularisé via une recharge CashPlus, ou l'admin a décidé de
+// l'absorber) — même contrat que .../wallet-reconciliation-alerts/:id/resolve : ne recalcule ni
+// ne corrige rien, marque seulement qu'un humain a traité le cas.
+router.put('/admin/commission-shortfalls/:id/resolve', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows: [shortfall] } = await db.query(
+    `UPDATE mission_commission_shortfalls SET resolved_at = NOW() WHERE id = $1 AND resolved_at IS NULL RETURNING *`,
+    [req.params.id]
+  );
+  if (!shortfall) return res.status(404).json({ error: 'Manque à gagner introuvable ou déjà résolu' });
+  res.json({ shortfall });
 }));
 
 // ── POST /users/oeil/identity — upload documents identité ──
