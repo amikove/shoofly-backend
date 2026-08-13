@@ -37,7 +37,11 @@ router.post('/payzone/init', missionCreateLimiter, authenticate, requireRole('cl
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   const db = getDb();
-  const { error, insert } = await prepareMissionInsert(db, req.user.id, req.body);
+  // forcedPaymentMethod: cette route est structurellement le seul chemin PayZone — le choix est
+  // déjà déterminé sans ambiguïté par la route elle-même, jamais par le corps de la requête (voir
+  // prepareMissionInsert, routes/missions.js). Garde ce flux byte-identique à avant l'ajout du
+  // modèle cash : aucun nouveau champ n'est exigé du client ici.
+  const { error, insert } = await prepareMissionInsert(db, req.user.id, req.body, { forcedPaymentMethod: 'payzone' });
   if (error) return res.status(400).json({ error });
 
   // Le montant réellement facturé au client est insert.price (celui après réduction promo

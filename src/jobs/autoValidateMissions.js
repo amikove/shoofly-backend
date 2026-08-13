@@ -1,6 +1,7 @@
 const { getSetting } = require('../utils/settings');
 const { logStatus } = require('../utils/missionHistory');
 const walletService = require('../services/walletService');
+const { settleCashCommission } = require('../utils/cashCommission');
 
 // Job horaire (appelé depuis index.js via cron) — valide et paie automatiquement
 // les missions restées 'completed' sans réponse du client au-delà du délai configuré
@@ -36,28 +37,38 @@ async function runAutoValidateMissions(db) {
           return;
         }
 
-        if (mission.transfer_type === 'during') {
-          await client.query(`UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`, [mission.id]);
-          const { rows: chain } = await client.query(
-            `SELECT oeil_id, started_at, ended_at FROM mission_transfer_chain WHERE mission_id=$1 ORDER BY sequence_order ASC`,
-            [mission.id]
-          );
-          if (chain.length > 0) {
-            const durations = chain.map(c => Math.max(0, new Date(c.ended_at) - new Date(c.started_at)));
-            const totalDuration = durations.reduce((s, d) => s + d, 0);
-            for (let i = 0; i < chain.length; i++) {
-              const link = chain[i];
-              const share = totalDuration > 0
-                ? Math.round(mission.oeil_earning * (durations[i] / totalDuration) * 100) / 100
-                : Math.round((mission.oeil_earning / chain.length) * 100) / 100;
-              await client.query(`UPDATE mission_transfer_chain SET earning_share=$1 WHERE mission_id=$2 AND oeil_id=$3`, [share, mission.id, link.oeil_id]);
-              await walletService.credit(client, link.oeil_id, 'oeil', share, 'Part mission — transfert au prorata (validation automatique)', mission.id);
+        if (mission.payment_method === 'payzone') {
+          if (mission.transfer_type === 'during') {
+            await client.query(`UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`, [mission.id]);
+            const { rows: chain } = await client.query(
+              `SELECT oeil_id, started_at, ended_at FROM mission_transfer_chain WHERE mission_id=$1 ORDER BY sequence_order ASC`,
+              [mission.id]
+            );
+            if (chain.length > 0) {
+              const durations = chain.map(c => Math.max(0, new Date(c.ended_at) - new Date(c.started_at)));
+              const totalDuration = durations.reduce((s, d) => s + d, 0);
+              for (let i = 0; i < chain.length; i++) {
+                const link = chain[i];
+                const share = totalDuration > 0
+                  ? Math.round(mission.oeil_earning * (durations[i] / totalDuration) * 100) / 100
+                  : Math.round((mission.oeil_earning / chain.length) * 100) / 100;
+                await client.query(`UPDATE mission_transfer_chain SET earning_share=$1 WHERE mission_id=$2 AND oeil_id=$3`, [share, mission.id, link.oeil_id]);
+                await walletService.credit(client, link.oeil_id, 'oeil', share, 'Part mission — transfert au prorata (validation automatique)', mission.id);
+              }
+            } else {
+              await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Validation automatique après délai (paiement intégral)', mission.id);
             }
           } else {
-            await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Validation automatique après délai (paiement intégral)', mission.id);
+            await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Validation automatique après délai', mission.id);
           }
         } else {
-          await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Validation automatique après délai', mission.id);
+          // Mission cash (2026-08-13) — voir routes/missions.js POST /:id/validate pour la même
+          // logique et sa justification détaillée (débit de mission.oeil_id, pas de split par
+          // chaîne pour la commission).
+          if (mission.transfer_type === 'during') {
+            await client.query(`UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`, [mission.id]);
+          }
+          await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (validation automatique après délai)');
         }
 
         await logStatus(client, mission.id, 'completed', null, 'Validation automatique après délai sans réponse du client');

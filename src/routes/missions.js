@@ -17,6 +17,7 @@ const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const { isValidSubcategory } = require('../constants/missionCategories');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
+const { checkCashCommissionBalance, settleCashCommission } = require('../utils/cashCommission');
 const { generateUniqueReference } = require('../utils/ticketReference');
 
 
@@ -80,7 +81,7 @@ function chatAccessExpiresAt(mission) {
 // lectures pour validation) — retourne { error } ou { insert, freePromo } prêts pour
 // insertMissionRecord ci-dessous. Comportement strictement identique à l'ancien code
 // inline de POST /missions.
-async function prepareMissionInsert(db, clientId, body) {
+async function prepareMissionInsert(db, clientId, body, opts = {}) {
   const {
     type, title, description, address, city, quartier, scheduled_at,
     duration_est, price, is_urgent, oeil_id,
@@ -90,6 +91,20 @@ async function prepareMissionInsert(db, clientId, body) {
     promo_code, discount,
     replacement_preference,
   } = body;
+
+  // Modèle de paiement cash (2026-08-13) — voir schema.js (missions.payment_method) et
+  // RAPPORT_DIAGNOSTIC_COHERENCE_CASH_VS_PAYZONE.md. Obligatoire, aucune valeur par défaut
+  // implicite : une mission payante doit toujours déclarer explicitement qui encaisse.
+  // opts.forcedPaymentMethod : réservé à POST /payments/payzone/init (routes/payments.js), qui
+  // n'a jamais demandé ce champ au client et ne doit pas commencer à l'exiger maintenant — le
+  // choix 'payzone' y est déjà déterminé sans ambiguïté par la route elle-même. Sans cet opt,
+  // ce chemin recevrait 400 pour un champ qu'aucun appelant existant n'envoie, ce qui romprait
+  // "payzone reste identique au bit près" (garde-fou explicite de la session). Pour POST
+  // /missions (aucun opt fourni), la valeur vient uniquement de body.payment_method.
+  const paymentMethod = opts.forcedPaymentMethod || body.payment_method;
+  if (!['cash', 'payzone'].includes(paymentMethod)) {
+    return { error: "payment_method invalide ou manquant (attendu : 'cash' ou 'payzone')" };
+  }
 
   const canonicalCity = resolveCity(city);
   if (!canonicalCity) return { error: 'Ville invalide' };
@@ -168,6 +183,18 @@ async function prepareMissionInsert(db, clientId, body) {
     if (+price < minPrice) return { error: `Le prix minimum est de ${minPrice} MAD` };
   }
 
+  // Réservation directe cash (oeil_id fourni à la création) : seul point d'affectation où un
+  // Œil est attaché à la mission AVANT que celle-ci existe, donc AVANT que mission.commission
+  // soit une colonne lisible — on vérifie ici sur la valeur locale `commission` fraîchement
+  // calculée ci-dessus (identique à ce que la ligne aurait une fois insérée). N'exécute jamais
+  // rien pour 'payzone' (checkCashCommissionBalance court-circuite déjà sur commission<=0, mais
+  // la garde explicite ci-dessous documente l'intention et évite un appel DB inutile pour le cas
+  // de très loin le plus fréquent).
+  if (oeil_id && paymentMethod === 'cash') {
+    const balanceCheck = await checkCashCommissionBalance(db, oeil_id, commission);
+    if (balanceCheck.error) return { error: balanceCheck.error };
+  }
+
   const status = oeil_id ? 'assigned' : 'pending';
 
   return {
@@ -176,7 +203,7 @@ async function prepareMissionInsert(db, clientId, body) {
       duration_est, price, commission, oeil_earning, is_urgent, oeil_id,
       property_type, visit_type, video_call, institution, purpose,
       company_name, audit_type, frequency, criteria, subcategory,
-      promo_code, discount, replacement_preference, status,
+      promo_code, discount, replacement_preference, status, payment_method: paymentMethod,
     },
     freePromo,
   };
@@ -194,7 +221,7 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
     duration_est, price, commission, oeil_earning, is_urgent, oeil_id,
     property_type, visit_type, video_call, institution, purpose,
     company_name, audit_type, frequency, criteria, subcategory,
-    promo_code, discount, replacement_preference, status,
+    promo_code, discount, replacement_preference, status, payment_method,
   } = insertData;
 
   const id = uuidv4();
@@ -203,15 +230,15 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
       id,client_id,type,subcategory,status,title,description,address,city,quartier,scheduled_at,
       duration_est,price,commission,oeil_earning,is_urgent,
       property_type,visit_type,video_call,institution,purpose,
-      company_name,audit_type,frequency,criteria,oeil_id,replacement_preference
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+      company_name,audit_type,frequency,criteria,oeil_id,replacement_preference,payment_method
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
     RETURNING *
   `, [
     id, clientId, type, subcategory||null, status, title, description||null, address, city, quartier,
     new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
     !!is_urgent, property_type||null, visit_type||null, !!video_call,
     institution||null, purpose||null, company_name||null, audit_type||null,
-    frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast'
+    frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast', payment_method
   ]);
 
   // Mission offerte via code promo gratuit : Shoofly paie l'Œil de sa poche, sans commission générée.
@@ -339,12 +366,15 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
   if (mission.status !== 'completed') return res.status(400).json({ error: 'Mission non terminée' });
   if (mission.validated_at) return res.status(400).json({ error: 'Mission déjà validée' });
 
-  // Toutes les écritures interdépendantes (validated_at, chaîne de transfert, crédit(s)
+  // Toutes les écritures interdépendantes (validated_at, chaîne de transfert, crédit(s)/débit
   // wallet, ledger, historique) dans une seule transaction — avant ce correctif, un crash
   // entre deux de ces étapes pouvait laisser une mission "validée" sans que le paiement
   // correspondant ait été appliqué (ou l'inverse). partialPayments accumule les paiements
   // au prorata pour notifier APRÈS le commit (jamais de notify() dans la transaction).
   const partialPayments = [];
+  // Rempli uniquement pour payment_method='cash' (voir bloc cash ci-dessous) — sert au choix du
+  // message post-commit (débit affiché, jamais "crédité").
+  let cashSettlement = null;
   try {
     await walletService.withTransaction(db, async (client) => {
       const { rowCount } = await client.query(
@@ -357,36 +387,54 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
         throw err;
       }
 
-      if (mission.transfer_type === 'during') {
-        // Split au prorata du temps réel de chaque Œil dans la chaîne de transferts —
-        // fonctionne peu importe le nombre de transferts (remplace l'ancien split 50/50 figé à 2 Œils).
-        await client.query(
-          `UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`,
-          [mission.id]
-        );
-        const { rows: chain } = await client.query(
-          `SELECT oeil_id, started_at, ended_at FROM mission_transfer_chain WHERE mission_id=$1 ORDER BY sequence_order ASC`,
-          [mission.id]
-        );
-        if (chain.length > 0) {
-          const durations = chain.map(c => Math.max(0, new Date(c.ended_at) - new Date(c.started_at)));
-          const totalDuration = durations.reduce((s, d) => s + d, 0);
-          for (let i = 0; i < chain.length; i++) {
-            const link = chain[i];
-            const share = totalDuration > 0
-              ? Math.round(mission.oeil_earning * (durations[i] / totalDuration) * 100) / 100
-              : Math.round((mission.oeil_earning / chain.length) * 100) / 100; // repli si durées nulles (cas limite)
-            await client.query(`UPDATE mission_transfer_chain SET earning_share=$1 WHERE mission_id=$2 AND oeil_id=$3`, [share, mission.id, link.oeil_id]);
-            await walletService.credit(client, link.oeil_id, 'oeil', share, 'Part mission — transfert au prorata', mission.id);
-            partialPayments.push({ oeilId: link.oeil_id, share });
+      if (mission.payment_method === 'payzone') {
+        if (mission.transfer_type === 'during') {
+          // Split au prorata du temps réel de chaque Œil dans la chaîne de transferts —
+          // fonctionne peu importe le nombre de transferts (remplace l'ancien split 50/50 figé à 2 Œils).
+          await client.query(
+            `UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`,
+            [mission.id]
+          );
+          const { rows: chain } = await client.query(
+            `SELECT oeil_id, started_at, ended_at FROM mission_transfer_chain WHERE mission_id=$1 ORDER BY sequence_order ASC`,
+            [mission.id]
+          );
+          if (chain.length > 0) {
+            const durations = chain.map(c => Math.max(0, new Date(c.ended_at) - new Date(c.started_at)));
+            const totalDuration = durations.reduce((s, d) => s + d, 0);
+            for (let i = 0; i < chain.length; i++) {
+              const link = chain[i];
+              const share = totalDuration > 0
+                ? Math.round(mission.oeil_earning * (durations[i] / totalDuration) * 100) / 100
+                : Math.round((mission.oeil_earning / chain.length) * 100) / 100; // repli si durées nulles (cas limite)
+              await client.query(`UPDATE mission_transfer_chain SET earning_share=$1 WHERE mission_id=$2 AND oeil_id=$3`, [share, mission.id, link.oeil_id]);
+              await walletService.credit(client, link.oeil_id, 'oeil', share, 'Part mission — transfert au prorata', mission.id);
+              partialPayments.push({ oeilId: link.oeil_id, share });
+            }
+          } else {
+            // Filet de sécurité : transfer_type='during' mais aucune ligne de chaîne trouvée
+            // (ne devrait plus arriver avec le nouveau système, mais protège les missions en transition).
+            await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Mission validée (paiement intégral)', mission.id);
           }
         } else {
-          // Filet de sécurité : transfer_type='during' mais aucune ligne de chaîne trouvée
-          // (ne devrait plus arriver avec le nouveau système, mais protège les missions en transition).
-          await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Mission validée (paiement intégral)', mission.id);
+          await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Validation client', mission.id);
         }
       } else {
-        await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Validation client', mission.id);
+        // Mission cash (2026-08-13) : le client a déjà payé l'Œil directement en espèces — pas
+        // de crédit d'oeil_earning (peu importe transfer_type — voir settleCashCommission pour
+        // la justification de débiter mission.oeil_id, l'Œil qui détient la mission au moment de
+        // la validation, plutôt qu'un split au prorata de la chaîne : la commission est un
+        // montant unique par mission, pas par tronçon, et chaque Œil de la chaîne a déjà été
+        // vérifié individuellement contre ce même montant à son affectation, voir hireOeilCore).
+        // Ferme quand même la chaîne de transfert (ended_at) pour laisser un historique cohérent,
+        // même si earning_share n'a aucun sens à calculer ici (rien n'est crédité).
+        if (mission.transfer_type === 'during') {
+          await client.query(
+            `UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`,
+            [mission.id]
+          );
+        }
+        cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (validation client)');
       }
 
       await logStatus(client, mission.id, 'completed', req.user.id, 'Validée par le client (paiement libéré)');
@@ -400,7 +448,11 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
   for (const p of partialPayments) {
     await notify(db, p.oeilId, '💰 Paiement partiel reçu', `${p.share} MAD crédités — votre part de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'partialPaymentReceivedTitle', 'partialPaymentReceivedBody', {amount: p.share, missionTitle: mission.title});
   }
-  await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'paymentReceivedOeilTitle', 'paymentReceivedOeilBody', {missionTitle: mission.title, amount: mission.oeil_earning});
+  if (cashSettlement) {
+    await notify(db, mission.oeil_id, '✅ Mission validée', `Le client a validé "${mission.title}". ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', {missionTitle: mission.title, amount: cashSettlement.collected});
+  } else {
+    await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'paymentReceivedOeilTitle', 'paymentReceivedOeilBody', {missionTitle: mission.title, amount: mission.oeil_earning});
+  }
   await notify(db, mission.client_id, '✅ Mission validée', `Vous avez validé "${mission.title}".`, 'info', mission.id, emitToUser, null, 'missionValidatedClientTitle', 'missionValidatedClientBody', {missionTitle: mission.title});
 
   res.json({ ok: true });
@@ -690,12 +742,16 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), miss
   const { error, insert, freePromo } = await prepareMissionInsert(db, req.user.id, req.body);
   if (error) return res.status(400).json({ error });
 
-  // Création directe réservée aux missions gratuites (price=0, promo 'free' ou aucune) —
-  // toute mission payante doit passer par POST /payments/payzone/init, seule voie qui
-  // collecte réellement le paiement. Sans cette garde, un client pouvait appeler cette
-  // route directement (hors frontend) avec un price>0 et obtenir une mission réelle,
-  // assignable et payant l'Œil, sans jamais payer quoi que ce soit.
-  if (+insert.price > 0) {
+  // Création directe réservée aux missions gratuites (price=0, promo 'free' ou aucune) et,
+  // depuis le modèle cash (2026-08-13), à toute mission payment_method='cash' — le client y
+  // paie l'Œil directement en espèces, il n'y a donc rien à faire encaisser à Shoofly avant
+  // création (voir prepareMissionInsert pour la vérification de solde wallet côté Œil, quand un
+  // oeil_id est fourni). Pour payment_method='payzone', comportement STRICTEMENT inchangé :
+  // toute mission payante doit passer par POST /payments/payzone/init, seule voie qui collecte
+  // réellement le paiement. Sans cette garde, un client pouvait appeler cette route directement
+  // (hors frontend) avec un price>0 et obtenir une mission réelle, assignable et payant l'Œil,
+  // sans jamais payer quoi que ce soit.
+  if (+insert.price > 0 && insert.payment_method !== 'cash') {
     return res.status(400).json({ error: 'Paiement requis pour cette mission — utilisez POST /payments/payzone/init.' });
   }
 
@@ -1168,7 +1224,18 @@ router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async
   const { rows: [profile] } = await db.query('SELECT is_verified FROM oeil_profiles WHERE user_id=$1', [req.user.id]);
   if (!profile?.is_verified) return res.status(403).json({ error: 'Profil non vérifié' });
 
-  
+  // Mission cash (2026-08-13) : ce chemin d'affectation n'appelait jusqu'ici aucun contrôle de
+  // la famille checkOeilAssignable (déjà signalé, hors périmètre de ce correctif) — le solde
+  // wallet doit néanmoins y être vérifié comme sur les 3 autres points d'affectation réels
+  // (prepareMissionInsert, hireOeilCore, assign-admin), sans quoi un Œil pourrait contourner le
+  // contrôle en acceptant directement plutôt qu'en passant par une candidature. N'exécute rien
+  // pour 'payzone'.
+  if (mission.payment_method === 'cash') {
+    const balanceCheck = await checkCashCommissionBalance(db, req.user.id, mission.commission);
+    if (balanceCheck.error) return res.status(400).json({ error: balanceCheck.error });
+  }
+
+
     // Valeur calculée ici (dépend de is_priority/transferred_from lus juste au-dessus)
     // car transitionMission ne prend que des valeurs statiques, pas des expressions SQL.
     const oeil2Id = (mission.is_priority === true && mission.transferred_from !== null) ? req.user.id : mission.oeil2_id;
@@ -1484,9 +1551,30 @@ router.post('/:id/status', authenticate, [
       // 1) c'est lui-même qui annule, 2) un admin annule en précisant que la faute lui revient
       const initiatedByClient = req.user.role === 'client'
         || (req.user.role === 'admin' && req.body.client_at_fault === true);
-      refund = await refundOnCancellation(db, mission, initiatedByClient);
+      // Mission cash (2026-08-13) : refundOnCancellation n'est appelée QUE pour 'payzone' —
+      // Shoofly n'a jamais encaissé le client d'une mission cash (il paie l'Œil directement en
+      // espèces), donc "rembourser" n'a aucun sens ici. refund.js n'est jamais modifié ; seul ce
+      // point d'appel est conditionné (garde-fou explicite de la session).
+      refund = mission.payment_method === 'payzone'
+        ? await refundOnCancellation(db, mission, initiatedByClient)
+        : 0;
 
-    if (initiatedByClient) {
+    if (mission.payment_method === 'cash') {
+      // Aucun langage de remboursement pour cash, quel que soit initiatedByClient — Shoofly n'a
+      // jamais rien encaissé à rendre. Même ventilation client/Œil que les branches payzone
+      // ci-dessous (WhatsApp Œil inclus), seul le texte/la clé change.
+      await notify(db, mission.client_id, 'Mission annulée', `"${mission.title}" a été annulée.`, 'info', mission.id, emitToUser, null, 'missionCancelledCashClientTitle', 'missionCancelledCashClientBody', {missionTitle: mission.title});
+      // oeil_id !== req.user.id suffit à couvrir les 2 cas réunis ici (client/admin à l'origine :
+      // toujours vrai, un client/admin n'est jamais l'oeil_id de la mission ; Œil à l'origine :
+      // exclut sa propre notification, même logique que la branche admin/système ci-dessous).
+      if (mission.oeil_id && mission.oeil_id !== req.user.id) {
+        await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
+        const { rows: [oeilContactCancelCash] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.oeil_id]);
+        if (oeilContactCancelCash?.phone) {
+          await sendWhatsAppTemplate(waselTemplates.mission_cancelled_oeil.template_name, oeilContactCancelCash.phone, [mission.title, 'Annulée']);
+        }
+      }
+    } else if (initiatedByClient) {
       if (!mission.oeil_id) {
         await notify(db, mission.client_id, '💰 Remboursement intégral', `${refund} MAD crédités sur votre portefeuille.`, 'info', mission.id, emitToUser, null, 'fullRefundTitle', 'fullRefundBody', {amount: refund});
       } else if (refund > 0) {
@@ -2204,9 +2292,16 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
   if (mission.status !== 'sous_reclamation') return res.status(409).json({ error: 'Cette demande a déjà été traitée' });
 
   if (action === 'validate') {
+    // Rempli uniquement pour payment_method='cash' — voir POST /:id/validate ci-dessus pour la
+    // même logique et sa justification détaillée.
+    let cashSettlement = null;
     try {
       await walletService.withTransaction(db, async (client) => {
-        await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée par le client (paiement intégral)', mission.id);
+        if (mission.payment_method === 'payzone') {
+          await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée par le client (paiement intégral)', mission.id);
+        } else {
+          cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (assistance validée par le client)');
+        }
         await transitionMission(client, mission.id, 'sous_reclamation', 'completed', req.user.id, {
           extraFields: { validated_at: 'NOW()', is_priority: false },
           note: 'Assistance mission validée par le client',
@@ -2221,7 +2316,11 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
       throw e;
     }
 
-    await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé votre déclaration d'assistance sur "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceValidatedOeilTitle', 'assistanceValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
+    if (cashSettlement) {
+      await notify(db, mission.oeil_id, '✅ Confirmé', `Le client a validé votre déclaration d'assistance sur "${mission.title}". ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { missionTitle: mission.title, amount: cashSettlement.collected });
+    } else {
+      await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé votre déclaration d'assistance sur "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceValidatedOeilTitle', 'assistanceValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
+    }
     await notify(db, mission.client_id, '✅ Confirmé', `Vous avez validé la déclaration de l'Œil pour "${mission.title}".`, 'info', mission.id, emitToUser, null, 'assistanceValidatedClientTitle', 'assistanceValidatedClientBody', { missionTitle: mission.title });
 
     if (io) {
@@ -2369,6 +2468,15 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
       overridable: true,
     });
     if (assignCheck.error) return res.status(400).json({ error: assignCheck.error });
+
+    // Mission cash (2026-08-13) : solde wallet requis pour couvrir la commission — TOUJOURS
+    // bloquant, contrairement à la suspension/l'anti-fraude/le cooldown ci-dessous, jamais
+    // overridable par l'admin (règle métier explicite : le mécanisme de commission prépayée
+    // n'a pas de dérogation). N'exécute rien pour 'payzone'.
+    if (mission.payment_method === 'cash') {
+      const cashBalanceCheck = await checkCashCommissionBalance(db, oeil_id, mission.commission);
+      if (cashBalanceCheck.error) return res.status(400).json({ error: cashBalanceCheck.error });
+    }
 
     // Suspension / blocage anti-fraude / cooldown de transfert : bloqué par défaut, mais l'admin
     // peut passer outre avec confirmation explicite (override_warning, mécanisme préexistant —
@@ -2558,22 +2666,39 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
     }
 
 // Remboursement client — annulation par le système (aucun remplaçant trouvé), non imputable au client : intégral
-      const refund = await refundOnCancellation(db, mission, false, 'Remboursement — aucun Œil disponible');
+      // Mission cash (2026-08-13) : refundOnCancellation n'est appelée QUE pour 'payzone' —
+      // Shoofly n'a jamais encaissé le client d'une mission cash. refund.js n'est jamais
+      // modifié ; seul ce point d'appel est conditionné (garde-fou explicite de la session).
+      const refund = mission.payment_method === 'payzone'
+        ? await refundOnCancellation(db, mission, false, 'Remboursement — aucun Œil disponible')
+        : 0;
+      const cancelBody = mission.payment_method === 'cash'
+        ? `Aucun Œil disponible pour "${mission.title}".`
+        : `Aucun Œil disponible pour "${mission.title}". Remboursement intégral effectué.`;
 
     await emitToUser?.(mission.client_id, 'notification', {
       title: '❌ Mission annulée',
-      body: `Aucun Œil disponible pour "${mission.title}". Remboursement intégral effectué.`,
+      body: cancelBody,
       type: 'error'
     });
 
     await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,'❌ Mission annulée','Aucun Œil disponible. Remboursement intégral effectué.','error',$2,'mission_view',$3,$4,$5)`,
-      [mission.client_id, mission.id, 'missionCancelledNoReplacementTitle', 'missionCancelledNoReplacementBody', null]
+      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,'❌ Mission annulée',$2,'error',$3,'mission_view',$4,$5,$6)`,
+      [mission.client_id, cancelBody, mission.id, 'missionCancelledNoReplacementTitle', 'missionCancelledNoReplacementBody', null]
     );
 
-    const { rows: [clientContactNoReplacement] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-    if (clientContactNoReplacement?.phone) {
-      await sendWhatsAppTemplate(waselTemplates.mission_cancelled_no_replacement_client.template_name, clientContactNoReplacement.phone, [mission.title, `${refund} MAD`]);
+    // Gabarit WhatsApp approuvé pour cette notification affirme explicitement un montant
+    // remboursé ({{2}}, voir config/waselTemplates.js) — texte figé côté Wasel/Meta, pas
+    // réécrivable ici. Aucun remboursement n'existant pour une mission cash, l'envoyer
+    // reviendrait à affirmer au client un remboursement qui n'a pas eu lieu : sauté pour
+    // 'cash' plutôt qu'envoyé avec un montant trompeur (0 MAD). Nécessiterait un gabarit dédié
+    // approuvé séparément si ce message doit un jour exister pour le cash — hors périmètre de
+    // cette session (voir rapport).
+    if (mission.payment_method === 'payzone') {
+      const { rows: [clientContactNoReplacement] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+      if (clientContactNoReplacement?.phone) {
+        await sendWhatsAppTemplate(waselTemplates.mission_cancelled_no_replacement_client.template_name, clientContactNoReplacement.phone, [mission.title, `${refund} MAD`]);
+      }
     }
   }
 }
@@ -2719,6 +2844,20 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   if (assignCheck.error) {
     const status = assignCheck.code === 'suspended_or_blocked' ? 403 : 400;
     return { ok: false, status, error: assignCheck.error };
+  }
+
+  // Mission cash (2026-08-13) : en plus de checkOeilAssignable ci-dessus, vérifie que le wallet
+  // de l'Œil couvre la commission de cette mission — appelant partagé par POST /:id/hire/:oeilId
+  // (client choisit un candidat) et la résolution automatique de départage de la cascade par lot
+  // (index.js) : les deux profitent de ce contrôle sans duplication. Retour {ok:false} déjà géré
+  // par les deux appelants exactement comme un échec de checkOeilAssignable (index.js retente au
+  // prochain tick, POST /:id/hire/:oeilId renvoie l'erreur telle quelle). N'exécute rien pour
+  // 'payzone'.
+  if (mission.payment_method === 'cash') {
+    const balanceCheck = await checkCashCommissionBalance(db, oeilId, mission.commission);
+    if (balanceCheck.error) {
+      return { ok: false, status: 400, error: balanceCheck.error };
+    }
   }
 
   // candidate_window_ends_at, pending_candidate_id et batch_tiebreak_ends_at remis à NULL ici
@@ -3324,6 +3463,9 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
       continue;
     }
 
+    // Rempli uniquement pour payment_method='cash' — voir POST /:id/validate pour la même
+    // logique et sa justification détaillée.
+    let cashSettlement = null;
     try {
       await walletService.withTransaction(db, async (client) => {
         const { rowCount } = await client.query(
@@ -3332,7 +3474,11 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
         );
         if (rowCount === 0) return; // déjà traitée entre-temps (réponse client juste avant ce tick)
 
-        await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée automatiquement (délai client dépassé)', mission.id);
+        if (mission.payment_method === 'payzone') {
+          await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée automatiquement (délai client dépassé)', mission.id);
+        } else {
+          cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (assistance auto-validée après délai)');
+        }
         await transitionMission(client, mission.id, 'sous_reclamation', 'completed', null, {
           extraFields: { validated_at: 'NOW()', is_priority: false },
           note: 'Assistance mission auto-validée après délai sans réponse du client',
@@ -3346,7 +3492,11 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
       throw e;
     }
 
-    await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedOeilTitle', 'assistanceAutoValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
+    if (cashSettlement) {
+      await notify(db, mission.oeil_id, 'Mission clôturée automatiquement', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { missionTitle: mission.title, amount: cashSettlement.collected });
+    } else {
+      await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedOeilTitle', 'assistanceAutoValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
+    }
     await notify(db, mission.client_id, 'Mission clôturée automatiquement', `Vous n'avez pas répondu à temps concernant "${mission.title}" — la déclaration de l'Œil a été considérée comme acceptée.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedClientTitle', 'assistanceAutoValidatedClientBody', { missionTitle: mission.title });
 
     // Ce chemin transitionne sous_reclamation -> completed sans passer par POST /:id/status
