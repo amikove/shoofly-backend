@@ -710,16 +710,22 @@ initDb().then(() => {
         AND m.is_priority = false
       `, [autoTransferMinutes, alertWindowMinutes]);
 
-      const transferCooldownHours = await getSetting(db, 'transfer_cooldown_hours', 4);
+      const transferCooldownBeforeHours = await getSetting(db, 'transfer_cooldown_before_hours', 3);
       for (const m of lateH30) {
         // Pénalité fiabilité — le score est entièrement recalculé par logReliabilityEvent ci-dessous,
         // pas besoin de le décrémenter manuellement ici (ancien code mort, toujours écrasé après coup).
+        // Cooldown — cette mission est structurellement 'before' (jamais démarrée ; transfer_type
+        // mis à 'before' juste plus bas), donc même formule 'before' que releaseMissionForReplacement
+        // (missions.js) : ancrée sur scheduled_at, pas sur l'instant du tick. L'ancien code posait
+        // à tort la formule 'during' (transfer_cooldown_hours, ancrée NOW()) — jusqu'à 2h05 de
+        // cooldown en trop vs. un Œil ayant déclaré URGENCE quelques minutes plus tôt pour la même
+        // situation (RAPPORT_COOLDOWN_H30_FORMULE.md).
         await db.query(
           `UPDATE users SET
-            transfer_cooldown_until = NOW() + INTERVAL '1 hour' * $1::numeric,
+            transfer_cooldown_until = GREATEST($3::timestamptz - INTERVAL '1 hour', NOW()) + INTERVAL '1 hour' * $1::numeric,
             transfer_count = transfer_count + 1
            WHERE id = $2`,
-          [transferCooldownHours, m.oeil_id]
+          [transferCooldownBeforeHours, m.oeil_id, m.scheduled_at]
         );
         // Le débit journalisé doit être plafonné au solde réel de l'Œil — sinon la ligne
         // wallet_transactions afficherait -100 alors que balance n'a baissé que du solde
@@ -760,7 +766,7 @@ initDb().then(() => {
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
            VALUES ($1, '⚠️ Pénalité appliquée', $2, 'error', $3, 'reliability_page', $4, $5, $6)`,
-          [m.oeil_id, `Vous n'avez pas démarré "${m.title}" à l'heure. -100 MAD déduits et cooldown 4h appliqué.`, m.id,
+          [m.oeil_id, `Vous n'avez pas démarré "${m.title}" à l'heure. -100 MAD déduits et cooldown 3h appliqué.`, m.id,
            'penaltyAppliedTitle', 'penaltyAppliedBody', JSON.stringify({ missionTitle: m.title })]
         );
 
