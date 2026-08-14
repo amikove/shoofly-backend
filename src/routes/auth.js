@@ -244,7 +244,7 @@ router.post('/forgot-password', [
     // le .catch() ici est un filet de sécurité supplémentaire : une exception non interceptée
     // dans une promesse non attendue deviendrait un unhandledRejection global, qui CRASHE le
     // process entier (voir le handler process.on('unhandledRejection') dans index.js).
-    sendPasswordResetEmail(req.body.email, user.first_name, rawToken)
+    sendPasswordResetEmail(req.body.email, user.first_name, rawToken, passwordResetTokenExpiryHours)
       .catch((err) => console.error('[forgot-password] échec inattendu de l\'envoi email', err?.message));
   }
 
