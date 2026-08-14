@@ -15,6 +15,7 @@ const { getSetting, invalidateSettingsCache } = require('../utils/settings');
 const { isWithinSchedule } = require('../utils/schedule');
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
+const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
 const asyncHandler = require('../middleware/asyncHandler');
 // Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
 // de dupliquer la logique de sélection de candidat pour le cas "Œil désactivé avec mission active".
@@ -1512,6 +1513,13 @@ router.get('/admin/settings', authenticate, requireRole('admin'), requirePermiss
   const settings = {}
   rows.forEach(r => settings[r.key] = r.value)
   res.json({ settings })
+}))
+
+// Lecture seule — renvoie les valeurs seedées de schema.js (config/settingsDefaults.js, source
+// unique partagée avec la migration), jamais une copie codée en dur ailleurs. Sert de référence
+// au bouton "Réinitialiser aux valeurs par défaut" de Parametres.jsx.
+router.get('/admin/settings/defaults', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  res.json({ defaults: SETTINGS_DEFAULTS })
 }))
 
 router.put('/admin/settings', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
