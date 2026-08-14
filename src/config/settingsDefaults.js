@@ -15,15 +15,11 @@
 // lignes UPDATE restent nécessaires pour les bases déjà provisionnées avant ce changement — ne pas
 // les supprimer, elles ne font simplement plus rien sur une base neuve puisque l'INSERT écrit déjà
 // directement la bonne valeur.
-//
-// NE PAS ajouter ici une clé qui n'a pas de vraie ligne seedée dans la base (voir constat d'audit
-// séparé : five_star_bonus_active/percent et candidature_whatsapp_seuil_count/minutes sont réglés
-// depuis Parametres.jsx et lus via getSetting() avec un défaut au cas par cas, mais n'ont jamais eu
-// de ligne INSERT ici — les y ajouter changerait leur comportement actuel au premier démarrage
-// d'une base neuve, ce qui dépasse le cadre de ce fichier).
 module.exports = {
   commission: '0.20',
   min_price: '80',
+  five_star_bonus_active: 'false',
+  five_star_bonus_percent: '10',
   urgency_fee: '0.30',
   accept_delay: '15',
   transfer_grace_minutes_queue: '45',
@@ -63,6 +59,8 @@ module.exports = {
   payment_attempt_abandoned_minutes: '30',
   urgent_mission_whatsapp_batch_size: '10',
   urgent_mission_whatsapp_batch_delay_minutes: '30',
+  candidature_whatsapp_seuil_count: '3',
+  candidature_whatsapp_seuil_minutes: '60',
   whatsapp_retry_max_attempts: '3',
   no_show_h30_penalty_points: '-20',
   no_show_h30_debit_cap_mad: '100',
