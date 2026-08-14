@@ -1532,7 +1532,7 @@ router.post('/:id/status', authenticate, [
     // Pénalité de fiabilité — sans ça, un Œil pouvait annuler directement via ce
     // endpoint pour échapper à la conséquence appliquée sur /refuse et /transfer.
     if (req.user.role === 'oeil') {
-      const { points, reason, isGrave } = computeLatePenalty(mission.scheduled_at, 'annulée par l\'Œil');
+      const { points, reason, isGrave } = await computeLatePenalty(db, mission.scheduled_at, 'annulée par l\'Œil');
       await logReliabilityEvent(db, req.user.id, mission.id, points, reason, isGrave);
     }
     let refund;
@@ -2122,7 +2122,8 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
   // via options.skipReliabilityPenalty (URGENCE uniquement, voir commentaire de la fonction) —
   // /transfer ne passe jamais ce flag, donc son comportement reste strictement inchangé ici.
   if (transferType === 'before' && !skipReliabilityPenalty) {
-    await logReliabilityEvent(db, oeilId, mission.id, 5, 'Transfert avant démarrage avec remplaçant', false);
+    const transferBeforeReplacementBonusPoints = await getSetting(db, 'transfer_before_replacement_bonus_points', 5);
+    await logReliabilityEvent(db, oeilId, mission.id, transferBeforeReplacementBonusPoints, 'Transfert avant démarrage avec remplaçant', false);
   }
 
   // Notifications
@@ -2641,17 +2642,19 @@ async function checkTransferDeadlines(db, io, emitToUser) {
     // la pénalité financière/fiabilité est conditionnée par transfer_no_penalty).
 if (mission.transfer_type === 'during' && mission.transferred_from) {
         if (!mission.transfer_no_penalty) {
+          const transferDuringNoReplacementDebitCapMad = await getSetting(db, 'transfer_during_no_replacement_debit_cap_mad', 100);
+          const transferDuringNoReplacementPenaltyPoints = await getSetting(db, 'transfer_during_no_replacement_penalty_points', -70);
           // Débit plafonné au solde réel (voir même pattern commenté en détail dans le cron H+30,
           // index.js) : lockBalance + debit() dans la même transaction pour que le montant journalisé
           // ne dépasse jamais ce qui a réellement été déduit.
           await walletService.withTransaction(db, async (client) => {
             const currentBalance = await walletService.lockBalance(client, mission.transferred_from, 'oeil');
-            const deducted = Math.min(100, currentBalance || 0);
+            const deducted = Math.min(transferDuringNoReplacementDebitCapMad, currentBalance || 0);
             if (deducted > 0) {
               await walletService.debit(client, mission.transferred_from, 'oeil', deducted, 'Pénalité — aucun remplaçant trouvé', mission.id);
             }
           });
-          await logReliabilityEvent(db, mission.transferred_from, mission.id, -70, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
+          await logReliabilityEvent(db, mission.transferred_from, mission.id, transferDuringNoReplacementPenaltyPoints, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
 
           await emitToUser?.(mission.transferred_from, 'notification', {
             title: '⚠️ Pénalité appliquée',
@@ -2667,7 +2670,8 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
           WHERE id=$1
         `, [mission.transferred_from, abandonCooldownHours]);
        } else if (mission.transfer_type === 'before' && mission.transferred_from && !mission.transfer_no_penalty) {
-      await logReliabilityEvent(db, mission.transferred_from, mission.id, -10, 'Transfert avant démarrage sans remplaçant trouvé', true);
+      const transferBeforeNoReplacementPenaltyPoints = await getSetting(db, 'transfer_before_no_replacement_penalty_points', -10);
+      await logReliabilityEvent(db, mission.transferred_from, mission.id, transferBeforeNoReplacementPenaltyPoints, 'Transfert avant démarrage sans remplaçant trouvé', true);
 
     }
 

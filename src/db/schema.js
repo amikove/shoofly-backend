@@ -280,7 +280,20 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
         ('payment_attempt_abandoned_minutes', '30'),
         ('urgent_mission_whatsapp_batch_size', '10'),
         ('urgent_mission_whatsapp_batch_delay_minutes', '30'),
-        ('whatsapp_retry_max_attempts', '3')
+        ('whatsapp_retry_max_attempts', '3'),
+        ('no_show_h30_penalty_points', '-20'),
+        ('no_show_h30_debit_cap_mad', '100'),
+        ('transfer_during_no_replacement_penalty_points', '-70'),
+        ('transfer_during_no_replacement_debit_cap_mad', '100'),
+        ('transfer_before_no_replacement_penalty_points', '-10'),
+        ('transfer_before_replacement_bonus_points', '5'),
+        ('late_cancel_penalty_tier1_points', '-15'),
+        ('late_cancel_penalty_tier2_points', '-35'),
+        ('late_cancel_penalty_tier3_points', '-50'),
+        ('late_cancel_penalty_tier1_threshold_hours', '24'),
+        ('late_cancel_penalty_tier2_threshold_hours', '2'),
+        ('presence_confirmation_deadline_minutes_h45', '15'),
+        ('password_reset_token_expiry_hours', '1')
       ON CONFLICT (key) DO NOTHING;
 
     -- Migration ponctuelle (chantier confirmation H-2/H-45) : le INSERT ci-dessus ne change

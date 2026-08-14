@@ -1537,6 +1537,13 @@ const {
   candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
   whatsapp_retry_max_attempts,
   payment_attempt_abandoned_minutes,
+  no_show_h30_penalty_points, no_show_h30_debit_cap_mad,
+  transfer_during_no_replacement_penalty_points, transfer_during_no_replacement_debit_cap_mad,
+  transfer_before_no_replacement_penalty_points, transfer_before_replacement_bonus_points,
+  late_cancel_penalty_tier1_points, late_cancel_penalty_tier2_points, late_cancel_penalty_tier3_points,
+  late_cancel_penalty_tier1_threshold_hours, late_cancel_penalty_tier2_threshold_hours,
+  presence_confirmation_deadline_minutes_h45,
+  password_reset_token_expiry_hours,
 } = req.body
   const updates = {
     commission, min_price, five_star_bonus_active, five_star_bonus_percent,
@@ -1559,6 +1566,13 @@ const {
     candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
     whatsapp_retry_max_attempts,
     payment_attempt_abandoned_minutes,
+    no_show_h30_penalty_points, no_show_h30_debit_cap_mad,
+    transfer_during_no_replacement_penalty_points, transfer_during_no_replacement_debit_cap_mad,
+    transfer_before_no_replacement_penalty_points, transfer_before_replacement_bonus_points,
+    late_cancel_penalty_tier1_points, late_cancel_penalty_tier2_points, late_cancel_penalty_tier3_points,
+    late_cancel_penalty_tier1_threshold_hours, late_cancel_penalty_tier2_threshold_hours,
+    presence_confirmation_deadline_minutes_h45,
+    password_reset_token_expiry_hours,
   }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
