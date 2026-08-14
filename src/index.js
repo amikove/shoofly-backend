@@ -735,12 +735,13 @@ initDb().then(() => {
         // + debit() dans la même transaction (plutôt qu'un débit de 100 fixe) : le montant passé
         // à debit() est déjà borné au solde verrouillé, donc INSUFFICIENT_BALANCE n'est jamais
         // levée ici ; si le solde est déjà à 0, on ne journalise rien (pas de ligne à 0 MAD).
-        await walletService.withTransaction(db, async (client) => {
+        const deducted = await walletService.withTransaction(db, async (client) => {
           const currentBalance = await walletService.lockBalance(client, m.oeil_id, 'oeil');
           const deducted = Math.min(noShowH30DebitCapMad, currentBalance || 0);
           if (deducted > 0) {
             await walletService.debit(client, m.oeil_id, 'oeil', deducted, 'Pénalité — mission non démarrée à l\'heure', m.id);
           }
+          return deducted;
         });
         await logReliabilityEvent(db, m.oeil_id, m.id, noShowH30PenaltyPoints, 'Mission non démarrée à l\'heure (H+30)', true);
 
@@ -768,8 +769,8 @@ initDb().then(() => {
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
            VALUES ($1, '⚠️ Pénalité appliquée', $2, 'error', $3, 'reliability_page', $4, $5, $6)`,
-          [m.oeil_id, `Vous n'avez pas démarré "${m.title}" à l'heure. -100 MAD déduits et cooldown 3h appliqué.`, m.id,
-           'penaltyAppliedTitle', 'penaltyAppliedBody', JSON.stringify({ missionTitle: m.title })]
+          [m.oeil_id, `Vous n'avez pas démarré "${m.title}" à l'heure. -${deducted} MAD déduits et cooldown ${transferCooldownBeforeHours}h appliqué.`, m.id,
+           'penaltyAppliedTitle', 'penaltyAppliedBody', JSON.stringify({ missionTitle: m.title, amount: deducted, cooldownHours: transferCooldownBeforeHours })]
         );
 
         // Liste admins récupérée une seule fois par tick (voir plus haut)

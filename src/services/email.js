@@ -53,16 +53,17 @@ async function sendEmailRaw(to, subject, html, text) {
 // voir password_reset_token_hash dans db/schema.js). Lien codé en dur vers le domaine de
 // production (jamais process.env.FRONTEND_URL, qui vaut localhost en dev) : la demande explicite
 // est que ce lien soit correct dès aujourd'hui même si la page frontend n'existe pas encore.
-async function sendPasswordResetEmail(toEmail, firstName, rawToken) {
+async function sendPasswordResetEmail(toEmail, firstName, rawToken, expiryHours) {
   const link = `${RESET_PASSWORD_URL_BASE}?token=${rawToken}`;
   const subject = 'Réinitialisation de votre mot de passe SHOOFLY';
   const greeting = firstName ? `Bonjour ${firstName},` : 'Bonjour,';
+  const expiryLabel = `${expiryHours} heure${expiryHours === 1 ? '' : 's'}`;
 
   const text = `${greeting}
 
 Vous avez demandé la réinitialisation de votre mot de passe SHOOFLY.
 
-Cliquez sur le lien ci-dessous pour choisir un nouveau mot de passe (valable 1 heure) :
+Cliquez sur le lien ci-dessous pour choisir un nouveau mot de passe (valable ${expiryLabel}) :
 ${link}
 
 Si vous n'êtes pas à l'origine de cette demande, ignorez cet email — votre mot de passe restera inchangé.
@@ -73,7 +74,7 @@ L'équipe SHOOFLY`;
     <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; color: #1a1a1a;">
       <p>${greeting}</p>
       <p>Vous avez demandé la réinitialisation de votre mot de passe SHOOFLY.</p>
-      <p>Cliquez sur le bouton ci-dessous pour choisir un nouveau mot de passe (valable 1 heure) :</p>
+      <p>Cliquez sur le bouton ci-dessous pour choisir un nouveau mot de passe (valable ${expiryLabel}) :</p>
       <p style="margin: 24px 0;">
         <a href="${link}" style="background:#111827;color:#ffffff;padding:12px 24px;border-radius:6px;text-decoration:none;display:inline-block;">
           Réinitialiser mon mot de passe

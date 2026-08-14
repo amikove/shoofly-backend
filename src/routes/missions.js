@@ -2647,18 +2647,19 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
           // Débit plafonné au solde réel (voir même pattern commenté en détail dans le cron H+30,
           // index.js) : lockBalance + debit() dans la même transaction pour que le montant journalisé
           // ne dépasse jamais ce qui a réellement été déduit.
-          await walletService.withTransaction(db, async (client) => {
+          const deducted = await walletService.withTransaction(db, async (client) => {
             const currentBalance = await walletService.lockBalance(client, mission.transferred_from, 'oeil');
             const deducted = Math.min(transferDuringNoReplacementDebitCapMad, currentBalance || 0);
             if (deducted > 0) {
               await walletService.debit(client, mission.transferred_from, 'oeil', deducted, 'Pénalité — aucun remplaçant trouvé', mission.id);
             }
+            return deducted;
           });
           await logReliabilityEvent(db, mission.transferred_from, mission.id, transferDuringNoReplacementPenaltyPoints, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
 
           await emitToUser?.(mission.transferred_from, 'notification', {
             title: '⚠️ Pénalité appliquée',
-            body: `Aucun remplaçant n'a été trouvé pour "${mission.title}". -100 MAD déduits.`,
+            body: `Aucun remplaçant n'a été trouvé pour "${mission.title}". -${deducted} MAD déduits.`,
             type: 'warning'
           });
         }
