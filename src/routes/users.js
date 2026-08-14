@@ -1536,6 +1536,7 @@ const {
   urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
   candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
   whatsapp_retry_max_attempts,
+  payment_attempt_abandoned_minutes,
 } = req.body
   const updates = {
     commission, min_price, five_star_bonus_active, five_star_bonus_percent,
@@ -1557,6 +1558,7 @@ const {
     urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
     candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
     whatsapp_retry_max_attempts,
+    payment_attempt_abandoned_minutes,
   }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
