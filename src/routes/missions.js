@@ -2657,11 +2657,13 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
           });
           await logReliabilityEvent(db, mission.transferred_from, mission.id, transferDuringNoReplacementPenaltyPoints, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
 
-          await emitToUser?.(mission.transferred_from, 'notification', {
-            title: '⚠️ Pénalité appliquée',
-            body: `Aucun remplaçant n'a été trouvé pour "${mission.title}". -${deducted} MAD déduits.`,
-            type: 'warning'
-          });
+          // Persisté (pas seulement émis en direct) : même pattern que la pénalité H+30 (index.js)
+          // via notify(), sinon un Œil hors-ligne au moment précis du tick perd cette notification
+          // pour toujours (RAPPORT_TEXTES_DYNAMIQUES_HARDCODES.md §7).
+          await notify(db, mission.transferred_from, '⚠️ Pénalité appliquée',
+            `Aucun remplaçant n'a été trouvé pour "${mission.title}". -${deducted} MAD déduits.`,
+            'error', mission.id, emitToUser, 'reliability_page', 'penaltyAppliedTitle', 'penaltyAppliedNoReplacementBody',
+            { missionTitle: mission.title, amount: deducted });
         }
         const abandonCooldownHours = await getSetting(db, 'abandon_during_mission_cooldown_hours', 48);
         await db.query(`
