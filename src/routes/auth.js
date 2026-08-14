@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
+const { getSetting } = require('../utils/settings');
 const { authenticate } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
@@ -227,7 +228,8 @@ router.post('/forgot-password', [
   if (user) {
     const rawToken = crypto.randomBytes(32).toString('hex');
     const tokenHash = hashResetToken(rawToken);
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1h
+    const passwordResetTokenExpiryHours = await getSetting(db, 'password_reset_token_expiry_hours', 1);
+    const expiresAt = new Date(Date.now() + passwordResetTokenExpiryHours * 60 * 60 * 1000);
 
     // Écrase directement tout token précédent encore valide pour cet utilisateur — l'invariant
     // "dernier token demandé = seul valide" est structurel ici (une seule paire de colonnes par

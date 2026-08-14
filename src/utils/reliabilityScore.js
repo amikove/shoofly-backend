@@ -1,22 +1,28 @@
 const { getDb } = require('../db/schema');
+const { getSetting } = require('./settings');
 
 // ── Pénalité proportionnelle au délai avant la mission ────
 // Plus l'action (refus, annulation...) est tardive, plus elle désorganise
 // le client et pèse sur la réputation de la plateforme. Barème partagé par
 // toutes les routes qui pénalisent un abandon d'Œil sur une mission assignée.
-function computeLatePenalty(scheduledAt, actionLabel) {
+async function computeLatePenalty(db, scheduledAt, actionLabel) {
   const hoursBeforeMission = scheduledAt
     ? (new Date(scheduledAt).getTime() - Date.now()) / 3600000
     : null;
+  const tier1Points = await getSetting(db, 'late_cancel_penalty_tier1_points', -15);
+  const tier2Points = await getSetting(db, 'late_cancel_penalty_tier2_points', -35);
+  const tier3Points = await getSetting(db, 'late_cancel_penalty_tier3_points', -50);
+  const tier1ThresholdHours = await getSetting(db, 'late_cancel_penalty_tier1_threshold_hours', 24);
+  const tier2ThresholdHours = await getSetting(db, 'late_cancel_penalty_tier2_threshold_hours', 2);
   let points, timing;
-  if (hoursBeforeMission === null || hoursBeforeMission > 24) {
-    points = -15; timing = 'plus de 24h avant';
-  } else if (hoursBeforeMission > 2) {
-    points = -35; timing = 'entre 2h et 24h avant';
+  if (hoursBeforeMission === null || hoursBeforeMission > tier1ThresholdHours) {
+    points = tier1Points; timing = 'plus de 24h avant';
+  } else if (hoursBeforeMission > tier2ThresholdHours) {
+    points = tier2Points; timing = 'entre 2h et 24h avant';
   } else {
-    points = -50; timing = 'moins de 2h avant, très tardif';
+    points = tier3Points; timing = 'moins de 2h avant, très tardif';
   }
-  return { points, reason: `Mission ${actionLabel} (${timing})`, isGrave: points <= -35 };
+  return { points, reason: `Mission ${actionLabel} (${timing})`, isGrave: points <= tier2Points };
 }
 
 // ── Enregistrer un événement de fiabilité ─────────────────

@@ -711,6 +711,8 @@ initDb().then(() => {
       `, [autoTransferMinutes, alertWindowMinutes]);
 
       const transferCooldownBeforeHours = await getSetting(db, 'transfer_cooldown_before_hours', 3);
+      const noShowH30PenaltyPoints = await getSetting(db, 'no_show_h30_penalty_points', -20);
+      const noShowH30DebitCapMad = await getSetting(db, 'no_show_h30_debit_cap_mad', 100);
       for (const m of lateH30) {
         // Pénalité fiabilité — le score est entièrement recalculé par logReliabilityEvent ci-dessous,
         // pas besoin de le décrémenter manuellement ici (ancien code mort, toujours écrasé après coup).
@@ -735,12 +737,12 @@ initDb().then(() => {
         // levée ici ; si le solde est déjà à 0, on ne journalise rien (pas de ligne à 0 MAD).
         await walletService.withTransaction(db, async (client) => {
           const currentBalance = await walletService.lockBalance(client, m.oeil_id, 'oeil');
-          const deducted = Math.min(100, currentBalance || 0);
+          const deducted = Math.min(noShowH30DebitCapMad, currentBalance || 0);
           if (deducted > 0) {
             await walletService.debit(client, m.oeil_id, 'oeil', deducted, 'Pénalité — mission non démarrée à l\'heure', m.id);
           }
         });
-        await logReliabilityEvent(db, m.oeil_id, m.id, -20, 'Mission non démarrée à l\'heure (H+30)', true);
+        await logReliabilityEvent(db, m.oeil_id, m.id, noShowH30PenaltyPoints, 'Mission non démarrée à l\'heure (H+30)', true);
 
         // Transfert automatique
         const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
@@ -891,8 +893,8 @@ initDb().then(() => {
       }
 
       // H-45min (marge ±10min) — second point de contrôle actif et indépendant du précédent.
-      // Délai de réponse fixe de 15 minutes, codé en dur (pas un réglage admin — décision prise
-      // pour ce chantier) : avec le lot de candidats par défaut (candidate_batch_size=10,
+      // Délai de réponse configurable (presence_confirmation_deadline_minutes_h45, 15 min par
+      // défaut) : avec le lot de candidats par défaut (candidate_batch_size=10,
       // candidate_confirmation_minutes=10 + candidate_tiebreak_window_minutes=5 = 15min par
       // cycle de réattribution), 15min de délai de réponse ici laissent encore ~30min de marge
       // avant l'heure de la mission pour 2 cycles complets de réattribution par lot.
@@ -907,7 +909,7 @@ initDb().then(() => {
       // admin passive plus bas) — audit perf 2026-07-26.
       const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
       for (const m of missions45) {
-        const responseMinutesH45 = 15;
+        const responseMinutesH45 = await getSetting(db, 'presence_confirmation_deadline_minutes_h45', 15);
         const deadlineAt = new Date(Date.now() + responseMinutesH45 * 60 * 1000);
         await db.query(
           `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1, presence_confirmed_at=NULL WHERE id=$2`,
