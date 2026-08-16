@@ -139,6 +139,7 @@ function postFormViaHttps(url, formBody, agent) {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+      res.on('error', reject);
     });
     req.on('error', reject);
     req.write(formBody);
