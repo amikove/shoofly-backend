@@ -12,6 +12,8 @@
 // d'exister à part). Points restés ambigus après lecture du seul résumé fourni, signalés dans le
 // rapport de session : confirmer contre la doc complète ou un test réel en sandbox avant prod.
 const crypto = require('crypto');
+const https = require('https');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const GENERATE_TOKEN_PATH = '/cpws/cpmarchand/index.cfm/generate_token';
 
@@ -80,6 +82,70 @@ function verifyCallbackHmac(requestId, receivedHmac) {
   return crypto.timingSafeEqual(expected, provided);
 }
 
+// IP fixe pour le whitelisting CashPlus (exigé par le prestataire pour l'appel generate_token) —
+// proxy Fixie (FIXIE_URL, credentials inclus dans l'URL : jamais loggée, jamais codée en dur)
+// routé via https-proxy-agent. C'est précisément pourquoi cet appel utilise https.request()
+// plutôt que fetch() comme le reste du projet (wasel.js, email.js) : le fetch natif de Node
+// (undici) ignore silencieusement l'option `agent` d'un Agent classique http.Agent/https.Agent —
+// ce que produit https-proxy-agent — sans lever d'erreur ; l'appel serait alors parti en direct
+// sans passer par le proxy, cassant le whitelisting sans aucun signal. Vérifié empiriquement avant
+// ce choix. Si FIXIE_URL est absente (dev/local), aucun blocage du process : warning + appel
+// direct, comportement historique inchangé.
+let cachedProxyAgent = null;
+let cachedFixieUrl = null;
+
+function getCashplusProxyAgent() {
+  const fixieUrl = process.env.FIXIE_URL;
+  if (!fixieUrl) {
+    console.warn('[cashplus] FIXIE_URL absente — appel generate_token en direct, sans IP fixe (whitelisting CashPlus non garanti)');
+    return undefined;
+  }
+  if (fixieUrl !== cachedFixieUrl) {
+    cachedProxyAgent = new HttpsProxyAgent(fixieUrl);
+    cachedFixieUrl = fixieUrl;
+  }
+  return cachedProxyAgent;
+}
+
+// Filet de sécurité : ne jamais logger un message d'erreur bas niveau (échec de connexion ou
+// d'authentification CONNECT auprès du proxy) qui contiendrait l'URL Fixie brute.
+function sanitizeNetworkErrorMessage(message) {
+  const fixieUrl = process.env.FIXIE_URL;
+  if (fixieUrl && message && message.includes(fixieUrl)) {
+    return message.split(fixieUrl).join('[FIXIE_URL]');
+  }
+  return message;
+}
+
+// POST form-urlencoded via https.request. `agent` optionnel : HttpsProxyAgent (Fixie) ou
+// undefined (connexion directe, https.globalAgent — comportement historique). `servername`
+// explicite requis : à travers un Agent personnalisé (HttpsProxyAgent), Node ne dérive PAS
+// automatiquement le SNI/la vérification de hostname TLS depuis l'URL cible comme il le fait en
+// connexion directe — il retombe sur "localhost", ce qui casse la validation du certificat CashPlus
+// pour CHAQUE appel proxifié. Vérifié empiriquement (voir rapport de session) : sans cette ligne,
+// le round-trip complet échoue systématiquement dès que FIXIE_URL est renseignée.
+function postFormViaHttps(url, formBody, agent) {
+  return new Promise((resolve, reject) => {
+    const { hostname } = new URL(url);
+    const req = https.request(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(formBody),
+      },
+      agent,
+      servername: hostname,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.write(formBody);
+    req.end();
+  });
+}
+
 // Appelle CashPlus generate_token. Ne lance jamais d'erreur réseau vers l'appelant — renvoie
 // {ok:false, message} pour que la route réponde proprement (routes/users.js), même contrat que
 // sendWhatsAppTemplateRaw (services/wasel.js). Encodage form-urlencoded — voir note d'en-tête de
@@ -104,19 +170,19 @@ async function callGenerateToken({ requestId, amount, fees, dateExpiration }) {
   });
 
   try {
-    const response = await fetch(`${baseUrl}${GENERATE_TOKEN_PATH}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body.toString(),
-    });
-    const data = await response.json().catch(() => null);
-    if (!data) return { ok: false, message: `Réponse CashPlus illisible (HTTP ${response.status})` };
+    const agent = getCashplusProxyAgent();
+    const { status, body: responseText } = await postFormViaHttps(
+      `${baseUrl}${GENERATE_TOKEN_PATH}`, body.toString(), agent,
+    );
+    let data = null;
+    try { data = JSON.parse(responseText); } catch { /* data reste null, traité ci-dessous */ }
+    if (!data) return { ok: false, message: `Réponse CashPlus illisible (HTTP ${status})` };
     if (Number(data.SUCCESS) === 1) {
       return { ok: true, token: data.TOKEN, dateExpiration: data.DATE_EXPIRATION };
     }
-    return { ok: false, message: data.MESSAGE || `Échec CashPlus (HTTP ${response.status})` };
+    return { ok: false, message: data.MESSAGE || `Échec CashPlus (HTTP ${status})` };
   } catch (err) {
-    console.error('[cashplus] Erreur réseau generate_token:', err.message);
+    console.error('[cashplus] Erreur réseau generate_token:', sanitizeNetworkErrorMessage(err.message));
     return { ok: false, message: 'Erreur réseau CashPlus' };
   }
 }
