@@ -978,6 +978,115 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- /missions/assistance-requests/:id/requalify, routes/missions.js.
     ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS admin_requalified_at TIMESTAMPTZ;
     ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS admin_requalified_by TEXT REFERENCES users(id);
+
+    -- ── PROMPT 2 (2026-08-17) — cascade cap, reprise H+30, litige cash découplé, détection
+    -- d'abandon par photo, notes clients, strikes no-show client. Voir rapport de session.
+
+    -- Plafonne la cascade de confirmation par lot à candidate_batch_max_waves lots successifs
+    -- (setting, voir settingsDefaults.js) au lieu d'un tirage illimité tant que mission_interests
+    -- n'est pas épuisé — voir advanceCandidateCascade, routes/missions.js. Remis à 0 à chaque
+    -- nouveau cycle de libération authentique (transferred_from fraîchement posé) — jamais à
+    -- l'intérieur d'advanceCandidateCascade elle-même, qui doit au contraire accumuler les
+    -- tirages successifs du MÊME cycle pour que le plafond ait un sens.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS batch_wave_count INTEGER NOT NULL DEFAULT 0;
+
+    -- Distingue un transfert H+30 (no-show, potentiellement de bonne foi — retard, embouteillage...)
+    -- des autres origines de libération (URGENCE, suspension admin, blocage anti-fraude,
+    -- confirmation de présence manquée, refus d'edit-request) qui posent toutes transferred_from
+    -- mais ne doivent PAS permettre à l'Œil d'origine de "reprendre" la mission plus tard — seul
+    -- le no-show H+30 le permet (POST /:id/resume-after-h30), si l'Œil se manifeste avant qu'un
+    -- remplaçant soit confirmé. Flag explicite plutôt qu'une déduction depuis transfer_reason
+    -- (texte libre, fragile à comparer) — même principe que transfer_no_penalty ci-dessus. Remis
+    -- à false à chaque nouveau cycle de libération, comme batch_wave_count.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS transfer_h30_no_show BOOLEAN NOT NULL DEFAULT FALSE;
+
+    -- Détection d'abandon sans GPS (mission active) : le système redemande une photo (sans
+    -- visage) toutes les activity_photo_interval_minutes (setting) tant que la mission est
+    -- 'active'. next_due_at est pointé vers l'avant à l'activation ET à chaque photo reçue (voir
+    -- POST /:id/status et routes/media.js) ; le cron dédié (index.js) n'a donc qu'à comparer
+    -- next_due_at à NOW(), jamais besoin de relire mission_media. alerted évite de renotifier
+    -- client/admin à chaque tick tant qu'aucune photo n'est revenue depuis la première alerte.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS activity_photo_next_due_at TIMESTAMPTZ;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS activity_photo_alerted BOOLEAN NOT NULL DEFAULT FALSE;
+
+    -- ── Litige "client absent" (cash) découplé : motif structuré + décision commission distincte ──
+    -- dispute_reason='client_absent' : posé par l'admin AU MOMENT de PUT /admin/claims/
+    -- :missionId/resolve (routes/users.js) — c'est la RATIFICATION admin qui fait foi, jamais le
+    -- texte libre saisi par l'Œil ou le client. Seule cette valeur déclenche à la fois (a) le
+    -- découplage commission ci-dessous et (b) l'éligibilité au strike no-show client
+    -- (client_strikes, ci-dessous) — les deux restant deux actions indépendantes dans le code,
+    -- jamais la même (exigence explicite de la session : un admin peut libérer la commission tout
+    -- en posant quand même un strike, ou l'inverse).
+    ALTER TABLE claims ADD COLUMN IF NOT EXISTS dispute_reason TEXT CHECK(dispute_reason IN ('client_absent'));
+    -- Pour une mission cash avec dispute_reason='client_absent' ET decision='oeil' : la commission
+    -- n'est PLUS débitée automatiquement dans la même transaction que la résolution (comportement
+    -- historique conservé pour tout autre cas — payzone, ou cash sans ce motif). Elle reste en
+    -- attente (commission_decision IS NULL) jusqu'à une décision admin explicite et séparée via
+    -- POST /admin/claims/:missionId/commission.
+    ALTER TABLE claims ADD COLUMN IF NOT EXISTS commission_decision TEXT CHECK(commission_decision IN ('debited','released'));
+    ALTER TABLE claims ADD COLUMN IF NOT EXISTS commission_decided_by TEXT REFERENCES users(id);
+    ALTER TABLE claims ADD COLUMN IF NOT EXISTS commission_decided_at TIMESTAMPTZ;
+
+    -- Même découplage, pour la voie SILENCIEUSE (checkAssistanceRequestExpiry, routes/
+    -- missions.js — client n'ayant jamais répondu sous 12h, donc aucun litige claims créé) :
+    -- colonnes séparées plutôt que de forcer une ligne claims artificielle pour un cas qui n'a
+    -- jamais été activement contesté par personne. Pour une mission cash, le statut se clôture
+    -- toujours automatiquement (comme avant, évite un blocage éternel) mais la commission reste
+    -- en attente jusqu'à POST /missions/assistance-requests/:id/commission (admin). Ne s'applique
+    -- qu'à category='mission' — 'urgence' ne passe jamais par ce chemin (skipReliabilityPenalty,
+    -- pas de commission en jeu à ce stade).
+    ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS commission_decision TEXT CHECK(commission_decision IN ('debited','released'));
+    ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS commission_decided_by TEXT REFERENCES users(id);
+    ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS commission_decided_at TIMESTAMPTZ;
+
+    -- Réattribution forcée par un admin (PROMPT 2 point 4, 2026-08-17) — POST /missions/:id/
+    -- force-reassign insère une ligne category='urgence' comme si l'Œil l'avait lui-même
+    -- déclarée (même parcours releaseMissionForReplacement, skipReliabilityPenalty:true, même
+    -- requalification a posteriori possible via POST /missions/assistance-requests/:id/
+    -- requalify, PROMPT 1 point 5, inchangée). triggered_by_admin_id (NULL pour une déclaration
+    -- Œil normale) distingue les deux origines dans l'historique/l'écran admin, sans dupliquer
+    -- le mécanisme de requalification pour un cas qui suit exactement les mêmes règles.
+    ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS triggered_by_admin_id TEXT REFERENCES users(id);
+
+    -- ── Strikes "client absent" (anti-fraude no-show client) ──────────────────────────────
+    -- Un strike = un admin a résolu un litige d'assistance avec dispute_reason='client_absent' EN
+    -- FAVEUR DE L'ŒIL (decision='oeil') — jamais depuis l'auto-validation silencieuse à 12h
+    -- (checkAssistanceRequestExpiry, routes/missions.js), qui n'implique aucun jugement humain.
+    -- Table d'audit dédiée (qui/quand/quelle mission) plutôt qu'un simple compteur : permet à
+    -- l'onglet admin "Clients suspendus" d'afficher l'historique complet, pas seulement le total.
+    CREATE TABLE IF NOT EXISTS client_strikes (
+      id          SERIAL PRIMARY KEY,
+      client_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      mission_id  TEXT NOT NULL REFERENCES missions(id),
+      reason      TEXT NOT NULL,
+      created_by  TEXT REFERENCES users(id),
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_client_strikes_client ON client_strikes(client_id);
+    -- Cache dénormalisé (même principe que oeil_profiles.rating_avg/rating_count) — évite un
+    -- COUNT(*) sur client_strikes à chaque affichage de liste client. 1er strike (=1) :
+    -- avertissement client uniquement. 2e strike (=2) : blocage automatique
+    -- (users.is_active=false) + apparition dans l'onglet admin "Clients suspendus" — voir
+    -- applyClientStrike, utils/clientStrikes.js.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS client_noshow_strikes INTEGER NOT NULL DEFAULT 0;
+
+    -- ── Note des clients par les Œils (symétrique de ratings, ci-dessus) ───────────────────
+    -- Un score par mission (UNIQUE mission_id, même contrainte que ratings), écrit par l'Œil
+    -- après la mission — voir POST /missions/:id/rate-client. Visible à un autre Œil AVANT de
+    -- candidater/accepter (moyenne+nombre, jamais le détail des commentaires d'autrui à ce stade)
+    -- via les colonnes cache ci-dessous sur users, au même titre que oeil_profiles.rating_avg/
+    -- rating_count pour la note existante client->Œil.
+    CREATE TABLE IF NOT EXISTS client_ratings (
+      id          SERIAL PRIMARY KEY,
+      mission_id  TEXT UNIQUE NOT NULL REFERENCES missions(id),
+      oeil_id     TEXT NOT NULL REFERENCES users(id),
+      client_id   TEXT NOT NULL REFERENCES users(id),
+      score       INTEGER NOT NULL CHECK(score BETWEEN 1 AND 5),
+      comment     TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS client_rating_avg NUMERIC(3,1);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS client_rating_count INTEGER NOT NULL DEFAULT 0;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

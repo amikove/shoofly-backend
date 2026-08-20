@@ -455,6 +455,8 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
           transfer_reason: 'Compte prestataire bloqué pour fraude',
           transfer_deadline: deadline,
           oeil_id: null,
+          batch_wave_count: 0,
+          transfer_h30_no_show: false,
         },
         note: 'Réattribution automatique — Œil bloqué par un admin (anti-fraude)',
       });

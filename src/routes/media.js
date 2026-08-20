@@ -6,6 +6,7 @@ const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { chatAccessExpiresAt } = require('./missions');
+const { getSetting } = require('../utils/settings');
 
 // ── Config Cloudinary ─────────────────────────────────────
 cloudinary.config({
@@ -78,6 +79,21 @@ router.post('/:missionId', authenticate, asyncHandler(checkMissionUploadAuthoriz
       [mission.id, req.user.id, type, filename, url, file.size || 0, req.body.caption || null]
     );
     inserted.push(media);
+  }
+
+  // PROMPT 2 (2026-08-17) — détection d'abandon sans GPS : toute photo envoyée par l'Œil
+  // assigné pendant que la mission est 'active' repousse l'échéance de la prochaine demande
+  // (voir routes/missions.js POST /:id/status et index.js, cron d'alerte). N'importe quelle
+  // photo compte (pas de distinction d'intention) — le seul signal disponible est "l'Œil est
+  // toujours là et envoie quelque chose". Ne s'applique jamais aux vidéos/documents ni aux
+  // uploads du client/admin.
+  const hasPhoto = inserted.some(m => m.type === 'photo');
+  if (hasPhoto && req.user.role === 'oeil' && mission.oeil_id === req.user.id && mission.status === 'active') {
+    const activityPhotoIntervalMinutes = await getSetting(db, 'activity_photo_interval_minutes', 45);
+    await db.query(
+      `UPDATE missions SET activity_photo_next_due_at=$1, activity_photo_alerted=false WHERE id=$2`,
+      [new Date(Date.now() + activityPhotoIntervalMinutes * 60 * 1000), mission.id]
+    );
   }
 
   // Notifier le client

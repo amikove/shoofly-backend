@@ -54,6 +54,7 @@ const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
 const checkMissionEditRequestExpiry = missionRoutesModule.checkMissionEditRequestExpiry;
 const checkAssistanceRequestExpiry = missionRoutesModule.checkAssistanceRequestExpiry;
 const checkPresenceConfirmationDeadlines = missionRoutesModule.checkPresenceConfirmationDeadlines;
+const checkActivityPhotoDeadlines = missionRoutesModule.checkActivityPhotoDeadlines;
 const advanceCandidateCascade = missionRoutesModule.advanceCandidateCascade;
 const hireOeilCore = missionRoutesModule.hireOeilCore;
 const notify = missionRoutesModule.notify;
@@ -464,6 +465,7 @@ initDb().then(() => {
   let cronWhatsappRetryRunning = false;
   let cronWalletReconciliationRunning = false;
   let cronCashplusExpiryRunning = false;
+  let cronActivityPhotoRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
   // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
@@ -755,7 +757,8 @@ initDb().then(() => {
             status='pending', is_priority=true,
             transfer_type='before', transferred_from=$1,
             transfer_reason='Mission non démarrée à l''heure — transfert automatique',
-            transfer_deadline=$2, oeil_id=NULL, updated_at=NOW()
+            transfer_deadline=$2, oeil_id=NULL, updated_at=NOW(),
+            batch_wave_count=0, transfer_h30_no_show=true
           WHERE id=$3
         `, [m.oeil_id, deadline, m.id]);
 
@@ -1078,6 +1081,22 @@ initDb().then(() => {
       await checkPresenceConfirmationDeadlines(db, io, emitToUser);
     } catch (e) { console.error('❌ Cron confirmations de présence error:', e.message); }
     finally { cronPresenceConfirmationRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron toutes les 5 min — Détection d'abandon sans GPS (photo de suivi manquante) ──
+  // (PROMPT 2, 2026-08-17) — même cadence que les autres vérifications de deadline ci-dessus,
+  // largement suffisante face à la fenêtre la plus courte en jeu (activity_photo_interval_
+  // minutes, défaut 45 min). Voir checkActivityPhotoDeadlines, routes/missions.js.
+  cron.schedule('*/5 * * * *', async () => {
+    if (cronActivityPhotoRunning) { console.warn('⏭️ Cron photo de suivi déjà en cours, tick ignoré'); return; }
+    cronActivityPhotoRunning = true;
+    try {
+      const db = getDb();
+      const io = app.get('io');
+      const emitToUser = app.get('emitToUser');
+      await checkActivityPhotoDeadlines(db, io, emitToUser);
+    } catch (e) { console.error('❌ Cron photo de suivi error:', e.message); }
+    finally { cronActivityPhotoRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 2 min — Cascade de confirmation candidat PAR LOT ──────
