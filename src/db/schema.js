@@ -1087,6 +1087,30 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
     ALTER TABLE users ADD COLUMN IF NOT EXISTS client_rating_avg NUMERIC(3,1);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS client_rating_count INTEGER NOT NULL DEFAULT 0;
+
+    -- ── PROMPT 5 (2026-08-18) — Notifications et bugs techniques confirmés ────────────────
+    -- Rappel intermédiaire client (H+6 de la fenêtre de validation 12h, voir jobs/
+    -- autoValidateMissions.js:runValidationReminders) — garde anti-doublon, un seul rappel
+    -- par mission avant l'auto-validation silencieuse.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS validation_reminder_sent_at TIMESTAMPTZ;
+
+    -- Relance des candidatures non choisies par le client (voir cron dédié, index.js) : compteur
+    -- + horodatage de la dernière relance WhatsApp, pour calculer la prochaine échéance
+    -- (candidature_relance_first_after_minutes puis candidature_relance_interval_minutes).
+    -- candidature_admin_alert_sent_at bascule la relance en alerte admin ("Missions proches sans
+    -- validation") une fois la mission trop proche de scheduled_at — posé une seule fois, sert
+    -- aussi de filtre à la liste admin (GET /missions/admin/missions-proches-validation).
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS candidature_relance_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS candidature_relance_last_sent_at TIMESTAMPTZ;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS candidature_admin_alert_sent_at TIMESTAMPTZ;
+
+    -- Relance par email des notifications WhatsApp à délai court restées non lues — cascade
+    -- candidat (mission_interests, ~10min) et confirmation de présence H-45 (missions). Garde
+    -- anti-doublon par cycle de sollicitation ; presence_confirmation_h45_email_sent_at est remis
+    -- à NULL à chaque nouvelle ouverture du point de contrôle H-45 (voir index.js, même UPDATE que
+    -- presence_confirmed_at) pour rester utilisable si la mission repasse par ce palier.
+    ALTER TABLE mission_interests ADD COLUMN IF NOT EXISTS email_fallback_sent_at TIMESTAMPTZ;
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS presence_confirmation_h45_email_sent_at TIMESTAMPTZ;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

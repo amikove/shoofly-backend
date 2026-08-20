@@ -3927,6 +3927,26 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandl
   res.json({ report });
 }));
 
+// ── GET /missions/admin/missions-proches-validation (PROMPT 5, 2026-08-18) ──
+// Liste vivante des missions encore 'pending' dont le client n'a pas choisi d'Œil malgré des
+// candidatures reçues, et pour lesquelles le cron de relance (index.js) a jugé la mission trop
+// proche pour compter sur un nouveau WhatsApp (candidature_admin_alert_sent_at posé). Pas de
+// pagination : ensemble volontairement borné (une mission en sort dès qu'elle change de statut,
+// choisie ou non) et intrinsèquement urgent — l'admin doit voir tout d'un coup d'œil, pas cliquer
+// entre des pages pendant que l'horloge tourne.
+router.get('/admin/missions-proches-validation', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT m.id, m.title, m.city, m.scheduled_at, m.price, m.candidature_relance_count,
+      c.id AS client_id, c.first_name AS client_first, c.last_name AS client_last, c.phone AS client_phone,
+      (SELECT COUNT(*)::int FROM mission_interests mi WHERE mi.mission_id = m.id) AS candidature_count
+    FROM missions m
+    JOIN users c ON c.id = m.client_id
+    WHERE m.status = 'pending' AND m.candidature_admin_alert_sent_at IS NOT NULL
+    ORDER BY m.scheduled_at ASC
+  `);
+  res.json({ missions: rows });
+}));
 
 // ── Cron : expirer les demandes de modification sans réponse de l'Œil ─────
 // (appelé depuis index.js via cron) — même logique que POST /edit-requests/:id/reject,

@@ -32,10 +32,12 @@ const { initDb, getDb, checkDbConnection } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
 const walletService = require('./services/walletService');
-const { runAutoValidateMissions } = require('./jobs/autoValidateMissions');
+const { runAutoValidateMissions, runValidationReminders } = require('./jobs/autoValidateMissions');
 const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
 const { runWalletReconciliation } = require('./jobs/walletReconciliation');
 const { runCashplusExpiry } = require('./jobs/cashplusExpiry');
+const { runCandidatureRelance } = require('./jobs/candidatureRelance');
+const { runUnreadWhatsappEmailFallback } = require('./jobs/unreadWhatsappEmailFallback');
 const { sendWhatsAppTemplate } = require('./services/wasel');
 const waselTemplates = require('./config/waselTemplates');
 
@@ -466,6 +468,9 @@ initDb().then(() => {
   let cronWalletReconciliationRunning = false;
   let cronCashplusExpiryRunning = false;
   let cronActivityPhotoRunning = false;
+  let cronValidationReminderRunning = false;
+  let cronCandidatureRelanceRunning = false;
+  let cronUnreadEmailFallbackRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
   // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
@@ -915,8 +920,11 @@ initDb().then(() => {
       for (const m of missions45) {
         const responseMinutesH45 = await getSetting(db, 'presence_confirmation_deadline_minutes_h45', 15);
         const deadlineAt = new Date(Date.now() + responseMinutesH45 * 60 * 1000);
+        // presence_confirmation_h45_email_sent_at remis à NULL à chaque nouvelle ouverture de ce
+        // point de contrôle (PROMPT 5, relance email) — sinon une mission repassant par H-45 après
+        // une réattribution resterait bloquée sur le fallback déjà envoyé au tour précédent.
         await db.query(
-          `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1, presence_confirmed_at=NULL WHERE id=$2`,
+          `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1, presence_confirmed_at=NULL, presence_confirmation_h45_email_sent_at=NULL WHERE id=$2`,
           [deadlineAt, m.id]
         );
         const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
@@ -1268,13 +1276,49 @@ initDb().then(() => {
     finally { cronCandidatureWhatsAppRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
+  // ── Cron toutes les 5 min — Relance candidatures non choisies (PROMPT 5, 2026-08-18) ────
+  // Logique extraite dans jobs/candidatureRelance.js (même raison que runAutoValidateMissions :
+  // testable indépendamment d'un vrai tick cron).
+  cron.schedule('*/5 * * * *', async () => {
+    if (cronCandidatureRelanceRunning) { console.warn('⏭️ Cron relance candidatures déjà en cours, tick ignoré'); return; }
+    cronCandidatureRelanceRunning = true;
+    try {
+      await runCandidatureRelance(getDb(), app.get('emitToUser'));
+    } catch (e) { console.error('❌ Cron relance candidatures error:', e.message); }
+    finally { cronCandidatureRelanceRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron toutes les 2 min — Relance par email des WhatsApp à délai court non lus (PROMPT 5,
+  // 2026-08-18) ── Logique extraite dans jobs/unreadWhatsappEmailFallback.js (même raison).
+  cron.schedule('*/2 * * * *', async () => {
+    if (cronUnreadEmailFallbackRunning) { console.warn('⏭️ Cron relance email déjà en cours, tick ignoré'); return; }
+    cronUnreadEmailFallbackRunning = true;
+    try {
+      await runUnreadWhatsappEmailFallback(getDb());
+    } catch (e) { console.error('❌ Cron relance email (délai court) error:', e.message); }
+    finally { cronUnreadEmailFallbackRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
   cron.schedule('0 * * * *', async () => {
     if (cronAutoValidateRunning) { console.warn('⏭️ Cron auto-validation déjà en cours, tick ignoré'); return; }
     cronAutoValidateRunning = true;
     try {
-      await runAutoValidateMissions(getDb());
+      await runAutoValidateMissions(getDb(), app.get('emitToUser'));
     } catch (e) { console.error('❌ Cron error:', e.message); }
     finally { cronAutoValidateRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron horaire — Rappel intermédiaire client (H+6 fenêtre de validation 12h) ──
+  // Même cadence que le cron d'auto-validation ci-dessus (les deux checkpoints de la même
+  // fenêtre de client_validation_hours), verrou dédié pour rester indépendant si l'un des deux
+  // devait un jour changer de fréquence.
+  cron.schedule('0 * * * *', async () => {
+    if (cronValidationReminderRunning) { console.warn('⏭️ Cron rappel validation déjà en cours, tick ignoré'); return; }
+    cronValidationReminderRunning = true;
+    try {
+      await runValidationReminders(getDb(), app.get('emitToUser'));
+    } catch (e) { console.error('❌ Cron rappel validation error:', e.message); }
+    finally { cronValidationReminderRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 30 min — Missions jamais assignées (12h+, encore >4h avant le créneau) ──
