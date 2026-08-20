@@ -236,4 +236,16 @@ module.exports = {
     variableCount: 2,
     note: '{{1}} titre de la mission, {{2}} délai en minutes avant la mission (ex: "120")',
   },
+
+  // Cron relance candidatures (index.js, PROMPT 5 2026-08-18) — le client n'a toujours pas
+  // choisi d'Œil parmi les candidatures reçues ; renvoi du même type d'information qu'
+  // oeil_applied (nouvelle candidature) mais dans un template dédié pour ne pas confondre les
+  // deux événements côté admin/analytics WhatsApp. S'arrête dès que la mission passe sous
+  // candidature_relance_imminent_threshold_minutes (relais pris par une alerte admin, pas de
+  // WhatsApp).
+  candidature_relance_client: {
+    template_name: 'relance_candidature_client',
+    variableCount: 2,
+    note: '{{1}} nombre de candidatures en attente, {{2}} titre de la mission',
+  },
 };

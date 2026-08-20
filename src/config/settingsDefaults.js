@@ -89,4 +89,21 @@ module.exports = {
   // (sans visage) pendant qu'une mission est 'active'. Voir schema.js
   // (missions.activity_photo_next_due_at), routes/missions.js et routes/media.js.
   activity_photo_interval_minutes: '45',
+  // PROMPT 5 (2026-08-18) — rappel intermédiaire client pendant la fenêtre de validation
+  // (client_validation_hours=12 par défaut) : envoyé à H+6, à mi-parcours avant l'auto-validation
+  // silencieuse. Voir jobs/autoValidateMissions.js:runValidationReminders.
+  client_validation_reminder_hours: '6',
+  // Relance WhatsApp des candidatures non choisies par le client — 1er renvoi
+  // candidature_relance_first_after_minutes après la notification initiale
+  // (candidature_whatsapp_sent_at), puis tous les candidature_relance_interval_minutes. Si la
+  // mission passe sous candidature_relance_imminent_threshold_minutes avant scheduled_at, la
+  // relance WhatsApp est remplacée par une alerte admin (onglet "Missions proches sans
+  // validation") — voir cron dédié, index.js.
+  candidature_relance_first_after_minutes: '60',
+  candidature_relance_interval_minutes: '120',
+  candidature_relance_imminent_threshold_minutes: '120',
+  // Relance par email si une notification WhatsApp à délai court (cascade candidat ~10min,
+  // confirmation de présence H-45) reste non lue ce délai après l'envoi — voir cron dédié,
+  // index.js, et services/email.js.
+  unread_whatsapp_email_fallback_minutes: '5',
 };
