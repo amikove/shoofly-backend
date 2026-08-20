@@ -73,6 +73,12 @@ module.exports = {
   late_cancel_penalty_tier3_points: '-50',
   late_cancel_penalty_tier1_threshold_hours: '24',
   late_cancel_penalty_tier2_threshold_hours: '2',
+  // Palier 1 (préavis >= 24h) rendu délibérément inatteignable (PROMPT 1 point 5, 2026-08-17,
+  // section 0/B4 : "toute annulation hors motif légitime ET moins de 24h doit être pénalisée" —
+  // interprété comme : un préavis de 24h ou plus n'est plus pénalisé du tout). Réglage plutôt que
+  // constante figée dans le code : un admin peut réactiver ce palier depuis l'écran Paramètres,
+  // sans déploiement, si l'interprétation s'avérait fausse — voir computeLatePenalty, utils/reliabilityScore.js.
+  late_cancel_penalty_tier1_enabled: 'false',
   presence_confirmation_deadline_minutes_h45: '15',
   password_reset_token_expiry_hours: '1',
 };

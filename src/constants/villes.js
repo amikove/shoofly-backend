@@ -35,6 +35,29 @@ function resolveCity(input) {
   return CITY_BY_LOWER.get(input.trim().toLowerCase()) || null;
 }
 
+// Format minimal d'un nom de ville : lettres (accents compris), espaces, apostrophes, tirets.
+// Sert uniquement à distinguer un input structurellement absurde (vide, chiffres, JSON...) d'un
+// nom de ville plausible mais hors de notre périmètre — voir validateCityInput ci-dessous
+// (PROMPT 1 point 3, 2026-08-17 : "Ville invalide" ne doit plus être renvoyé pour une ville
+// simplement non couverte).
+const CITY_FORMAT_RE = /^[A-Za-zÀ-ÖØ-öø-ÿ' -]{2,100}$/;
+
+// Valide un input ville en distinguant deux causes d'échec bien différentes pour l'utilisateur :
+// - format absurde (vide, non-string, chiffres/symboles...) → 'Ville invalide'
+// - format plausible mais absente de VILLES (liste figée, couverture Shoofly) → 'Ville non couverte'
+// Retourne { city } si valide, { error, code } sinon. Réutilisé par prepareMissionInsert
+// (création) et validateMissionEditFields (modification) pour ne jamais diverger.
+function validateCityInput(input) {
+  if (typeof input !== 'string' || !CITY_FORMAT_RE.test(input.trim())) {
+    return { error: 'Ville invalide', code: 'invalid_format' };
+  }
+  const canonicalCity = resolveCity(input);
+  if (!canonicalCity) {
+    return { error: 'Ville non couverte', code: 'not_covered' };
+  }
+  return { city: canonicalCity };
+}
+
 // Vérifie qu'un quartier appartient bien à la ville donnée (comparaison insensible à la casse).
 // `city` doit déjà être la forme canonique (résolue via resolveCity).
 function isValidQuartier(city, quartier) {
@@ -54,4 +77,4 @@ function resolveQuartier(city, quartier) {
   return list.find(q => q.toLowerCase() === target) || null;
 }
 
-module.exports = { VILLES, VILLES_LIST, resolveCity, isValidQuartier, resolveQuartier };
+module.exports = { VILLES, VILLES_LIST, resolveCity, isValidQuartier, resolveQuartier, validateCityInput };
