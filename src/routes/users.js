@@ -8,6 +8,7 @@ const { refundOnCancellation } = require('../utils/refund');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const walletService = require('../services/walletService');
 const { settleCashCommission } = require('../utils/cashCommission');
+const { applyClientStrike } = require('../utils/clientStrikes');
 const cashplusService = require('../services/cashplus');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
@@ -1468,6 +1469,8 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
               transfer_deadline: deadline,
               transfer_no_penalty: true,
               oeil_id: null,
+              batch_wave_count: 0,
+              transfer_h30_no_show: false,
             },
             note: 'Réattribution automatique — Œil suspendu par un admin',
           });
@@ -1505,6 +1508,72 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
       res.json({ is_active: u.is_active, reassigned_missions: reassignedCount });
     }
   }));
+
+// ── Admin : "Clients suspendus" — strikes no-show ──────────────────────────
+// (PROMPT 2 point 6, 2026-08-17) — liste dédiée aux clients touchés par le mécanisme de strike
+// no-show (utils/clientStrikes.js), distincte de la gestion Œil existante (AdminFiabilite.jsx,
+// PUT /admin/:id/toggle-active ci-dessus) : ce mécanisme n'a rien à voir avec is_suspended
+// (réservé role='oeil') — il agit sur is_active, comme le fait déjà le toggle générique
+// ci-dessus pour tout rôle non-oeil, mais avec un historique de strikes attaché.
+// status='blocked' (défaut) : bloqués maintenant (is_active=false). 'unblocked' : ont eu au
+// moins un strike mais actuellement actifs (débloqués, ou jamais passés sous le seuil de 2).
+// 'all' : les deux.
+router.get('/admin/clients/strikes', authenticate, requireRole('admin'), requirePermission('users'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { status = 'blocked' } = req.query;
+
+  let activeFilter = '';
+  if (status === 'blocked') activeFilter = 'AND u.is_active = false';
+  else if (status === 'unblocked') activeFilter = 'AND u.is_active = true';
+
+  const { rows } = await db.query(`
+    SELECT u.id, u.first_name, u.last_name, u.phone, u.email, u.city, u.is_active, u.client_noshow_strikes,
+      (SELECT MAX(created_at) FROM client_strikes WHERE client_id=u.id) AS last_strike_at
+    FROM users u
+    WHERE u.role='client' AND u.client_noshow_strikes >= 1 ${activeFilter}
+    ORDER BY u.client_noshow_strikes DESC, last_strike_at DESC
+  `);
+  res.json({ clients: rows });
+}));
+
+// ── Admin : historique des strikes d'un client ──────────────────────────────
+router.get('/admin/clients/:id/strikes', authenticate, requireRole('admin'), requirePermission('users'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT cs.*, m.title AS mission_title
+    FROM client_strikes cs
+    JOIN missions m ON m.id = cs.mission_id
+    WHERE cs.client_id=$1
+    ORDER BY cs.created_at DESC
+  `, [req.params.id]);
+  res.json({ strikes: rows });
+}));
+
+// ── Admin : débloquer un client (strikes no-show) ───────────────────────────
+// Réinitialise le compteur (client_noshow_strikes=0), pas seulement is_active — même principe
+// que la réintégration d'un Œil suspendu (AdminFiabilite.jsx, score de réintégration) : un
+// déblocage doit repartir sur une ardoise vierge, sinon le tout prochain strike (3e) re-bloquerait
+// immédiatement le compte (voir clientStrikes.js, condition count>=2), rendant le déblocage
+// quasiment sans effet.
+router.post('/admin/clients/:id/unblock', authenticate, requireRole('admin'), requirePermission('users'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+
+  const { rows: [target] } = await db.query(`SELECT role, is_active FROM users WHERE id=$1`, [req.params.id]);
+  if (!target) return res.status(404).json({ error: 'Introuvable' });
+  if (target.role !== 'client') return res.status(400).json({ error: 'Réservé aux comptes client.' });
+
+  const { rows: [updated] } = await db.query(
+    `UPDATE users SET is_active=true, client_noshow_strikes=0 WHERE id=$1 RETURNING is_active, client_noshow_strikes`,
+    [req.params.id]
+  );
+
+  await missionRoutes.notify(db, req.params.id, '✅ Compte réactivé',
+    'Votre compte a été réactivé par un administrateur.',
+    'success', null, emitToUser, null, 'accountReactivatedTitle', 'accountUnsuspendedAdminBody', null);
+
+  res.json({ ok: true, is_active: updated.is_active, client_noshow_strikes: updated.client_noshow_strikes });
+}));
 
 // ── Admin : paramètres ─────────────────────────────────────
 router.get('/admin/settings', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
@@ -1630,36 +1699,57 @@ router.get('/admin/claims', authenticate, requireRole('admin'), requirePermissio
 }));
 
 // ── Admin : résoudre une réclamation ───────────────────────
+// PROMPT 2 (2026-08-17, section 0) — dispute_reason='client_absent' (optionnel, decision='oeil'
+// uniquement) : (a) pour une mission cash, la commission n'est PLUS débitée automatiquement dans
+// cette même transaction — elle reste en attente (commission_decision IS NULL) jusqu'à une
+// décision admin séparée et explicite, voir POST /admin/claims/:missionId/commission ; (b)
+// déclenche un strike no-show client (utils/clientStrikes.js), lui aussi indépendant de la
+// décision commission — les deux ne sont jamais la même action dans le code. payzone et tout
+// autre cash (dispute_reason omis) gardent le comportement automatique historique, inchangé.
 router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { decision } = req.body;
+  const { decision, dispute_reason } = req.body;
   if (!['oeil','client'].includes(decision)) return res.status(400).json({ error: 'Décision invalide' });
+  if (dispute_reason !== undefined && dispute_reason !== null && dispute_reason !== 'client_absent') {
+    return res.status(400).json({ error: 'Motif de litige invalide' });
+  }
+  const isClientAbsent = decision === 'oeil' && dispute_reason === 'client_absent';
 
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.missionId]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
   if (mission.status !== 'sous_reclamation') return res.status(409).json({ error: 'Cette réclamation a déjà été traitée' });
 
-  // Écritures DB interdépendantes (statut, solde, ledger, claims) dans une seule
+  // Écritures DB interdépendantes (statut, solde, ledger, claims, strike) dans une seule
   // transaction — la garde optimiste de transitionMission (WHERE status=$X) protège
   // contre deux admins résolvant la même réclamation simultanément (la 2e requête
   // reçoit STALE_STATE -> 409, aucune double écriture possible).
   let refund;
-  // Rempli uniquement pour decision='oeil' + payment_method='cash' — voir
-  // routes/missions.js POST /:id/validate pour la même logique et sa justification détaillée.
+  // Rempli uniquement pour decision='oeil' + payment_method='cash' + PAS dispute_reason=
+  // 'client_absent' (comportement historique) — voir routes/missions.js POST /:id/validate pour
+  // la même logique et sa justification détaillée.
   let cashSettlement = null;
+  let strikeResult = null;
   try {
     await walletService.withTransaction(db, async (client) => {
       if (decision === 'oeil') {
         if (mission.payment_method === 'payzone') {
           await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Mission validée après réclamation', mission.id);
-        } else {
+        } else if (!isClientAbsent) {
           cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (réclamation résolue en faveur de l\'Œil)');
         }
+        // else : cash + client_absent — commission volontairement laissée en attente (voir
+        // POST /admin/claims/:missionId/commission ci-dessous), aucun débit ici.
         await transitionMission(client, mission.id, 'sous_reclamation', 'completed', req.user.id, {
           extraFields: { validated_at: 'NOW()', is_priority: false },
           note: 'Réclamation résolue en faveur de l\'Œil',
         });
-        await client.query(`UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
+        await client.query(
+          `UPDATE claims SET status='resolved_oeil', resolved_by=$1, resolved_at=NOW(), dispute_reason=$3 WHERE mission_id=$2`,
+          [req.user.id, mission.id, dispute_reason || null]
+        );
+        if (isClientAbsent) {
+          strikeResult = await applyClientStrike(client, mission.client_id, mission.id, 'client_absent', req.user.id);
+        }
       } else {
         // Réclamation gagnée par le client, non imputable à lui : remboursement intégral —
         // uniquement pour 'payzone' (Shoofly a réellement encaissé le client en ligne). Pour
@@ -1673,7 +1763,10 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
           extraFields: { is_priority: false },
           note: 'Réclamation résolue en faveur du client',
         });
-        await client.query(`UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW() WHERE mission_id=$2`, [req.user.id, mission.id]);
+        await client.query(
+          `UPDATE claims SET status='resolved_client', resolved_by=$1, resolved_at=NOW(), dispute_reason=$3 WHERE mission_id=$2`,
+          [req.user.id, mission.id, dispute_reason || null]
+        );
         // Fermer automatiquement tout signalement encore ouvert lié à cette mission —
         // la mission étant annulée, le problème signalé est désormais sans objet.
         await client.query(
@@ -1704,10 +1797,38 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   if (decision === 'oeil') {
     if (cashSettlement) {
       await notify(mission.oeil_id, '✅ Réclamation résolue', `Résolue en votre faveur. ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { amount: cashSettlement.collected });
+    } else if (isClientAbsent) {
+      await notify(mission.oeil_id, '✅ Réclamation résolue', "Résolue en votre faveur. La décision concernant la commission (débitée ou libérée) vous sera communiquée séparément par un administrateur.", 'claimResolvedOeilWinPendingCommissionTitle', 'claimResolvedOeilWinPendingCommissionBody', null);
     } else {
       await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.', 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
     }
     await notify(mission.client_id, 'Réclamation résolue', 'Résolue en faveur de l\'Œil.', 'claimResolvedClientLoseTitle', 'claimResolvedClientLoseBody', null);
+
+    // PROMPT 2 — strike no-show client, notification distincte selon le seuil franchi. Une
+    // notification "avertissement" au 1er strike, "compte suspendu" (+ alerte tous admins)
+    // seulement au strike qui fait réellement basculer is_active à false (justBlocked) — pas à
+    // chaque strike suivant si le compte est réintégré puis re-strické (voir clientStrikes.js).
+    if (strikeResult) {
+      if (strikeResult.justBlocked) {
+        await notify(mission.client_id, '🔴 Compte suspendu',
+          'Votre compte a été suspendu suite à plusieurs litiges "client absent" résolus en faveur de l\'Œil. Contactez le support pour plus d\'informations.',
+          'clientBlockedNoShowTitle', 'clientBlockedNoShowBody', null);
+
+        const { rows: [clientInfo] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [mission.client_id]);
+        const clientName = clientInfo ? `${clientInfo.first_name} ${clientInfo.last_name}`.trim() : 'Client';
+        const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`);
+        for (const admin of admins) {
+          await notify(admin.id, '🔴 Client bloqué automatiquement',
+            `Le client ${clientName} a été bloqué automatiquement après ${strikeResult.count} litiges "client absent" résolus en sa défaveur.`,
+            'clientBlockedNoShowAdminTitle', 'clientBlockedNoShowAdminBody', { clientName, count: strikeResult.count });
+        }
+
+      } else if (strikeResult.count === 1) {
+        await notify(mission.client_id, '⚠️ Avertissement',
+          'Un litige "client absent" a été résolu en faveur de l\'Œil sur une mission récente. En cas de récidive, votre compte pourra être suspendu.',
+          'clientNoShowWarningTitle', 'clientNoShowWarningBody', null);
+      }
+    }
   } else {
     if (mission.payment_method === 'cash') {
       await notify(mission.client_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Mission annulée.', 'claimResolvedClientWinCashTitle', 'claimResolvedClientWinCashBody', null);
@@ -1724,7 +1845,73 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   // la cascade de réattribution), même pattern que router.checkTransferDeadlines etc.
   missionRoutes.closeMissionChatRoom(io, mission.id);
 
-  res.json({ ok: true });
+  res.json({ ok: true, strike: strikeResult });
+}));
+
+// ── Admin : décision commission différée (litige "client absent", cash) ───────────────────
+// PROMPT 2 (2026-08-17, section 0) — action DÉLIBÉRÉMENT séparée de la résolution ci-dessus
+// (jamais fusionnée dans le même appel/la même fonction) : un admin peut choisir de libérer la
+// commission tout en ayant déjà posé un strike, ou l'inverse, à des moments différents. Réservée
+// aux réclamations résolues en faveur de l'Œil avec dispute_reason='client_absent' — pour toute
+// autre réclamation, la commission a déjà été réglée automatiquement par la route ci-dessus (rien
+// à décider ici).
+router.post('/admin/claims/:missionId/commission', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { decision } = req.body; // 'debit' | 'release'
+  if (!['debit', 'release'].includes(decision)) return res.status(400).json({ error: 'Décision invalide (attendu : debit ou release)' });
+
+  const { rows: [claim] } = await db.query('SELECT * FROM claims WHERE mission_id=$1', [req.params.missionId]);
+  if (!claim) return res.status(404).json({ error: 'Réclamation introuvable' });
+  if (claim.status !== 'resolved_oeil' || claim.dispute_reason !== 'client_absent') {
+    return res.status(400).json({ error: 'Décision commission réservée aux réclamations "client absent" résolues en faveur de l\'Œil.' });
+  }
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.missionId]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.payment_method !== 'cash') return res.status(400).json({ error: 'Décision commission réservée aux missions cash.' });
+
+  // Garde d'idempotence posée sur l'UPDATE lui-même — même principe que le reste de cette
+  // session : si deux admins décident en concurrence, un seul applique réellement le débit.
+  const { rowCount } = await db.query(
+    `UPDATE claims SET commission_decision=$1, commission_decided_by=$2, commission_decided_at=NOW() WHERE mission_id=$3 AND commission_decision IS NULL`,
+    [decision === 'debit' ? 'debited' : 'released', req.user.id, req.params.missionId]
+  );
+  if (rowCount === 0) return res.status(409).json({ error: 'La commission a déjà été décidée pour cette réclamation.' });
+
+  let cashSettlement = null;
+  if (decision === 'debit') {
+    await walletService.withTransaction(db, async (client) => {
+      cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (réclamation "client absent", décision admin différée)');
+    });
+  }
+
+  const emitToUser = req.app.get('emitToUser');
+  if (decision === 'debit') {
+    await missionRoutes.notify(db, mission.oeil_id, 'Commission débitée',
+      `Suite à votre réclamation résolue en votre faveur sur "${mission.title}", ${cashSettlement.collected} MAD de commission ont été débités de votre wallet (mission cash).`,
+      'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { missionTitle: mission.title, amount: cashSettlement.collected });
+  } else {
+    await missionRoutes.notify(db, mission.oeil_id, 'Commission libérée',
+      `Un administrateur a décidé de ne pas prélever de commission sur "${mission.title}".`,
+      'info', mission.id, emitToUser, null, 'commissionReleasedOeilTitle', 'commissionReleasedOeilBody', { missionTitle: mission.title });
+  }
+
+  res.json({ ok: true, commission_decision: decision === 'debit' ? 'debited' : 'released', collected: cashSettlement?.collected ?? 0 });
+}));
+
+// ── Admin : réclamations "client absent" en attente de décision commission ─────────────────
+router.get('/admin/claims/commission-pending', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT cl.*, m.title AS mission_title, m.price AS mission_price, m.commission AS mission_commission, m.oeil_id,
+      o.first_name||' '||o.last_name AS oeil_name
+    FROM claims cl
+    JOIN missions m ON m.id = cl.mission_id
+    JOIN users o ON o.id = m.oeil_id
+    WHERE cl.status='resolved_oeil' AND cl.dispute_reason='client_absent' AND cl.commission_decision IS NULL
+    ORDER BY cl.resolved_at ASC
+  `);
+  res.json({ claims: rows });
 }));
 
 

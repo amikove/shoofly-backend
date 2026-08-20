@@ -56,6 +56,10 @@ module.exports = {
   presence_confirmation_deadline_minutes_sameday: '45',
   candidate_batch_size: '10',
   candidate_tiebreak_window_minutes: '5',
+  // PROMPT 2 (2026-08-17) — plafonne le nombre de lots successifs qu'advanceCandidateCascade
+  // tire avant de passer en recherche élargie (is_urgent=true), au lieu d'un tirage illimité tant
+  // que mission_interests n'est pas épuisé. Voir schema.js (missions.batch_wave_count).
+  candidate_batch_max_waves: '2',
   payment_attempt_abandoned_minutes: '30',
   urgent_mission_whatsapp_batch_size: '10',
   urgent_mission_whatsapp_batch_delay_minutes: '30',
@@ -81,4 +85,8 @@ module.exports = {
   late_cancel_penalty_tier1_enabled: 'false',
   presence_confirmation_deadline_minutes_h45: '15',
   password_reset_token_expiry_hours: '1',
+  // PROMPT 2 (2026-08-17) — détection d'abandon sans GPS : fréquence de la demande de photo
+  // (sans visage) pendant qu'une mission est 'active'. Voir schema.js
+  // (missions.activity_photo_next_due_at), routes/missions.js et routes/media.js.
+  activity_photo_interval_minutes: '45',
 };

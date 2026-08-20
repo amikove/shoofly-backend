@@ -666,12 +666,14 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
   const { rows: missions } = await db.query(`
       SELECT m.*,
         c.first_name||' '||c.last_name AS client_name, c.phone AS client_phone, c.avatar_url AS client_avatar,
+        c.client_rating_avg AS client_rating_avg, c.client_rating_count AS client_rating_count,
         o.first_name||' '||o.last_name AS oeil_name,   o.phone AS oeil_phone,   o.avatar_url AS oeil_avatar,
         (SELECT COUNT(*) FROM mission_media WHERE mission_id=m.id)::int AS media_count,
         (SELECT COUNT(*) FROM mission_messages WHERE mission_id=m.id)::int AS message_count,
         (SELECT COUNT(*) FROM mission_interests WHERE mission_id=m.id AND oeil_id='${req.user.id}')::int > 0 AS has_interested,
         (SELECT score FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_score,
         (SELECT comment FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_comment,
+        (SELECT score FROM client_ratings WHERE mission_id=m.id LIMIT 1) AS client_rating_score_given,
         (SELECT row_to_json(er) FROM (
           SELECT id, proposed_changes, expires_at, created_at FROM mission_edit_requests
           WHERE mission_id=m.id AND status='pending' LIMIT 1
@@ -1103,7 +1105,7 @@ router.post('/edit-requests/:id/reject', authenticate, requireRole('oeil'), asyn
   let updatedMission;
   try {
     updatedMission = await transitionMission(db, mission.id, 'assigned', 'pending', req.user.id, {
-      extraFields: { oeil_id: null, is_priority: true, transfer_deadline: deadline },
+      extraFields: { oeil_id: null, is_priority: true, transfer_deadline: deadline, batch_wave_count: 0, transfer_h30_no_show: false },
       note: 'Demande de modification refusée par l\'Œil',
     });
   } catch (e) {
@@ -1281,6 +1283,7 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   const { rows: [mission] } = await db.query(`
     SELECT m.*,
       c.first_name||' '||c.last_name AS client_name, c.phone AS client_phone, c.email AS client_email,
+      c.client_rating_avg AS client_rating_avg, c.client_rating_count AS client_rating_count,
       o.first_name||' '||o.last_name AS oeil_name,   o.phone AS oeil_phone,
       p.rating_avg AS oeil_rating, p.total_missions AS oeil_total_missions,
       (SELECT row_to_json(er) FROM (
@@ -1644,7 +1647,15 @@ router.post('/:id/status', authenticate, [
   const extraFields = { updated_at: 'NOW()' };
   if (status === 'completed') { extraFields.completed_at = 'NOW()'; extraFields.completed_by_oeil_at = 'NOW()'; }
   if (status === 'cancelled') { extraFields.cancelled_at = 'NOW()'; extraFields.cancel_reason = cancel_reason || null; }
-  if (status === 'active') extraFields.started_at = 'NOW()';
+  if (status === 'active') {
+    extraFields.started_at = 'NOW()';
+    // PROMPT 2 (2026-08-17) — détection d'abandon sans GPS : amorce la première échéance de
+    // demande de photo dès le démarrage réel de la mission. Voir routes/media.js (reset à
+    // chaque photo reçue de l'Œil assigné) et index.js (cron d'alerte si dépassée sans photo).
+    const activityPhotoIntervalMinutes = await getSetting(db, 'activity_photo_interval_minutes', 45);
+    extraFields.activity_photo_next_due_at = new Date(Date.now() + activityPhotoIntervalMinutes * 60 * 1000);
+    extraFields.activity_photo_alerted = false;
+  }
   if (['cancelled', 'completed'].includes(status)) extraFields.is_priority = false;
   delete extraFields.updated_at; // déjà géré systématiquement par transitionMission
 
@@ -1687,6 +1698,12 @@ router.post('/:id/status', authenticate, [
         [updated.id, updated.oeil_id]
       );
     }
+
+    // PROMPT 2 — première demande de photo (sans visage) de la fenêtre qui vient de s'ouvrir
+    // (activity_photo_next_due_at posé ci-dessus).
+    await notify(db, updated.oeil_id, '📸 Photo de suivi requise',
+      "Merci d'envoyer une photo dans la messagerie de la mission toutes les 45 minutes pendant son déroulement (aucun visage ne doit apparaître sur la photo).",
+      'mission', updated.id, emitToUser, 'mission_view', 'activityPhotoRequestTitle', 'activityPhotoRequestBody', { missionTitle: updated.title });
   }
 
   // Remboursement en cas d'annulation — dépend de QUI est à l'origine de l'annulation,
@@ -2069,6 +2086,39 @@ await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${
   });
 }));
 
+// ── POST /:id/rate-client ── Œil note le client ───────────
+// (PROMPT 2 point 5, 2026-08-17) — symétrique de POST /:id/rate ci-dessus (client note l'Œil),
+// mais volontairement plus simple : aucune conséquence financière (pas de bonus qualité) ni de
+// score de fiabilité pour un client — ces deux mécaniques sont spécifiques au statut de
+// prestataire de l'Œil, sans équivalent côté client dans ce projet. Aucune notification au
+// client (non demandé — cette note sert aux AUTRES Œils avant de candidater, pas au client
+// lui-même).
+router.post('/:id/rate-client', authenticate, requireRole('oeil'), [
+  body('score').isInt({ min: 1, max: 5 }),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const db = getDb();
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+  if (mission.status !== 'completed') return res.status(400).json({ error: 'Mission non complétée' });
+
+  const existing = await db.query('SELECT id FROM client_ratings WHERE mission_id=$1', [req.params.id]);
+  if (existing.rows.length) return res.status(409).json({ error: 'Déjà noté' });
+
+  await db.query(
+    `INSERT INTO client_ratings (mission_id, oeil_id, client_id, score, comment) VALUES ($1,$2,$3,$4,$5)`,
+    [mission.id, req.user.id, mission.client_id, req.body.score, req.body.comment || null]
+  );
+
+  const { rows: [avg] } = await db.query('SELECT AVG(score)::numeric(3,1) AS a, COUNT(*)::int AS c FROM client_ratings WHERE client_id=$1', [mission.client_id]);
+  await db.query('UPDATE users SET client_rating_avg=$1, client_rating_count=$2 WHERE id=$3', [avg.a, avg.c, mission.client_id]);
+
+  res.status(201).json({ rating_avg: avg.a, rating_count: avg.c });
+}));
+
 // ── POST /:id/interest ── Œil exprime son intérêt ─────────
 
 router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
@@ -2220,6 +2270,8 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
         transfer_deadline: deadline,
         transfer_no_penalty: skipReliabilityPenalty,
         oeil_id: null,
+        batch_wave_count: 0,
+        transfer_h30_no_show: false,
       },
       extraGuards: { oeil_id: oeilId },
       note: `${historyNoteVerb} (${transferType === 'before' ? 'avant démarrage' : 'en cours de mission'})`,
@@ -2544,6 +2596,62 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
   res.json({ ok: true, action: 'disputed', ticket_reference: ticket.reference });
 }));
 
+// ── POST /missions/:id/force-reassign ── Admin force une réattribution (mission active/en_route) ──
+// (PROMPT 2 point 4, 2026-08-17). Même mécanique que POST /:id/assistance{urgence} ci-dessus —
+// réutilise releaseMissionForReplacement telle quelle (transitionMission/cooldown/cascade
+// identiques), SANS pénalité de fiabilité au déclenchement (skipReliabilityPenalty:true) : un
+// admin qui force une réattribution ne peut pas juger en temps réel s'il s'agit d'un abandon ou
+// d'une situation légitime (perte de contact, doute...). Insère une ligne
+// mission_assistance_requests (category='urgence', triggered_by_admin_id posé) pour rester
+// requalifiable a posteriori via POST /missions/assistance-requests/:id/requalify (PROMPT 1
+// point 5, totalement inchangée — elle ne distingue pas l'origine de la ligne) : même parcours
+// que si l'Œil avait lui-même déclaré une urgence, cohérence explicitement demandée avec le
+// prompt 1. Réservée à 'active'/'en_route' (pas 'assigned', scope explicite de la demande) —
+// pour une mission encore 'assigned', l'admin dispose déjà de PUT /:id/admin-edit et de
+// l'affectation directe.
+router.post('/:id/force-reassign', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+  const { reason } = req.body;
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'Le motif est obligatoire' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (!['active', 'en_route'].includes(mission.status)) {
+    return res.status(400).json({ error: 'Réattribution forcée réservée aux missions "active" ou "en_route".' });
+  }
+  if (!mission.oeil_id) return res.status(400).json({ error: 'Aucun Œil actuellement assigné à cette mission.' });
+
+  const trimmedReason = reason.trim();
+  const oeilId = mission.oeil_id;
+  const fullReason = `Réattribution forcée par un administrateur : ${trimmedReason}`;
+
+  const result = await releaseMissionForReplacement(db, io, emitToUser, mission, oeilId, fullReason, {
+    historyNoteVerb: 'Réattribution forcée par un administrateur',
+    clientAlertTitle: '⚠️ Changement sur votre mission',
+    clientAlertBody: `Un administrateur a lancé la recherche d'un remplaçant pour "${mission.title}".`,
+    clientAlertTitleKey: 'forceReassignClientTitle',
+    clientAlertBodyKey: 'forceReassignClientBody',
+    systemMessageText: 'Un administrateur a lancé une recherche de remplaçant pour cette mission.',
+    systemMessageKey: 'forceReassignSystemMessage',
+    skipReliabilityPenalty: true,
+  });
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+
+  const { rows: [assistanceRequest] } = await db.query(
+    `INSERT INTO mission_assistance_requests (mission_id, oeil_id, category, reason, status, transfer_type, responded_at, triggered_by_admin_id)
+     VALUES ($1,$2,'urgence',$3,'triggered',$4,NOW(),$5) RETURNING *`,
+    [mission.id, oeilId, fullReason, result.transferType, req.user.id]
+  );
+
+  await notify(db, oeilId, 'Mission réattribuée par un administrateur',
+    `Un administrateur a lancé une recherche de remplaçant pour "${mission.title}". Aucune pénalité ne vous a été appliquée pour le moment.`,
+    'mission', mission.id, emitToUser, null, 'forceReassignOeilTitle', 'forceReassignOeilBody', { missionTitle: mission.title });
+
+  res.json({ ok: true, assistance_request_id: assistanceRequest.id, transfer_type: result.transferType, deadline: result.deadline });
+}));
+
 // ── POST /missions/assistance-requests/:id/requalify ── Admin requalifie une urgence a posteriori ──
 // (PROMPT 1 point 5, 2026-08-17 — section 0/B4). Le chemin assistance/urgence reste et doit
 // rester sans pénalité au moment où l'Œil le déclenche (releaseMissionForReplacement,
@@ -2607,6 +2715,70 @@ router.post('/assistance-requests/:id/requalify', authenticate, requireRole('adm
   });
 }));
 
+// ── POST /missions/assistance-requests/:id/commission ── Admin décide de la commission (auto-validation 12h, cash) ──
+// (PROMPT 2, 2026-08-17, section 0) — pendant de POST /admin/claims/:missionId/commission
+// (routes/users.js) pour la voie SILENCIEUSE (checkAssistanceRequestExpiry plus bas) : une
+// mission cash auto-validée à 12h laisse volontairement la commission en attente
+// (commission_decision IS NULL). Réservée à category='mission' + status='auto_validated' +
+// payment_method='cash' — jamais de strike associé ici (aucun jugement humain, voir le
+// commentaire de checkAssistanceRequestExpiry).
+router.post('/assistance-requests/:id/commission', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { decision } = req.body; // 'debit' | 'release'
+  if (!['debit', 'release'].includes(decision)) return res.status(400).json({ error: 'Décision invalide (attendu : debit ou release)' });
+
+  const { rows: [assistanceRequest] } = await db.query('SELECT * FROM mission_assistance_requests WHERE id=$1', [req.params.id]);
+  if (!assistanceRequest) return res.status(404).json({ error: 'Déclaration d\'assistance introuvable' });
+  if (assistanceRequest.category !== 'mission' || assistanceRequest.status !== 'auto_validated') {
+    return res.status(400).json({ error: 'Décision commission réservée aux déclarations auto-validées après délai (silence du client).' });
+  }
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [assistanceRequest.mission_id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.payment_method !== 'cash') return res.status(400).json({ error: 'Décision commission réservée aux missions cash.' });
+
+  // Garde d'idempotence posée sur l'UPDATE lui-même, même principe que le reste de cette session.
+  const { rowCount } = await db.query(
+    `UPDATE mission_assistance_requests SET commission_decision=$1, commission_decided_by=$2, commission_decided_at=NOW() WHERE id=$3 AND commission_decision IS NULL`,
+    [decision === 'debit' ? 'debited' : 'released', req.user.id, assistanceRequest.id]
+  );
+  if (rowCount === 0) return res.status(409).json({ error: 'La commission a déjà été décidée pour cette déclaration.' });
+
+  let cashSettlement = null;
+  if (decision === 'debit') {
+    await walletService.withTransaction(db, async (client) => {
+      cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (assistance auto-validée, décision admin différée)');
+    });
+  }
+
+  const emitToUser = req.app.get('emitToUser');
+  if (decision === 'debit') {
+    await notify(db, mission.oeil_id, 'Commission débitée',
+      `Suite à l'auto-validation de votre déclaration sur "${mission.title}", ${cashSettlement.collected} MAD de commission ont été débités de votre wallet (mission cash).`,
+      'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { missionTitle: mission.title, amount: cashSettlement.collected });
+  } else {
+    await notify(db, mission.oeil_id, 'Commission libérée',
+      `Un administrateur a décidé de ne pas prélever de commission sur "${mission.title}".`,
+      'info', mission.id, emitToUser, null, 'commissionReleasedOeilTitle', 'commissionReleasedOeilBody', { missionTitle: mission.title });
+  }
+
+  res.json({ ok: true, commission_decision: decision === 'debit' ? 'debited' : 'released', collected: cashSettlement?.collected ?? 0 });
+}));
+
+// ── GET /missions/assistance-requests/commission-pending ── Admin : file d'attente commission (auto-validation cash) ──
+router.get('/assistance-requests/commission-pending', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT ar.*, m.title AS mission_title, m.price AS mission_price, m.commission AS mission_commission, m.oeil_id,
+      o.first_name||' '||o.last_name AS oeil_name
+    FROM mission_assistance_requests ar
+    JOIN missions m ON m.id = ar.mission_id
+    JOIN users o ON o.id = m.oeil_id
+    WHERE ar.category='mission' AND ar.status='auto_validated' AND m.payment_method='cash' AND ar.commission_decision IS NULL
+    ORDER BY ar.responded_at ASC
+  `);
+  res.json({ assistance_requests: rows });
+}));
 // ── POST /missions/:id/confirm-presence ── L'Œil confirme sa présence ──
 // Confirmation active demandée au rappel J-1 20h ou, à défaut (mission assignée le jour
 // même), au rappel H-2 (voir index.js + checkPresenceConfirmationDeadlines ci-dessous).
@@ -2639,6 +2811,69 @@ router.post('/:id/confirm-presence', authenticate, requireRole('oeil'), asyncHan
   res.json({ ok: true, presence_confirmed_at: updated.presence_confirmed_at });
 }));
 
+// ── POST /missions/:id/resume-after-h30 ── L'Œil d'origine reprend après un transfert H+30 ──
+// (PROMPT 2 point 2, 2026-08-17 — section 0/C3). Un Œil transféré automatiquement à H+30 pour
+// non-démarrage (index.js, cron alertes H/H+30) peut en réalité être arrivé sur place peu après
+// (retard, embouteillage...) — s'il se manifeste avant qu'un remplaçant soit CONFIRMÉ (oeil_id
+// toujours NULL), la mission lui est restituée telle quelle. transfer_h30_no_show distingue ce
+// cas précis des autres origines de libération (URGENCE, suspension admin, blocage anti-fraude,
+// confirmation de présence manquée, edit-request refusée) qui posent toutes transferred_from mais
+// ne doivent jamais permettre cette reprise. status='pending' comme UNIQUE garde de
+// transitionMission (pas d'extraGuards sur oeil_id) : dans ce schéma, status='pending' implique
+// TOUJOURS oeil_id IS NULL (les deux sont posés atomiquement ensemble à chaque transition vers
+// pending) — passer oeil_id:null à extraGuards serait un piège (SQL `oeil_id=NULL` ne matche
+// jamais, voir missionStateMachine.js), donc jamais fait ici ; le contrôle "aucun remplaçant
+// confirmé" est déjà entièrement porté par fromStatus='pending' lui-même, exactement comme le
+// fait déjà hireOeilCore plus bas.
+router.post('/:id/resume-after-h30', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  if (mission.status !== 'pending' || mission.transferred_from !== req.user.id || !mission.transfer_h30_no_show) {
+    return res.status(403).json({ error: "Cette mission ne peut pas être reprise (déjà réattribuée à un remplaçant confirmé, ou origine du transfert différente d'un non-démarrage H+30)." });
+  }
+
+  let updated;
+  try {
+    updated = await transitionMission(db, mission.id, 'pending', 'assigned', req.user.id, {
+      extraFields: {
+        oeil_id: req.user.id, assigned_at: 'NOW()', is_priority: false, is_urgent: false,
+        transfer_deadline: null, candidate_window_ends_at: null, pending_candidate_id: null,
+        batch_tiebreak_ends_at: null, batch_wave_count: 0,
+        presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
+      },
+      extraGuards: { transferred_from: req.user.id },
+      note: "L'Œil d'origine a repris la mission après le transfert automatique H+30 (aucun remplaçant confirmé)",
+    });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) {
+      return res.status(409).json({ error: 'Un remplaçant a déjà été confirmé pour cette mission entre-temps.' });
+    }
+    throw e;
+  }
+
+  // Ardoise vierge sur la cascade éventuellement en cours (mêmes deux colonnes que hireOeilCore) —
+  // toute sollicitation en cours devient sans objet, la mission n'est plus recherchée.
+  await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
+
+  await notify(db, mission.client_id,
+    '✅ Votre Œil est de retour',
+    `L'Œil initialement assigné à "${mission.title}" est finalement arrivé et reprend la mission.`,
+    'mission', mission.id, emitToUser, null, 'oeilResumedAfterH30ClientTitle', 'oeilResumedAfterH30ClientBody',
+    { missionTitle: mission.title }
+  );
+
+  if (io) {
+    io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'assigned' });
+    io.to('room:admin').emit('mission_updated', updated);
+  }
+
+  res.json({ ok: true, mission: updated });
+}));
 // ── GET /:id/assignable-oeils ── Picker admin (assign-admin) : champs bruts ──
 // Route dédiée plutôt qu'un paramètre ajouté à GET /users/oeils : cette dernière est aussi
 // consommée par des écrans client (client/Oeils.jsx, client/Dashboard.jsx) avec le filtre
@@ -2993,6 +3228,8 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
           presence_confirmed_at: null,
           presence_confirmation_requested_at: null,
           presence_confirmation_deadline_at: null,
+          batch_wave_count: 0,
+          transfer_h30_no_show: false,
         },
         extraGuards: { oeil_id: oeilId },
         note: 'Réattribution automatique — confirmation de présence non reçue à temps',
@@ -3038,6 +3275,63 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
   }
 }
 
+// ── Cron : détection d'abandon sans GPS — photo de suivi manquante (mission active) ──
+// (PROMPT 2, 2026-08-17) — appelé depuis index.js via cron, toutes les 5 minutes, même cadence
+// que les autres vérifications de deadline (checkTransferDeadlines, checkPresenceConfirmation
+// Deadlines ci-dessus). activity_photo_next_due_at est posé au démarrage réel (POST /:id/status,
+// status='active') et repoussé à chaque photo reçue de l'Œil assigné (routes/media.js) — cette
+// fonction n'a donc qu'à comparer l'échéance à NOW(), jamais besoin de relire mission_media.
+// activity_photo_alerted évite de renotifier client/admin à chaque tick tant qu'aucune photo
+// n'est revenue depuis la première alerte (remis à false par routes/media.js dès la prochaine
+// photo reçue, y compris après une alerte déjà envoyée) — la mission reste donc trouvée par la
+// requête ci-dessous à chaque tick suivant tant qu'elle est toujours en retard, mais l'UPDATE
+// idempotent plus bas empêche toute renotification tant qu'alerted reste true.
+async function checkActivityPhotoDeadlines(db, io, emitToUser) {
+  const { rows: overdue } = await db.query(`
+    SELECT m.*, u.first_name, u.last_name
+    FROM missions m
+    JOIN users u ON u.id = m.oeil_id
+    WHERE m.status='active'
+      AND m.activity_photo_next_due_at IS NOT NULL
+      AND m.activity_photo_next_due_at <= NOW()
+      AND m.activity_photo_alerted = false
+  `);
+  if (overdue.length === 0) return;
+
+  // Un seul SELECT admins + un seul getSetting par tick, réutilisés pour chaque mission en
+  // retard ci-dessous (même principe que le cron alertes H/H+30 — audit perf 2026-07-26).
+  const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+  const intervalMinutes = await getSetting(db, 'activity_photo_interval_minutes', 45);
+
+  for (const mission of overdue) {
+    // Garde d'idempotence posée sur l'UPDATE lui-même : si une photo vient d'arriver pile à ce
+    // tick (routes/media.js repasse alerted à false en concurrence), on ne notifie personne.
+    const { rowCount } = await db.query(
+      `UPDATE missions SET activity_photo_alerted=true WHERE id=$1 AND activity_photo_alerted=false`,
+      [mission.id]
+    );
+    if (rowCount === 0) continue;
+
+    await notify(db, mission.client_id,
+      '⚠️ Absence de nouvelles de votre Œil',
+      `Votre Œil n'a pas envoyé de photo de suivi depuis un moment sur "${mission.title}". Nous vérifions la situation.`,
+      'warning', mission.id, emitToUser, 'mission_view', 'activityPhotoMissingClientTitle', 'activityPhotoMissingClientBody',
+      { missionTitle: mission.title }
+    );
+
+    for (const admin of admins) {
+      await notify(db, admin.id,
+        '🚨 Abandon possible — photo de suivi manquante',
+        `L'Œil ${mission.first_name} ${mission.last_name} n'a envoyé aucune photo de suivi depuis plus de ${intervalMinutes} min sur "${mission.title}" (mission active).`,
+        'error', mission.id, emitToUser, 'admin_missions', 'activityPhotoMissingAdminTitle', 'activityPhotoMissingAdminBody',
+        { missionTitle: mission.title, oeilName: `${mission.first_name} ${mission.last_name}` }
+      );
+    }
+
+    if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, activity_photo_alerted: true });
+    console.log(`🚨 Photo de suivi manquante — mission ${mission.id}, alerte envoyée`);
+  }
+}
 
 // ── Cœur de la logique d'embauche d'un Œil parmi les intéressés — réutilisé
 // par POST /:id/hire/:oeilId (choix initial du client), par POST /:id/candidate-confirm
@@ -3248,8 +3542,18 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
   // laisser fuiter un solicited_at/confirmed_at périmé sur le cycle suivant.
   await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
 
+  // PROMPT 2 (2026-08-17) — plafond de lots successifs (candidate_batch_max_waves, défaut 2) :
+  // une fois atteint, on route directement vers la recherche élargie (branche candidates.length
+  // ===0 ci-dessous, is_urgent=true) sans tirer de nouveau lot, même si mission_interests contient
+  // encore des candidats jamais sollicités. batch_wave_count n'est incrémenté que lors d'un
+  // tirage réel (branche candidates.length>0) et remis à 0 à chaque nouveau cycle de libération
+  // authentique (tous les sites qui posent fraîchement transferred_from — jamais ici, sous peine
+  // de neutraliser le plafond à chaque appel de cette fonction).
+  const maxBatchWaves = await getSetting(db, 'candidate_batch_max_waves', 2);
+  const capReached = mission.batch_wave_count >= maxBatchWaves;
+
   const batchSize = await getSetting(db, 'candidate_batch_size', 10);
-  const { rows: candidates } = await db.query(`
+  const { rows: candidates } = capReached ? { rows: [] } : await db.query(`
     SELECT u.id
     FROM mission_interests mi
     JOIN users u ON u.id = mi.oeil_id
@@ -3268,7 +3572,7 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
     // autre chemin, annulée...), on n'écrase rien. pending_candidate_id garde le mieux classé
     // du lot à titre indicatif (affichage admin) uniquement — voir commentaire sur la colonne.
     const { rowCount } = await db.query(
-      `UPDATE missions SET pending_candidate_id=$1, candidate_window_ends_at=$2, batch_tiebreak_ends_at=NULL, updated_at=NOW()
+      `UPDATE missions SET pending_candidate_id=$1, candidate_window_ends_at=$2, batch_tiebreak_ends_at=NULL, batch_wave_count=batch_wave_count+1, updated_at=NOW()
        WHERE id=$3 AND status='pending' AND oeil_id IS NULL`,
       [candidateIds[0], windowEndsAt, mission.id]
     );
@@ -3643,7 +3947,7 @@ async function checkMissionEditRequestExpiry(db, io, emitToUser) {
     let updatedMission;
     try {
       updatedMission = await transitionMission(db, mission.id, 'assigned', 'pending', null, {
-        extraFields: { oeil_id: null, is_priority: true, transfer_deadline: deadline },
+        extraFields: { oeil_id: null, is_priority: true, transfer_deadline: deadline, batch_wave_count: 0, transfer_h30_no_show: false },
         note: 'Demande de modification expirée (délai dépassé sans réponse de l\'Œil)',
       });
     } catch (e) {
@@ -3682,6 +3986,14 @@ async function checkMissionEditRequestExpiry(db, io, emitToUser) {
 // (appelé depuis index.js via cron). Même principe que autoValidateMissions.js
 // (client_validation_hours réutilisé tel quel, même philosophie "silence du client = acceptation")
 // plutôt qu'un nouveau réglage dédié — voir rapport de session pour la justification.
+// PROMPT 2 (2026-08-17, section 0) — pour une mission cash, le silence du client continue de
+// CLÔTURER LE STATUT automatiquement (évite un blocage éternel de la mission), mais ne débite
+// plus automatiquement la commission : cette décision (débiter/libérer) part dans une file
+// d'attente admin dédiée (commission_decision IS NULL) — voir POST /missions/assistance-requests/
+// :id/commission plus bas. Aucun jugement humain n'a eu lieu ici (silence, pas résolution
+// active) : cette voie ne pose donc jamais de strike no-show client, contrairement à PUT
+// /admin/claims/:missionId/resolve (routes/users.js). payzone est inchangé (comportement
+// automatique conservé, Shoofly détient déjà l'argent).
 async function checkAssistanceRequestExpiry(db, io, emitToUser) {
   const { rows: expired } = await db.query(`
     SELECT * FROM mission_assistance_requests WHERE category='mission' AND status='pending' AND expires_at <= NOW()
@@ -3703,9 +4015,6 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
       continue;
     }
 
-    // Rempli uniquement pour payment_method='cash' — voir POST /:id/validate pour la même
-    // logique et sa justification détaillée.
-    let cashSettlement = null;
     try {
       await walletService.withTransaction(db, async (client) => {
         const { rowCount } = await client.query(
@@ -3716,9 +4025,9 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
 
         if (mission.payment_method === 'payzone') {
           await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée automatiquement (délai client dépassé)', mission.id);
-        } else {
-          cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (assistance auto-validée après délai)');
         }
+        // else (cash) : commission volontairement laissée en attente (commission_decision reste
+        // NULL) — voir POST /missions/assistance-requests/:id/commission, aucun débit ici.
         await transitionMission(client, mission.id, 'sous_reclamation', 'completed', null, {
           extraFields: { validated_at: 'NOW()', is_priority: false },
           note: 'Assistance mission auto-validée après délai sans réponse du client',
@@ -3732,10 +4041,10 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
       throw e;
     }
 
-    if (cashSettlement) {
-      await notify(db, mission.oeil_id, 'Mission clôturée automatiquement', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { missionTitle: mission.title, amount: cashSettlement.collected });
-    } else {
+    if (mission.payment_method === 'payzone') {
       await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedOeilTitle', 'assistanceAutoValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
+    } else {
+      await notify(db, mission.oeil_id, 'Mission clôturée automatiquement', `Délai écoulé sans réponse du client — "${mission.title}" clôturée. La décision concernant la commission (débitée ou libérée) vous sera communiquée séparément par un administrateur.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedPendingCommissionOeilTitle', 'assistanceAutoValidatedPendingCommissionOeilBody', { missionTitle: mission.title });
     }
     await notify(db, mission.client_id, 'Mission clôturée automatiquement', `Vous n'avez pas répondu à temps concernant "${mission.title}" — la déclaration de l'Œil a été considérée comme acceptée.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedClientTitle', 'assistanceAutoValidatedClientBody', { missionTitle: mission.title });
 
@@ -3751,6 +4060,7 @@ router.checkTransferDeadlines = checkTransferDeadlines;
 router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
 router.checkAssistanceRequestExpiry = checkAssistanceRequestExpiry;
 router.checkPresenceConfirmationDeadlines = checkPresenceConfirmationDeadlines;
+router.checkActivityPhotoDeadlines = checkActivityPhotoDeadlines;
 router.hireOeilCore = hireOeilCore;
 router.applyMissionEditChanges = applyMissionEditChanges;
 router.advanceCandidateCascade = advanceCandidateCascade;
