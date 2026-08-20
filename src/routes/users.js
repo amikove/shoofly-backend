@@ -1411,8 +1411,15 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
           );
       u = row;
     } else {
+      const { rows: [before] } = await db.query('SELECT is_active FROM users WHERE id=$1', [req.params.id]);
       const { rows: [row] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 RETURNING is_active`, [req.params.id]);
       u = row;
+      // Client désactivé avec une mission en cours (PROMPT 6, 2026-08-18) : l'Œil assigné devient
+      // décisionnaire (honorer/annuler sans pénalité) — voir handleClientDisabled, routes/missions.js.
+      // before.is_active check : ne déclenche qu'à la désactivation, jamais à la réactivation.
+      if (target.role === 'client' && before.is_active && !u.is_active) {
+        await missionRoutes.handleClientDisabled(db, req.params.id, emitToUser);
+      }
     }
 
     // Suspension (pas réactivation) d'un Œil ayant une mission active/en_route/assignée :
@@ -1823,6 +1830,13 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
             'clientBlockedNoShowAdminTitle', 'clientBlockedNoShowAdminBody', { clientName, count: strikeResult.count });
         }
 
+        // Client bloqué avec une AUTRE mission active en cours (PROMPT 6, 2026-08-18) — la
+        // mission qui a valu ce strike est déjà en train de se clôturer (sous_reclamation ->
+        // completed/cancelled juste au-dessus), mais un client peut avoir plusieurs missions
+        // simultanées ; l'Œil de toute autre mission encore active devient décisionnaire (voir
+        // handleClientDisabled, routes/missions.js). Volontairement hors de la transaction
+        // resolveClaim ci-dessus (déjà commit à ce stade, notify() fait un appel réseau/socket).
+        await missionRoutes.handleClientDisabled(db, mission.client_id, emitToUser);
       } else if (strikeResult.count === 1) {
         await notify(mission.client_id, '⚠️ Avertissement',
           'Un litige "client absent" a été résolu en faveur de l\'Œil sur une mission récente. En cas de récidive, votre compte pourra être suspendu.',

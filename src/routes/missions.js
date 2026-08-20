@@ -58,6 +58,28 @@ function closeMissionChatRoom(io, missionId) {
   io?.socketsLeave?.(`mission:${missionId}`);
 }
 
+// Compte client désactivé (is_active passe à false) alors qu'une mission est en cours avec un
+// Œil assigné (PROMPT 6, 2026-08-18). Appelée APRÈS commit depuis les deux points qui peuvent
+// désactiver un client : PUT /admin/:id/toggle-active (users.js, désactivation manuelle) et le
+// blocage automatique par strikes no-show (applyClientStrike, utils/clientStrikes.js — consommé
+// dans users.js après le commit de la transaction de résolution de litige, jamais depuis
+// l'intérieur de celle-ci — règle du projet : pas d'appel réseau/lent pendant qu'une connexion
+// DB est retenue). L'Œil assigné devient décisionnaire : voir GET /pending-client-disabled et
+// POST /:id/client-disabled-decision ci-dessous. Ne fait qu'un SELECT + des notify() — aucune
+// écriture sur la mission elle-même ici, la décision (et donc la seule écriture) revient à l'Œil.
+async function handleClientDisabled(db, clientId, emitToUser) {
+  const { rows: missions } = await db.query(
+    `SELECT id, title, oeil_id FROM missions
+     WHERE client_id=$1 AND oeil_id IS NOT NULL AND status IN ('assigned','en_route','active')`,
+    [clientId]
+  );
+  for (const mission of missions) {
+    await notify(db, mission.oeil_id, '⚠️ Compte client désactivé',
+      `Le compte du client de la mission "${mission.title}" a été désactivé. Vous pouvez choisir de continuer la mission normalement ou de l'annuler — aucune pénalité ne vous sera appliquée dans les deux cas.`,
+      'mission', mission.id, emitToUser, 'mission_view', 'clientDisabledOeilTitle', 'clientDisabledOeilBody', { missionTitle: mission.title });
+  }
+}
+
 // Délai de grâce lecture seule sur le chat après clôture (2026-07-31) — voir schema.js
 // (colonne missions.closed_at, posée par transitionMission à chaque transition vers
 // completed/cancelled) et prompt de session dédié. N'affecte QUE la lecture : l'envoi
@@ -1277,6 +1299,27 @@ router.get('/pending-confirmations', authenticate, requireRole('oeil'), asyncHan
   res.json({ pending_confirmations: rows });
 }));
 
+// ── GET /missions/pending-client-disabled ── Missions dont le client vient d'être désactivé ──
+// (PROMPT 6, 2026-08-18) — l'Œil assigné doit choisir honorer/annuler, voir
+// POST /:id/client-disabled-decision plus bas. Liste entièrement dérivée (voir schema.js,
+// commentaire de client_disabled_ack_at) : redevient vide d'elle-même si le client est réactivé.
+// Doit rester déclarée AVANT GET /:id ci-dessous (même piège que /pending-confirmations).
+router.get('/pending-client-disabled', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT m.id, m.title, m.scheduled_at,
+      c.first_name AS client_first_name, c.last_name AS client_last_name
+    FROM missions m
+    JOIN users c ON c.id = m.client_id
+    WHERE m.oeil_id = $1
+      AND m.status IN ('assigned','en_route','active')
+      AND c.is_active = false
+      AND m.client_disabled_ack_at IS NULL
+    ORDER BY m.scheduled_at ASC
+  `, [req.user.id]);
+  res.json({ pending_client_disabled: rows });
+}));
+
 // ── GET /missions/:id ──────────────────────────────────
 router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
@@ -1848,6 +1891,81 @@ router.post('/:id/status', authenticate, [
   io.to('room:admin').emit('mission_updated', updated);
 
   res.json({ mission: updated });
+}));
+
+// ── POST /missions/:id/client-disabled-decision ── Honorer ou annuler (PROMPT 6) ───────────
+// Réservée à l'Œil assigné, uniquement tant que le client de cette mission est désactivé et que
+// la mission est encore active. 'honor' : aucun changement de statut, seulement l'acquittement
+// (client_disabled_ack_at) pour ne plus reproposer le choix. 'cancel' : transition directe vers
+// 'cancelled', délibérément SANS passer par releaseMissionForReplacement — le client étant
+// désactivé, il n'y a plus personne à servir, donc pas de recherche de remplaçant — et SANS
+// pénalité de fiabilité (aucun appel à logReliabilityEvent, contrairement à ce que ferait
+// /transfer). Remboursement : non applicable ici — en pratique toutes les missions actives sont
+// payment_method='cash' (PayZone désactivé côté frontend depuis le 2026-08-13), et Shoofly n'a
+// jamais encaissé le client d'une mission cash (voir même garde-fou sur POST /:id/status).
+router.post('/:id/client-disabled-decision', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const io = req.app.get('io');
+  const emitToUser = req.app.get('emitToUser');
+  const { decision } = req.body;
+  if (!['honor', 'cancel'].includes(decision)) {
+    return res.status(400).json({ error: "decision doit être 'honor' ou 'cancel'" });
+  }
+
+  const { rows: [mission] } = await db.query(
+    `SELECT m.*, c.is_active AS client_is_active FROM missions m JOIN users c ON c.id=m.client_id WHERE m.id=$1`,
+    [req.params.id]
+  );
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+  if (!['assigned', 'en_route', 'active'].includes(mission.status)) {
+    return res.status(409).json({ error: 'Cette mission n\'est plus active.' });
+  }
+  if (mission.client_is_active) {
+    return res.status(409).json({ error: 'Le compte du client n\'est plus désactivé — rien à décider.' });
+  }
+
+  if (decision === 'honor') {
+    await db.query(`UPDATE missions SET client_disabled_ack_at=NOW() WHERE id=$1`, [req.params.id]);
+    return res.json({ ok: true, decision: 'honor' });
+  }
+
+  let updated;
+  try {
+    updated = await transitionMission(db, mission.id, mission.status, 'cancelled', req.user.id, {
+      extraFields: {
+        cancel_reason: 'Compte client désactivé — mission annulée par l\'Œil, sans pénalité',
+        client_disabled_ack_at: 'NOW()',
+        is_priority: false,
+      },
+      note: 'Compte client désactivé — annulée par l\'Œil sans pénalité',
+    });
+  } catch (e) {
+    if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+    throw e;
+  }
+
+  // Même nettoyage de clôture que POST /:id/status (signalements ouverts + surveillance) —
+  // cette route contourne délibérément /:id/status (pas de recherche de remplaçant, pas de
+  // pénalité), mais une mission 'cancelled' doit rester cohérente quel que soit le chemin emprunté.
+  await db.query(
+    `UPDATE mission_problem_reports SET status='resolved', admin_note=COALESCE(admin_note, 'Résolu automatiquement suite à l''annulation de la mission'), resolved_by=$1, resolved_at=NOW()
+       WHERE mission_id=$2 AND status IN ('open','in_progress')`,
+    [req.user.id, mission.id]
+  );
+  await db.query(`UPDATE missions SET under_surveillance=false WHERE id=$1`, [mission.id]);
+
+  await db.query(`INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,'Mission annulée.','system','missionCancelled')`,
+    [mission.id, req.user.id]);
+
+  await notify(db, mission.client_id, 'Mission annulée', `"${mission.title}" a été annulée.`,
+    'mission', mission.id, emitToUser, null, 'missionCancelledClientDisabledTitle', 'missionCancelledClientDisabledBody', { missionTitle: mission.title });
+
+  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'cancelled' });
+  closeMissionChatRoom(io, mission.id);
+  io.to('room:admin').emit('mission_updated', updated);
+
+  res.json({ ok: true, decision: 'cancel', mission: updated });
 }));
 
 // ── POST /missions/:id/location ────────────────────────────
@@ -4098,6 +4216,7 @@ router.applyMissionEditChanges = applyMissionEditChanges;
 router.advanceCandidateCascade = advanceCandidateCascade;
 router.notify = notify;
 router.closeMissionChatRoom = closeMissionChatRoom;
+router.handleClientDisabled = handleClientDisabled;
 router.chatAccessExpiresAt = chatAccessExpiresAt;
 router.pricing = pricing;
 router.prepareMissionInsert = prepareMissionInsert;
