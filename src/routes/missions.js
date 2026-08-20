@@ -1624,6 +1624,18 @@ router.post('/:id/status', authenticate, [
       if (!report) {
         return res.status(400).json({ error: 'Vous devez soumettre le rapport avant de terminer la mission' })
       }
+    } else {
+      // PROMPT 4 (2026-08-18) — preuve de déplacement : mission standard, au moins 1 photo
+      // envoyée par l'Œil assigné lui-même (n'importe laquelle, y compris une photo
+      // d'activité) avant de pouvoir clôturer — une photo envoyée par le client (chat) ne
+      // prouve pas le déplacement de l'Œil, donc ne compte pas.
+      const { rows: [{ n: photoCount }] } = await db.query(
+        `SELECT COUNT(*)::int AS n FROM mission_media WHERE mission_id=$1 AND type='photo' AND uploader_id=$2`,
+        [mission.id, req.user.id]
+      )
+      if (photoCount < 1) {
+        return res.status(400).json({ error: 'Vous devez envoyer au moins une photo avant de terminer la mission' })
+      }
     }
   }
 
