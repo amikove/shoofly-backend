@@ -1111,6 +1111,16 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- presence_confirmed_at) pour rester utilisable si la mission repasse par ce palier.
     ALTER TABLE mission_interests ADD COLUMN IF NOT EXISTS email_fallback_sent_at TIMESTAMPTZ;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS presence_confirmation_h45_email_sent_at TIMESTAMPTZ;
+
+    -- ── PROMPT 6 (2026-08-18) — Compte client désactivé avec mission active ───────────────
+    -- Horodatage de la décision de l'Œil (honorer/annuler) face à un client désactivé en cours
+    -- de mission. État "en attente de décision" entièrement dérivé (pas de statut dédié) : voir
+    -- GET /missions/pending-client-disabled — une mission n'y apparaît que si le client est
+    -- is_active=false ET ce champ est NULL, donc redevient invisible automatiquement si le client
+    -- est réactivé, sans rien à nettoyer ici. Posé aussi bien sur "honorer" (empêche de re-
+    -- proposer le choix) que sur "annuler" (déjà exclue par son statut 'cancelled', posé quand
+    -- même pour garder un historique complet). Voir handleClientDisabled, routes/missions.js.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS client_disabled_ack_at TIMESTAMPTZ;
   `);
   console.log('✅ PostgreSQL schema ready');
 }
