@@ -54,8 +54,20 @@ async function logReliabilityEvent(db, oeilId, missionId, points, reason, isGrav
 
 // ── Calculer le score d'un Œil ────────────────────────────
 async function computeReliabilityScore(db, oeilId) {
+    // reverses_event_id IS NULL exclut les événements de compensation eux-mêmes ; le NOT IN
+    // exclut l'événement d'origine qu'ils annulent — la paire entière disparaît du calcul (voir
+    // reverseReliabilityEvent ci-dessous et schema.js), pas juste une addition de deltas opposés,
+    // sinon le score dérive via le dénominateur de la moyenne (glissante 20 + historique) au lieu
+    // de revenir exactement à sa valeur d'avant l'événement annulé.
     const { rows: rawEvents } = await db.query(
-      `SELECT points, is_reset FROM reliability_events WHERE oeil_id=$1 ORDER BY created_at ASC`,
+      `SELECT points, is_reset FROM reliability_events
+       WHERE oeil_id=$1
+         AND reverses_event_id IS NULL
+         AND id NOT IN (
+           SELECT reverses_event_id FROM reliability_events
+           WHERE oeil_id=$1 AND reverses_event_id IS NOT NULL
+         )
+       ORDER BY created_at ASC`,
       [oeilId]
     );
     // Si un événement de reset (réintégration admin) existe, on ignore tout l'historique
@@ -169,12 +181,52 @@ async function reactivateWithCorrectiveEvent(db, oeilId, targetScore, adminId) {
   return score;
 }
 
+// ── Annuler intégralement un événement de fiabilité déjà appliqué ─
+// N'écrase ni ne supprime jamais l'événement d'origine (il reste lisible tel quel par toute
+// lecture directe de reliability_events, ex: reliabilityRoutes.js, users.js admin). Insère à la
+// place un événement de compensation de poids strictement opposé (jamais un montant en dur —
+// lu depuis l'événement réellement appliqué), référençant l'origine via reverses_event_id.
+// computeReliabilityScore exclut la paire entière du calcul (voir plus haut), donc le score
+// recalculé après coup redevient identique bit-à-bit à sa valeur d'avant l'événement d'origine,
+// pour toujours (pas seulement au moment de l'appel — un futur recalcul ne peut pas régresser).
+//
+// Sélectionne le DERNIER événement non encore annulé correspondant à (oeilId, missionId, reason)
+// — si ce (oeil, mission) a connu plusieurs cycles transfert/reprise dans le temps, les cycles
+// précédents ont déjà leur propre compensation et sont donc déjà exclus par le NOT EXISTS,
+// jamais re-matchés par erreur.
+//
+// Retourne l'événement d'origine (utile à l'appelant pour vérifier qu'il y avait bien quelque
+// chose à annuler) ou null si aucun événement correspondant et non-annulé n'existe — l'appelant
+// décide si ce cas est une anomalie (voir POST /:id/resume-after-h30, gardé par
+// transfer_h30_no_show donc un événement DOIT exister) ou un no-op légitime.
+async function reverseReliabilityEvent(db, oeilId, missionId, originalReason, newReason) {
+  const { rows: [original] } = await db.query(
+    `SELECT * FROM reliability_events
+     WHERE oeil_id=$1 AND mission_id=$2 AND reason=$3
+       AND NOT EXISTS (
+         SELECT 1 FROM reliability_events r2 WHERE r2.reverses_event_id = reliability_events.id
+       )
+     ORDER BY created_at DESC LIMIT 1`,
+    [oeilId, missionId, originalReason]
+  );
+  if (!original) return null;
+
+  await db.query(
+    `INSERT INTO reliability_events (oeil_id, mission_id, points, reason, is_grave, reverses_event_id)
+     VALUES ($1, $2, $3, $4, false, $5)`,
+    [oeilId, missionId, -original.points, newReason, original.id]
+  );
+  await checkAndUpdateSuspension(db, oeilId);
+  return original;
+}
+
 module.exports = {
   logReliabilityEvent,
   computeReliabilityScore,
   checkAndUpdateSuspension,
   getReliabilityLevel,
   reactivateWithCorrectiveEvent,
+  reverseReliabilityEvent,
   computeLatePenalty,
   isNewOeil,
   NEW_OEIL_MISSION_THRESHOLD,

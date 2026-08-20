@@ -6,7 +6,7 @@ const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { requireSuperAdmin } = require('../middleware/permissions');
-const { logReliabilityEvent, computeLatePenalty, isNewOeil } = require('../utils/reliabilityScore');
+const { logReliabilityEvent, computeLatePenalty, isNewOeil, reverseReliabilityEvent } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutesBulk } = require('../utils/responseTime');
 const { refundOnCancellation } = require('../utils/refund');
 const { getSetting } = require('../utils/settings');
@@ -2909,6 +2909,7 @@ router.get('/assistance-requests/commission-pending', authenticate, requireRole(
   `);
   res.json({ assistance_requests: rows });
 }));
+
 // ── POST /missions/:id/confirm-presence ── L'Œil confirme sa présence ──
 // Confirmation active demandée au rappel J-1 20h ou, à défaut (mission assignée le jour
 // même), au rappel H-2 (voir index.js + checkPresenceConfirmationDeadlines ci-dessous).
@@ -2955,6 +2956,18 @@ router.post('/:id/confirm-presence', authenticate, requireRole('oeil'), asyncHan
 // jamais, voir missionStateMachine.js), donc jamais fait ici ; le contrôle "aucun remplaçant
 // confirmé" est déjà entièrement porté par fromStatus='pending' lui-même, exactement comme le
 // fait déjà hireOeilCore plus bas.
+//
+// (PROMPT A / B2, 2026-08-18) La pénalité de fiabilité et le débit wallet appliqués au moment du
+// transfert H+30 sont désormais intégralement annulés quand cette reprise réussit — ce qui compte
+// est que l'Œil s'est bien déplacé, un simple souci de connexion/inattention ne doit pas coûter
+// cher à quelqu'un qui a fait le travail. Annulation = écritures compensatoires (jamais de
+// suppression/mutation de l'événement ou de la ligne wallet d'origine) : voir
+// reverseReliabilityEvent (reliabilityScore.js) pour le score, walletService.credit() plus bas
+// pour le solde. Ne se déclenche que si transitionMission ci-dessous a réussi (le catch renvoie
+// déjà 409 sans rien exécuter d'autre si un remplaçant a été confirmé entre-temps) ; idempotent
+// par construction — l'UPDATE ... WHERE status='pending' de transitionMission ne peut réussir
+// qu'une seule fois par cycle de transfert (double-clic/retry après coup retrouvent
+// status='assigned' et échouent dès la garde ci-dessous, avant tout code de compensation).
 router.post('/:id/resume-after-h30', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
@@ -2986,6 +2999,53 @@ router.post('/:id/resume-after-h30', authenticate, requireRole('oeil'), asyncHan
     throw e;
   }
 
+  // ── Annulation intégrale des effets du transfert H+30 (PROMPT A / B2) ──────────────────────
+  // Reprise réussie (on a dépassé le try/catch ci-dessus) => l'Œil récupère aussi exactement ce
+  // qui lui a été retiré à ce moment-là, ni plus ni moins. Les deux mécanismes déclenchés par le
+  // cron H+30 (index.js) sont distincts et traités séparément :
+  //   - Pénalité de fiabilité : logReliabilityEvent(db, oeil_id, mission_id, noShowH30PenaltyPoints,
+  //     'Mission non démarrée à l\'heure (H+30)', true) — annulée via reverseReliabilityEvent, qui
+  //     insère une compensation et exclut la paire entière du calcul (voir ce fichier).
+  //   - Débit financier : walletService.debit(..., 'Pénalité — mission non démarrée à l\'heure', ...)
+  //     à l'intérieur d'une transaction avec lockBalance — c'est un retrait pur du solde de l'Œil
+  //     (plafonné à min(réglage, solde réel), voir index.js), sans transfert vers un autre compte
+  //     ni ligne "credit" correspondante ailleurs : la mission continue en parallèle sa recherche
+  //     de remplaçant sans lien financier avec ce débit. Recréditer ce même Œil du même montant
+  //     annule donc intégralement cet effet, sans toucher personne d'autre.
+  // Montant/points jamais recalculés depuis les réglages actuels : toujours lus depuis la ligne
+  // réellement appliquée à CETTE mission, pour rester corrects même si les réglages ont changé
+  // entre-temps (voir guardrail du prompt).
+  const reversedPenalty = await reverseReliabilityEvent(
+    db, req.user.id, mission.id,
+    'Mission non démarrée à l\'heure (H+30)',
+    "Annulation pénalité H+30 — l'Œil a repris la mission avant confirmation d'un remplaçant"
+  );
+  if (!reversedPenalty) {
+    // transfer_h30_no_show=true (vérifié plus haut) garantit que le cron H+30 a bien journalisé
+    // cet événement pour cette mission — son absence ici est une incohérence de données, pas un
+    // cas métier légitime à ignorer silencieusement (contrairement au débit ci-dessous, qui peut
+    // légitimement ne pas exister si le solde était déjà à 0 au moment du transfert).
+    throw new Error(`resume-after-h30: événement de pénalité H+30 introuvable pour la mission ${mission.id} / oeil ${req.user.id}`);
+  }
+
+  const { rows: [debitTx] } = await db.query(
+    `SELECT * FROM wallet_transactions
+     WHERE user_id=$1 AND mission_id=$2 AND type='debit' AND reason=$3
+     ORDER BY created_at DESC LIMIT 1`,
+    [req.user.id, mission.id, 'Pénalité — mission non démarrée à l\'heure']
+  );
+  if (debitTx) {
+    // countsAsEarning:false — ce crédit restitue un solde déjà débité, ce n'est pas un nouveau
+    // gain (même garde-fou que le recrédit sur virement refusé, routes/users.js).
+    await walletService.credit(
+      db, req.user.id, 'oeil', parseFloat(debitTx.amount),
+      `Recrédit — reprise de mission après transfert H+30 (annule débit #${debitTx.id})`,
+      mission.id, { countsAsEarning: false }
+    );
+  }
+  // Si debitTx est absent, le solde de l'Œil était déjà à 0 au moment du transfert H+30 (index.js
+  // ne journalise aucune ligne dans ce cas précis) — rien à recréditer, ce n'est pas une anomalie.
+
   // Ardoise vierge sur la cascade éventuellement en cours (mêmes deux colonnes que hireOeilCore) —
   // toute sollicitation en cours devient sans objet, la mission n'est plus recherchée.
   await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
@@ -3004,6 +3064,7 @@ router.post('/:id/resume-after-h30', authenticate, requireRole('oeil'), asyncHan
 
   res.json({ ok: true, mission: updated });
 }));
+
 // ── GET /:id/assignable-oeils ── Picker admin (assign-admin) : champs bruts ──
 // Route dédiée plutôt qu'un paramètre ajouté à GET /users/oeils : cette dernière est aussi
 // consommée par des écrans client (client/Oeils.jsx, client/Dashboard.jsx) avec le filtre

@@ -506,6 +506,22 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS content_key TEXT;
     ALTER TABLE mission_messages ADD COLUMN IF NOT EXISTS params JSONB;
     ALTER TABLE reliability_events ADD COLUMN IF NOT EXISTS is_reset BOOLEAN NOT NULL DEFAULT false;
+    -- PROMPT A (B2, 2026-08-18) : annulation intégrale d'une pénalité déjà appliquée (ex: reprise
+    -- après transfert H+30) sans jamais supprimer/modifier l'événement d'origine. Posé UNIQUEMENT
+    -- sur l'événement de compensation, pointant vers l'événement qu'il annule — voir
+    -- reverseReliabilityEvent() (reliabilityScore.js), qui exclut la paire (origine + compensation)
+    -- du calcul de computeReliabilityScore plutôt que de simplement additionner un delta opposé :
+    -- computeReliabilityScore fait une MOYENNE (glissante 20 + historique), donc ajouter deux
+    -- événements de poids opposés change le dénominateur et ne restaure pas exactement le score
+    -- précédent (voir RAPPORT_PROMPT_A_RESUME_H30_ANNULATION.md) — seule l'exclusion totale de la
+    -- paire garantit une restauration bit-à-bit, tout en gardant les deux lignes visibles dans tout
+    -- historique consultant reliability_events directement (reliabilityRoutes.js, users.js).
+    -- ON DELETE CASCADE (pas NO ACTION, le défaut) : cohérent avec oeil_id ci-dessus et le reste
+    -- du schéma (cascade quasi-systématique) — permet à un DELETE FROM users de toujours nettoyer
+    -- la paire origine+compensation ensemble dans le même cascade, sans ordre manuel requis (la
+    -- suppression réelle d'un Œil n'arrive normalement jamais en production, hors nettoyage de
+    -- fixtures de test).
+    ALTER TABLE reliability_events ADD COLUMN IF NOT EXISTS reverses_event_id INTEGER REFERENCES reliability_events(id) ON DELETE CASCADE;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS stale_notified_at TIMESTAMPTZ;
 
     -- Index de performance sur les colonnes fréquemment filtrées/jointes
