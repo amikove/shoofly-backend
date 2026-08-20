@@ -928,6 +928,56 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- Index partiel : même principe que idx_wallet_reconciliation_unresolved ci-dessus (le cron/
     -- la vue admin par défaut filtrent tous deux sur resolved_at IS NULL).
     CREATE INDEX IF NOT EXISTS idx_commission_shortfalls_unresolved ON mission_commission_shortfalls(created_at) WHERE resolved_at IS NULL;
+
+    -- Verrou anti-double-création (PROMPT 1 point 4, 2026-08-17) — empêche un double-clic sur
+    -- "Créer" (ou un retry réseau du frontend) de produire deux missions identiques. Empreinte
+    -- calculée côté serveur sur les champs normalisés de la création (voir POST /missions,
+    -- routes/missions.js) : aucune coopération du frontend requise (chantier backend seul, aucun
+    -- header Idempotency-Key attendu). La contrainte UNIQUE (client_id, fingerprint) fait porter
+    -- la déduplication par Postgres lui-même — seul moyen réellement sûr sous requêtes concurrentes
+    -- (un simple SELECT-puis-INSERT applicatif laisserait une fenêtre de course ouverte entre les
+    -- deux requêtes d'un double-clic). Lignes volontairement conservées après expiration de la
+    -- fenêtre de déduplication (pas de cron de purge) : même choix que mission_status_history,
+    -- table légère au regard du volume de missions déjà accepté ailleurs dans ce projet.
+    CREATE TABLE IF NOT EXISTS mission_create_locks (
+      client_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      fingerprint  TEXT NOT NULL,
+      mission_id   TEXT REFERENCES missions(id),
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (client_id, fingerprint)
+    );
+
+    -- Trace d'audit des éditions admin sur une mission (PROMPT 1 point 2, 2026-08-17) — "qui, quoi,
+    -- quand", cohérent avec la rigueur déjà exigée sur ce projet pour tout ce qui touche aux
+    -- missions. La colonne changes stocke {champ: {from, to}} pour chaque champ réellement modifié
+    -- — jamais price (verrouillé pour tout rôle, y compris super admin, voir PUT /missions/admin/:id) :
+    -- le montant de commission bloqué sur le wallet Œil à la création (checkCashCommissionBalance)
+    -- ne doit jamais pouvoir se retrouver désynchronisé d'un price modifié après coup.
+    CREATE TABLE IF NOT EXISTS mission_admin_edits (
+      id          SERIAL PRIMARY KEY,
+      mission_id  TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      admin_id    TEXT NOT NULL REFERENCES users(id),
+      changes     JSONB NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_mission_admin_edits_mission ON mission_admin_edits(mission_id);
+
+    -- Le client peut désormais annuler lui-même sa demande de modification tant qu'elle est en
+    -- attente (PROMPT 1 point 1, 2026-08-17) — voir POST /missions/edit-requests/:id/cancel.
+    ALTER TABLE mission_edit_requests DROP CONSTRAINT IF EXISTS mission_edit_requests_status_check;
+    ALTER TABLE mission_edit_requests ADD CONSTRAINT mission_edit_requests_status_check
+      CHECK (status IN ('pending','approved','rejected','expired','cancelled')) NOT VALID;
+
+    -- Requalification admin a posteriori d'une déclaration d'urgence (PROMPT 1 point 5,
+    -- 2026-08-17, section 0/B4) — le chemin assistance/urgence reste sans pénalité au moment où
+    -- l'Œil le déclenche (une urgence ne se juge pas en temps réel), mais un admin peut ensuite,
+    -- depuis l'historique de l'Œil, requalifier une déclaration précise comme non légitime. Cela
+    -- applique rétroactivement le barème de points de computeLatePenalty selon le préavis que
+    -- l'Œil avait réellement donné (created_at de cette ligne vs missions.scheduled_at), jamais
+    -- selon l'instant de la requalification elle-même. Voir POST
+    -- /missions/assistance-requests/:id/requalify, routes/missions.js.
+    ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS admin_requalified_at TIMESTAMPTZ;
+    ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS admin_requalified_by TEXT REFERENCES users(id);
   `);
   console.log('✅ PostgreSQL schema ready');
 }

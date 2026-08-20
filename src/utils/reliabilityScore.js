@@ -5,18 +5,35 @@ const { getSetting } = require('./settings');
 // Plus l'action (refus, annulation...) est tardive, plus elle désorganise
 // le client et pèse sur la réputation de la plateforme. Barème partagé par
 // toutes les routes qui pénalisent un abandon d'Œil sur une mission assignée.
-async function computeLatePenalty(db, scheduledAt, actionLabel) {
+// `asOfDate` (optionnel) : instant à partir duquel le préavis est mesuré. Par défaut Date.now()
+// (comportement historique, inchangé pour l'appelant existant ci-dessous). PROMPT 1 point 5
+// (2026-08-17) introduit un appelant qui juge une action a posteriori, parfois bien après
+// scheduledAt lui-même (requalification admin d'une urgence) — il DOIT passer le vrai instant
+// de l'action (ex: mission_assistance_requests.created_at), jamais laisser le défaut, sous peine
+// de calculer un préavis négatif absurde et de tomber systématiquement dans le pire palier.
+async function computeLatePenalty(db, scheduledAt, actionLabel, asOfDate = null) {
+  const referenceTime = asOfDate ? new Date(asOfDate).getTime() : Date.now();
   const hoursBeforeMission = scheduledAt
-    ? (new Date(scheduledAt).getTime() - Date.now()) / 3600000
+    ? (new Date(scheduledAt).getTime() - referenceTime) / 3600000
     : null;
   const tier1Points = await getSetting(db, 'late_cancel_penalty_tier1_points', -15);
   const tier2Points = await getSetting(db, 'late_cancel_penalty_tier2_points', -35);
   const tier3Points = await getSetting(db, 'late_cancel_penalty_tier3_points', -50);
   const tier1ThresholdHours = await getSetting(db, 'late_cancel_penalty_tier1_threshold_hours', 24);
   const tier2ThresholdHours = await getSetting(db, 'late_cancel_penalty_tier2_threshold_hours', 2);
+  // Palier 1 rendu délibérément inatteignable par défaut (PROMPT 1 point 5, 2026-08-17, section
+  // 0/B4) : un préavis de tier1ThresholdHours ou plus ne coûte plus aucun point. Piloté par
+  // réglage (late_cancel_penalty_tier1_enabled), pas une constante figée dans le code — voir
+  // settingsDefaults.js — pour rester réactivable en un clic admin, sans déploiement, si
+  // l'interprétation s'avérait fausse. tier1Points reste calculé ci-dessus, jamais supprimé.
+  const tier1Enabled = (await getSetting(db, 'late_cancel_penalty_tier1_enabled', 'false')) === 'true';
   let points, timing;
   if (hoursBeforeMission === null || hoursBeforeMission > tier1ThresholdHours) {
-    points = tier1Points; timing = 'plus de 24h avant';
+    if (tier1Enabled) {
+      points = tier1Points; timing = 'plus de 24h avant';
+    } else {
+      points = 0; timing = 'plus de 24h avant (préavis suffisant, aucune pénalité)';
+    }
   } else if (hoursBeforeMission > tier2ThresholdHours) {
     points = tier2Points; timing = 'entre 2h et 24h avant';
   } else {

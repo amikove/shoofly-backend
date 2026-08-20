@@ -1,9 +1,11 @@
 ﻿const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const { requireSuperAdmin } = require('../middleware/permissions');
 const { logReliabilityEvent, computeLatePenalty, isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutesBulk } = require('../utils/responseTime');
 const { refundOnCancellation } = require('../utils/refund');
@@ -14,7 +16,7 @@ const walletService = require('../services/walletService');
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
-const { resolveCity, resolveQuartier } = require('../constants/villes');
+const { resolveQuartier, validateCityInput } = require('../constants/villes');
 const { isValidSubcategory } = require('../constants/missionCategories');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
 const { checkCashCommissionBalance, settleCashCommission } = require('../utils/cashCommission');
@@ -106,8 +108,9 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
     return { error: "payment_method invalide ou manquant (attendu : 'cash' ou 'payzone')" };
   }
 
-  const canonicalCity = resolveCity(city);
-  if (!canonicalCity) return { error: 'Ville invalide' };
+  const cityCheck = validateCityInput(city);
+  if (cityCheck.error) return { error: cityCheck.error };
+  const canonicalCity = cityCheck.city;
   let canonicalQuartier = null;
   if (quartier) {
     canonicalQuartier = resolveQuartier(canonicalCity, quartier);
@@ -718,6 +721,28 @@ const missionCreateLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// ── Anti-double-création (PROMPT 1 point 4, 2026-08-17) ────────────────────
+// missionCreateLimiter ci-dessus throttle le volume (10/15min) mais ne dédoublonne rien : deux
+// requêtes quasi simultanées (double-clic, retry réseau du frontend) passent toutes les deux le
+// rate limit et créeraient deux missions identiques. Empreinte déterministe sur les champs
+// normalisés qui définissent une création "identique" du point de vue utilisateur — oeil_id
+// inclus (une réservation directe et une recherche ouverte sur le même créneau/adresse ne sont
+// pas la même création) ; commission/oeil_earning volontairement exclus (dérivés de price, ne
+// peuvent pas différer pour un price identique). Voir mission_create_locks (db/schema.js) pour
+// la garde d'unicité réellement posée par Postgres — cette fonction ne fait que calculer la clé.
+function missionCreateFingerprint(insert) {
+  const parts = [
+    insert.type, (insert.title || '').trim(), (insert.address || '').trim(),
+    insert.city, insert.quartier, new Date(insert.scheduled_at).toISOString(),
+    insert.duration_est ?? null, +insert.price, insert.oeil_id || null,
+    insert.subcategory || null, insert.payment_method,
+  ];
+  return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+// Fenêtre de déduplication — largement suffisante pour absorber un double-clic ou un retry réseau,
+// assez courte pour ne jamais gêner une resoumission volontaire après correction d'une erreur.
+const MISSION_CREATE_LOCK_WINDOW_SECONDS = 15;
+
 // Réutilisé par POST /payments/payzone/init (routes/payments.js — paiement PayZone) :
 // mêmes règles de validation structurelle qu'à la création directe d'une mission.
 const missionCreateValidators = [
@@ -755,7 +780,27 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), miss
     return res.status(400).json({ error: 'Paiement requis pour cette mission — utilisez POST /payments/payzone/init.' });
   }
 
+  // Anti-double-création : verrou posé sur l'INSERT lui-même via la contrainte UNIQUE
+  // (client_id, fingerprint) de mission_create_locks — seule garde réellement sûre sous requêtes
+  // concurrentes (un SELECT préalable laisserait une fenêtre de course ouverte entre les deux
+  // requêtes d'un double-clic). Nettoyage paresseux de cette clé précise avant tentative : une
+  // même empreinte redevient réutilisable passé la fenêtre, sans cron de purge dédié.
+  const fingerprint = missionCreateFingerprint(insert);
+  await db.query(
+    `DELETE FROM mission_create_locks WHERE client_id=$1 AND fingerprint=$2 AND created_at < NOW() - ($3 * INTERVAL '1 second')`,
+    [req.user.id, fingerprint, MISSION_CREATE_LOCK_WINDOW_SECONDS]
+  );
+  const { rowCount: lockAcquired } = await db.query(
+    `INSERT INTO mission_create_locks (client_id, fingerprint) VALUES ($1,$2) ON CONFLICT (client_id, fingerprint) DO NOTHING`,
+    [req.user.id, fingerprint]
+  );
+  if (lockAcquired === 0) {
+    return res.status(409).json({ error: 'Cette mission est déjà en cours de création, merci de patienter quelques secondes.' });
+  }
+
   const mission = await insertMissionRecord(db, req.user.id, insert, freePromo);
+
+  await db.query(`UPDATE mission_create_locks SET mission_id=$1 WHERE client_id=$2 AND fingerprint=$3`, [mission.id, req.user.id, fingerprint]);
 
   await notifyNewMission(db, mission, emitToUser, io);
 
@@ -789,9 +834,9 @@ function validateMissionEditFields(body, mission) {
     changes.address = address;
   }
   if ('city' in body) {
-    const canonicalCity = resolveCity(body.city);
-    if (!canonicalCity) return { error: 'Ville invalide' };
-    changes.city = canonicalCity;
+    const cityCheck = validateCityInput(body.city);
+    if (cityCheck.error) return { error: cityCheck.error };
+    changes.city = cityCheck.city;
   }
   if ('quartier' in body) {
     if (body.quartier) {
@@ -816,6 +861,24 @@ function validateMissionEditFields(body, mission) {
   if ('replacement_preference' in body) {
     if (!['fast', 'choose'].includes(body.replacement_preference)) return { error: 'Préférence de remplacement invalide' };
     changes.replacement_preference = body.replacement_preference;
+  }
+
+  // type/subcategory : jamais atteints par le client (bloqués en amont par FORBIDDEN_EDIT_FIELDS
+  // sur PUT /:id) — n'existent ici que pour PUT /:id/admin-edit (Super Admin, PROMPT 1 point 2,
+  // 2026-08-17), qui appelle cette même fonction pour rester sur une seule et unique règle de
+  // validation entre les deux routes.
+  if ('type' in body) {
+    if (!['immobilier', 'file_attente', 'audit', 'personnalisee'].includes(body.type)) {
+      return { error: 'Type de mission invalide' };
+    }
+    changes.type = body.type;
+  }
+  if ('subcategory' in body) {
+    const typeForSubcategory = changes.type || mission.type;
+    if (body.subcategory && !isValidSubcategory(typeForSubcategory, body.subcategory)) {
+      return { error: 'Sous-catégorie invalide pour ce type de mission' };
+    }
+    changes.subcategory = body.subcategory || null;
   }
 
   return { changes };
@@ -907,6 +970,62 @@ router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req,
   }
 
   return res.status(400).json({ error: `Modification impossible pour une mission au statut "${mission.status}"` });
+}));
+
+// ── PUT /missions/:id/admin-edit ── Super Admin édite une mission (tous champs sauf price) ──
+// (PROMPT 1 point 2, 2026-08-17). price reste verrouillé pour TOUT rôle, y compris Super Admin :
+// la commission (et, en cash, le blocage de solde sur le wallet Œil via checkCashCommissionBalance
+// à l'affectation) est calculée une seule fois à la création à partir de price et n'est jamais
+// recalculée après coup (voir pricing(), prepareMissionInsert plus haut) — un price modifiable
+// romprait cette cohérence financière déjà construite. Aucune restriction de statut ici (pas
+// demandée) : un Super Admin peut corriger une mission quel que soit son statut. Toute édition est
+// tracée dans mission_admin_edits (qui/quoi/quand, avant/après par champ — voir db/schema.js).
+router.put('/:id/admin-edit', authenticate, requireRole('admin'), requireSuperAdmin, asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+  const io = req.app.get('io');
+
+  if ('price' in req.body) {
+    return res.status(400).json({ error: 'Le prix est verrouillé après création, y compris pour le Super Admin.' });
+  }
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  const { error, changes } = validateMissionEditFields(req.body, mission);
+  if (error) return res.status(400).json({ error });
+  if (Object.keys(changes).length === 0) return res.status(400).json({ error: 'Aucun champ à modifier' });
+
+  // Avant/après par champ, capturé sur la ligne encore non modifiée — from doit refléter la valeur
+  // réellement remplacée, jamais une reconstruction après l'UPDATE.
+  const auditChanges = {};
+  for (const key of Object.keys(changes)) {
+    auditChanges[key] = { from: mission[key], to: changes[key] };
+  }
+
+  const updated = await applyMissionEditChanges(db, mission.id, changes);
+
+  await db.query(
+    `INSERT INTO mission_admin_edits (mission_id, admin_id, changes) VALUES ($1,$2,$3)`,
+    [mission.id, req.user.id, JSON.stringify(auditChanges)]
+  );
+
+  // Notification in-app uniquement, même choix que POST /edit-requests/:id/cancel plus haut (pas
+  // de nouveau template WhatsApp, pas de title_key/body_key sans traduction frontend correspondante
+  // — chantier backend seul).
+  await notify(db, mission.client_id, 'Mission modifiée',
+    `Un administrateur a modifié les informations de votre mission "${updated.title}".`,
+    'mission', mission.id, emitToUser);
+  if (mission.oeil_id) {
+    await notify(db, mission.oeil_id, 'Mission modifiée',
+      `Un administrateur a modifié les informations de la mission "${updated.title}".`,
+      'mission', mission.id, emitToUser);
+  }
+
+  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: updated.status });
+  io.to('room:admin').emit('mission_updated', updated);
+
+  res.json({ mission: updated, changes: auditChanges });
 }));
 
 // ── POST /missions/edit-requests/:id/approve ── Œil accepte la modification proposée ──
@@ -1022,6 +1141,51 @@ router.post('/edit-requests/:id/reject', authenticate, requireRole('oeil'), asyn
   await advanceCandidateCascade(db, io, emitToUser, updatedMission, {});
 
   res.json({ mission: updatedMission, edit_request: { ...editRequest, status: 'rejected' } });
+}));
+
+// ── POST /missions/edit-requests/:id/cancel ── Le client retire sa propre demande ──
+// (PROMPT 1 point 1, 2026-08-17). Distinct de /reject (Œil) et de l'expiration (cron) : ici
+// c'est l'auteur de la demande qui se rétracte, tant que l'Œil n'a pas encore tranché. Aucun
+// effet sur la mission elle-même (reste 'assigned', inchangée) — contrairement à /reject et à
+// checkMissionEditRequestExpiry, qui remettent la mission en 'pending' : une demande retirée par
+// son propre auteur avant toute réponse n'a jamais modifié quoi que ce soit à annuler.
+router.post('/edit-requests/:id/cancel', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+
+  const { rows: [editRequest] } = await db.query('SELECT * FROM mission_edit_requests WHERE id=$1', [req.params.id]);
+  if (!editRequest) return res.status(404).json({ error: 'Demande de modification introuvable' });
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [editRequest.mission_id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  if (mission.client_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
+
+  if (editRequest.status !== 'pending') return res.status(400).json({ error: 'Cette demande a déjà été traitée' });
+  if (new Date(editRequest.expires_at) < new Date()) {
+    return res.status(400).json({ error: "Le délai de réponse de l'Œil est expiré, cette demande ne peut plus être annulée." });
+  }
+
+  // Garde d'idempotence posée sur l'UPDATE lui-même (WHERE status='pending' AND expires_at>NOW()),
+  // même principe que /approve, /reject et checkMissionEditRequestExpiry : si l'Œil vient de
+  // répondre ou si le cron d'expiration vient de passer entre les vérifications ci-dessus et cet
+  // UPDATE, rowCount=0 le révèle sans course possible.
+  const { rowCount } = await db.query(
+    `UPDATE mission_edit_requests SET status='cancelled', resolved_at=NOW() WHERE id=$1 AND status='pending' AND expires_at > NOW()`,
+    [editRequest.id]
+  );
+  if (rowCount === 0) return res.status(409).json({ error: 'Cette demande a changé de statut entre-temps, veuillez rafraîchir.' });
+
+  // Notification in-app uniquement — pas de template WhatsApp Wasel dédié à ce jour pour cet
+  // événement (chantier backend seul, aucune soumission de nouveau template hors périmètre) ;
+  // pas de title_key/body_key non plus, pour ne pas introduire une clé i18n sans traduction
+  // frontend correspondante (shoofly-react hors périmètre de ce chantier).
+  await notify(db, mission.oeil_id,
+    'Modification retirée',
+    `Le client a retiré sa demande de modification sur "${mission.title}".`,
+    'mission', mission.id, emitToUser
+  );
+
+  res.json({ mission, edit_request: { ...editRequest, status: 'cancelled' } });
 }));
 
 
@@ -2378,6 +2542,69 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
   if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, under_surveillance: true });
 
   res.json({ ok: true, action: 'disputed', ticket_reference: ticket.reference });
+}));
+
+// ── POST /missions/assistance-requests/:id/requalify ── Admin requalifie une urgence a posteriori ──
+// (PROMPT 1 point 5, 2026-08-17 — section 0/B4). Le chemin assistance/urgence reste et doit
+// rester sans pénalité au moment où l'Œil le déclenche (releaseMissionForReplacement,
+// skipReliabilityPenalty:true — une urgence ne se juge pas en temps réel, voir commentaire plus
+// haut ~2005). Cette route est le SEUL moyen de faire coûter des points à une déclaration
+// d'urgence, et seulement après coup, une fois qu'un admin — typiquement depuis l'historique de
+// l'Œil — juge qu'elle n'était pas légitime (abus répété, déclaration mensongère, etc.).
+// Catégorie 'urgence' uniquement : la catégorie 'mission' (client absent/injoignable...) est déjà
+// arbitrée par un humain via PUT /admin/claims/:missionId/resolve avant toute conséquence, elle
+// n'a pas ce besoin. requireRole('admin') générique (pas requireSuperAdmin) : même gate que les
+// autres actions admin touchant reliability_score (voir routes/reliabilityRoutes.js).
+router.post('/assistance-requests/:id/requalify', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const emitToUser = req.app.get('emitToUser');
+
+  const { rows: [assistanceRequest] } = await db.query('SELECT * FROM mission_assistance_requests WHERE id=$1', [req.params.id]);
+  if (!assistanceRequest) return res.status(404).json({ error: 'Déclaration d\'assistance introuvable' });
+  if (assistanceRequest.category !== 'urgence') {
+    return res.status(400).json({ error: 'Seules les déclarations "urgence" peuvent être requalifiées — la catégorie "mission" est déjà arbitrée via le litige client.' });
+  }
+  if (assistanceRequest.admin_requalified_at) {
+    return res.status(400).json({ error: 'Cette déclaration a déjà été requalifiée' });
+  }
+
+  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [assistanceRequest.mission_id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  // Garde d'idempotence posée sur l'UPDATE lui-même, même principe que les autres routes de ce
+  // chantier : si deux admins requalifient la même déclaration en concurrence, un seul applique
+  // réellement la pénalité.
+  const { rowCount } = await db.query(
+    `UPDATE mission_assistance_requests SET admin_requalified_at=NOW(), admin_requalified_by=$1
+     WHERE id=$2 AND admin_requalified_at IS NULL`,
+    [req.user.id, assistanceRequest.id]
+  );
+  if (rowCount === 0) return res.status(409).json({ error: 'Cette déclaration a été requalifiée entre-temps' });
+
+  // Préavis pénalisé = celui réellement donné par l'Œil au moment de sa déclaration (created_at
+  // de cette ligne), jamais l'instant de la requalification elle-même (souvent bien après
+  // mission.scheduled_at, ce qui donnerait systématiquement un préavis négatif absurde).
+  const { points, reason, isGrave } = await computeLatePenalty(
+    db, mission.scheduled_at, 'libération urgence requalifiée non légitime', assistanceRequest.created_at
+  );
+  // points===0 (palier 1 désactivé, préavis suffisant) : ne journalise PAS un événement de
+  // fiabilité "0 pt" — la requalification elle-même reste tracée ci-dessus
+  // (admin_requalified_at/by), mais un 0 inséré dans reliability_events se moyennerait quand même
+  // dans computeReliabilityScore et tirerait le score vers le bas par simple dilution du
+  // dénominateur, alors que "réexaminé et blanchi" doit rester strictement neutre — jamais pire
+  // que ne pas avoir d'avis du tout.
+  if (points !== 0) {
+    await logReliabilityEvent(db, assistanceRequest.oeil_id, mission.id, points, reason, isGrave);
+  }
+
+  await notify(db, assistanceRequest.oeil_id, 'Déclaration d\'urgence requalifiée',
+    `Un administrateur a examiné votre déclaration d'urgence sur la mission "${mission.title}" et l'a jugée non légitime.`,
+    'mission', mission.id, emitToUser);
+
+  res.json({
+    assistance_request: { ...assistanceRequest, admin_requalified_at: new Date(), admin_requalified_by: req.user.id },
+    penalty: { points, reason },
+  });
 }));
 
 // ── POST /missions/:id/confirm-presence ── L'Œil confirme sa présence ──
