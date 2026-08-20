@@ -35,6 +35,19 @@ router.post('/:missionId', authenticate, requireRole('oeil'), asyncHandler(async
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
   if (mission.oeil_id !== req.user.id) return res.status(403).json({ error: 'Accès refusé' });
 
+  // PROMPT 4 (2026-08-18) — minimum 10 photos réellement envoyées (media.js) avant de pouvoir
+  // soumettre le rapport. Ne bloque jamais un enregistrement brouillon (submitted=false,
+  // autosave) — seulement la soumission finale.
+  if (submitted) {
+    const { rows: [{ n: photoCount }] } = await db.query(
+      `SELECT COUNT(*)::int AS n FROM mission_media WHERE mission_id=$1 AND type='photo' AND uploader_id=$2`,
+      [req.params.missionId, req.user.id]
+    );
+    if (photoCount < 10) {
+      return res.status(400).json({ error: `Vous devez envoyer au moins 10 photos avant de soumettre le rapport (${photoCount}/10 actuellement)` });
+    }
+  }
+
   // Calculer le score
   const score = calculateScore(data);
 
