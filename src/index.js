@@ -1372,6 +1372,7 @@ initDb().then(() => {
     cronStaleMissionsRunning = true;
     try {
       const db = getDb();
+      const emitToUser = app.get('emitToUser');
       const staleMissionHours = await getSetting(db, 'stale_mission_hours', 12);
       const staleMissionMinLeadHours = await getSetting(db, 'stale_mission_min_lead_hours', 4);
 
@@ -1388,8 +1389,6 @@ initDb().then(() => {
       // 2026-07-26).
       const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
       for (const m of staleMissions) {
-          // Notification admin — la suggestion client (augmenter le budget) a été retirée :
-          // aucune page d'édition de mission n'existe encore pour que le client agisse dessus.
           for (const admin of admins) {
             await db.query(
               `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -1401,6 +1400,28 @@ initDb().then(() => {
               await sendWhatsAppTemplate(waselTemplates.mission_without_oeil_admin.template_name, admin.phone, [m.title]);
             }
           }
+
+          // Constat 20 (audit-360, BE-5) — notification client restaurée : retirée le 2026-07-11
+          // (commit 2d73ade) faute de page d'édition côté client et de compte WhatsApp Wasel actif.
+          // Les deux blocages ont évolué depuis : PUT /missions/:id applique désormais directement
+          // les modifications sur une mission encore 'pending' (voir validateMissionEditFields),
+          // et notify()/l'infra WhatsApp existent pour le reste du produit. `price` reste dans
+          // FORBIDDEN_EDIT_FIELDS (verrouillé pour le client, PROMPT 1 anti-fraude) — pas de
+          // gabarit WhatsApp dédié côté client (créer un template Wasel est hors périmètre de ce
+          // chantier, voir constat 03) : notification in-app uniquement, pas d'envoi WhatsApp ici.
+          await db.query(
+            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+             VALUES ($1, $2, $3, 'warning', $4, 'mission_view', $5, $6, $7)`,
+            [m.client_id, '💡 Toujours aucun Œil pour votre mission', `Votre mission "${m.title}" n'a pas encore trouvé d'Œil après 12h. Augmenter le budget peut attirer plus de candidats. Consultez votre mission pour l'ajuster.`, m.id,
+             'staleMissionClientTitle', 'staleMissionClientBody', JSON.stringify({ missionTitle: m.title })]
+          );
+          if (emitToUser) emitToUser(m.client_id, 'notification', {
+            title: '💡 Toujours aucun Œil pour votre mission',
+            body: `"${m.title}" — toujours sans Œil après 12h`,
+            missionId: m.id,
+            type: 'warning'
+          });
+
           await db.query(`UPDATE missions SET stale_notified_at = NOW() WHERE id = $1`, [m.id]);
           console.log(`⏳ Notification mission sans Œil envoyée pour ${m.id}`);
         }
