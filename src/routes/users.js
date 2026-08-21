@@ -413,6 +413,20 @@ router.get('/admin/profile/:userId', authenticate, requireRole('admin'), asyncHa
       `SELECT id, points, reason, is_grave, created_at, mission_id FROM reliability_events WHERE oeil_id=$1 ORDER BY created_at DESC`,
       [userId]
     );
+    // (FE-3 constat 07, audit-360, 2026-08-21) — POST /missions/assistance-requests/:id/requalify
+    // existe déjà (PROMPT 1 point 5) mais aucune réponse ne renvoyait la liste des déclarations
+    // d'urgence ni leur id, sans lesquels l'onglet Fiabilité ne peut ni les afficher ni appeler la
+    // route. Filtrée sur oeil_id=$1 (colonne directe de mission_assistance_requests, pas besoin de
+    // passer par missions.oeil_id) : un admin consultant la fiche de l'Œil X ne voit jamais les
+    // déclarations d'un autre Œil.
+    const { rows: urgenceDeclarations } = await db.query(
+      `SELECT ar.id, ar.mission_id, ar.reason, ar.created_at, ar.admin_requalified_at, m.title AS mission_title
+       FROM mission_assistance_requests ar
+       JOIN missions m ON m.id = ar.mission_id
+       WHERE ar.oeil_id=$1 AND ar.category='urgence'
+       ORDER BY ar.created_at DESC`,
+      [userId]
+    );
     reliability = {
       reliability_score: ru.reliability_score,
       is_suspended: ru.is_suspended,
@@ -421,6 +435,7 @@ router.get('/admin/profile/:userId', authenticate, requireRole('admin'), asyncHa
       rating_avg: oeilProfile?.rating_avg || 0,
       rating_count: oeilProfile?.rating_count || 0,
       events,
+      urgence_declarations: urgenceDeclarations,
     };
   }
 

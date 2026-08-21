@@ -1175,6 +1175,29 @@ router.put('/:id/admin-edit', authenticate, requireRole('admin'), requireSuperAd
   res.json({ mission: updated, changes: auditChanges });
 }));
 
+// ── GET /missions/:id/admin-edits ── Historique des éditions Super Admin sur une mission ──
+// (FE-2, audit-360, 2026-08-21) — PUT /:id/admin-edit ci-dessus écrit dans mission_admin_edits
+// mais aucune route ne la lisait jusqu'ici. Même forme que GET /:id/history plus haut (jointure
+// users pour le nom de l'auteur, triée chronologiquement), pour l'écran d'édition admin de
+// shoofly-react. Lecture seule, réservée à requireRole('admin') générique (pas requireSuperAdmin) :
+// mission_admin_edits ne contient rien de plus sensible que le reste d'une mission déjà visible à
+// tout admin via GET /:id, contrairement à L'ÉDITION elle-même (PUT /:id/admin-edit), qui reste
+// verrouillée au Super Admin — même distinction lecture/écriture que GET /:id/assignable-oeils
+// (lecture admin générique) vs les routes d'action qui en découlent.
+router.get('/:id/admin-edits', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows: [mission] } = await db.query('SELECT id FROM missions WHERE id=$1', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  const { rows } = await db.query(`
+    SELECT e.*, u.first_name||' '||u.last_name AS admin_name
+    FROM mission_admin_edits e
+    LEFT JOIN users u ON u.id = e.admin_id
+    WHERE e.mission_id = $1
+    ORDER BY e.created_at ASC
+  `, [req.params.id]);
+  res.json({ admin_edits: rows });
+}));
+
 // ── POST /missions/edit-requests/:id/approve ── Œil accepte la modification proposée ──
 router.post('/edit-requests/:id/approve', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
@@ -1441,6 +1464,30 @@ router.get('/pending-client-disabled', authenticate, requireRole('oeil'), asyncH
     ORDER BY m.scheduled_at ASC
   `, [req.user.id]);
   res.json({ pending_client_disabled: rows });
+}));
+
+// ── GET /missions/pending-h30-resume ── Missions reprenables après un transfert H+30 ──
+// (FE-1, audit-360, 2026-08-21) — POST /:id/resume-after-h30 (plus haut) exige que l'Œil voie
+// transferred_from/transfer_h30_no_show sur SA PROPRE mission transférée, mais oeil_id est mis à
+// NULL par la même UPDATE qui pose ces deux champs (cron H/H+30, index.js). Résultat : ni GET /:id
+// (garde canSeeChat, plus bas) ni la liste (mode=available/mine) ne les exposent à cet Œil, tous
+// deux ne les laissant passer que pour le oeil_id ACTUEL — qui n'est plus lui après le transfert.
+// Route dédiée, même pattern que pending-confirmations/pending-client-disabled ci-dessus, plutôt
+// que de toucher à cette logique de filtrage déjà auditée (POINT 2, audit sécurité global 08-09).
+// Doit rester déclarée AVANT GET /:id ci-dessous (même piège que les deux routes précédentes).
+router.get('/pending-h30-resume', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(`
+    SELECT m.id, m.title, m.scheduled_at, m.transfer_deadline,
+      c.first_name AS client_first_name, c.last_name AS client_last_name
+    FROM missions m
+    JOIN users c ON c.id = m.client_id
+    WHERE m.transferred_from = $1
+      AND m.status = 'pending'
+      AND m.transfer_h30_no_show = true
+    ORDER BY m.transfer_deadline ASC
+  `, [req.user.id]);
+  res.json({ pending_h30_resume: rows });
 }));
 
 // ── GET /missions/:id ──────────────────────────────────
