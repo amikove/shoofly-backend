@@ -1701,7 +1701,19 @@ router.post('/:id/status', authenticate, [
   // du CASE WHEN $1=... précédent, un seul statut cible possible par appel.
   const extraFields = { updated_at: 'NOW()' };
   if (status === 'completed') { extraFields.completed_at = 'NOW()'; extraFields.completed_by_oeil_at = 'NOW()'; }
-  if (status === 'cancelled') { extraFields.cancelled_at = 'NOW()'; extraFields.cancel_reason = cancel_reason || null; }
+  if (status === 'cancelled') {
+    extraFields.cancelled_at = 'NOW()';
+    extraFields.cancel_reason = cancel_reason || null;
+    // Ardoise vierge sur la cascade par lot (CONSTAT 15, audit-360) — même nettoyage que les
+    // autres chemins de sortie de la cascade (POST /:id/accept, /:id/assign-admin, hireOeilCore) :
+    // une annulation est elle aussi une sortie définitive, les fenêtres/compteurs de lot ne
+    // doivent pas rester posés sur une mission désormais clôturée.
+    extraFields.candidate_window_ends_at = null;
+    extraFields.pending_candidate_id = null;
+    extraFields.batch_tiebreak_ends_at = null;
+    extraFields.batch_wave_count = 0;
+    extraFields.urgent_whatsapp_next_wave_at = null;
+  }
   if (status === 'active') {
     extraFields.started_at = 'NOW()';
     // PROMPT 2 (2026-08-17) — détection d'abandon sans GPS : amorce la première échéance de
@@ -1841,6 +1853,24 @@ router.post('/:id/status', authenticate, [
         }
       }
     }
+    }
+
+    // Mission jamais assignée (oeil_id toujours celui d'avant transition ici) : les candidats
+    // déjà sollicités dans une cascade en cours n'ont jusqu'ici jamais appris que la mission a
+    // disparu (CONSTAT 15, audit-360) — même clé que les autres notifications d'annulation
+    // adressées à un Œil dans ce même bloc (missionCancelledByClientTitle/Body), factuellement
+    // correcte ici aussi (la mission a bien été annulée).
+    if (!mission.oeil_id) {
+      const { rows: solicited } = await db.query(
+        `SELECT oeil_id FROM mission_interests WHERE mission_id=$1 AND solicited_at IS NOT NULL`,
+        [mission.id]
+      );
+      for (const s of solicited) {
+        await notify(db, s.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
+      }
+      // Ardoise vierge sur mission_interests — même nettoyage que POST /:id/accept,
+      // /:id/assign-admin, hireOeilCore, cohérent avec le reset des fenêtres/compteurs ci-dessus.
+      await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
     }
 
     // Fermer automatiquement tout signalement encore ouvert lié à cette mission —
@@ -2835,9 +2865,13 @@ router.post('/assistance-requests/:id/requalify', authenticate, requireRole('adm
     await logReliabilityEvent(db, assistanceRequest.oeil_id, mission.id, points, reason, isGrave);
   }
 
+  // CONSTAT 18 (audit-360) : titleKey/bodyKey manquants — vérifié fr.json/ar.json (shoofly-react)
+  // avant d'écrire ceci, aucune clé existante ne couvre ce scénario précis (requalification
+  // rétroactive d'une urgence par un admin) ; nouvelle paire dédiée, même convention de nommage
+  // que les autres notify() de ce fichier (assistanceUrgence*, assistanceDisputedOeil*...).
   await notify(db, assistanceRequest.oeil_id, 'Déclaration d\'urgence requalifiée',
     `Un administrateur a examiné votre déclaration d'urgence sur la mission "${mission.title}" et l'a jugée non légitime.`,
-    'mission', mission.id, emitToUser);
+    'mission', mission.id, emitToUser, null, 'assistanceUrgenceRequalifiedOeilTitle', 'assistanceUrgenceRequalifiedOeilBody', { missionTitle: mission.title });
 
   res.json({
     assistance_request: { ...assistanceRequest, admin_requalified_at: new Date(), admin_requalified_by: req.user.id },
@@ -3229,6 +3263,18 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     await sendWhatsAppTemplate(waselTemplates.oeil_assigned_client.template_name, clientContactAssign.phone, [oeilNameAssign, mission.title]);
   }
 
+  // Notifier les Œils non retenus — même bloc que hireOeilCore (CONSTAT 14, audit-360) :
+  // une affectation manuelle admin court-circuite la cascade au même titre qu'une sélection
+  // client, les candidats déjà intéressés (mission_interests) doivent être informés à l'identique.
+  const { rows: othersAssign } = await db.query(
+    'SELECT oeil_id FROM mission_interests WHERE mission_id=$1 AND oeil_id!=$2',
+    [mission.id, oeil_id]
+  );
+  for (const o of othersAssign) {
+    await notify(db, o.oeil_id, 'Mission pourvue',
+      `"${mission.title}" a été attribuée à un autre Œil.`, 'info', mission.id, emitToUser, null, 'missionFilledTitle', 'missionFilledBody', {missionTitle: mission.title});
+  }
+
   await db.query(
     `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key,params) VALUES ($1,$2,$3,'system',$4,$5)`,
     [mission.id, req.user.id, `${oeil.first_name} a été assigné par l'admin.`, 'assignedByAdmin', JSON.stringify({ oeilName: oeil.first_name })]
@@ -3279,6 +3325,19 @@ async function checkTransferDeadlines(db, io, emitToUser) {
       }
       throw e;
     }
+
+    // CONSTAT 16 (audit-360) : émettre mission_status_changed et poster un message système
+    // AVANT de fermer la room (même pattern que releaseMissionForReplacement) — sinon les
+    // participants encore dans la room mission:<id> à cet instant n'apprennent jamais que la
+    // mission vient d'être annulée faute de remplaçant. content_key réutilise 'missionCancelled'
+    // (déjà traduit FR/AR) : message générique factuellement exact ici. sender_id=client_id,
+    // seul participant garanti non-NULL sur ce chemin (transferred_from peut être NULL —
+    // voir POST /edit-requests/:id/reject, qui le laisse volontairement NULL).
+    io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'cancelled' });
+    await db.query(
+      `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,$3,'system',$4)`,
+      [mission.id, mission.client_id, 'Mission annulée.', 'missionCancelled']
+    );
 
     // Ce chemin transitionne vers 'cancelled' sans passer par POST /:id/status (voir
     // RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.3) — fermeture de room répliquée
@@ -3460,6 +3519,16 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
         { missionTitle: mission.title, oeilName: `${mission.first_name} ${mission.last_name}` }
       );
     }
+
+    // CONSTAT 16 (audit-360) : même pattern que releaseMissionForReplacement — émettre
+    // mission_status_changed et poster un message système dans le chat (room jamais fermée
+    // ici, mission remise en recherche, pas clôturée) pour que le client/l'Œil déjà dans la
+    // room mission:<id> apprenne la réattribution sans avoir à recharger.
+    if (io) io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
+    await db.query(
+      `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,$3,'system',$4)`,
+      [mission.id, oeilId, "L'Œil n'a pas confirmé sa présence à temps. Recherche d'un remplaçant en cours.", 'presenceNotConfirmedSystemMessage']
+    );
 
     if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'pending', is_priority: true });
     console.log(`⏰ Confirmation de présence non reçue à temps — mission ${mission.id}, Œil ${oeilId} retiré sans pénalité`);
@@ -3859,6 +3928,11 @@ router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), asyncHa
 
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+  // CONSTAT 15 (audit-360) : distingue le cas annulée du cas attribuée à un autre Œil — le
+  // message doit refléter la réalité plutôt que toujours prétendre qu'un autre Œil a été retenu.
+  if (mission.status === 'cancelled') {
+    return res.status(409).json({ error: 'Cette mission a été annulée.' });
+  }
   if (mission.status !== 'pending' || mission.oeil_id) {
     return res.status(409).json({ error: 'Cette mission a déjà été attribuée à un autre Œil.' });
   }
