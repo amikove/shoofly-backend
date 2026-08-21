@@ -667,12 +667,26 @@ initDb().then(() => {
       const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
 
       // Missions qui auraient dû démarrer il y a 0-30 min (H)
+      // Ancre = GREATEST(scheduled_at, assigned_at) et non scheduled_at seul (CONSTAT 01,
+      // audit-360). scheduled_at est un point fixe dans le passé qui ne bouge jamais après un
+      // transfert H+30 : une fois `NOW() - scheduled_at` sorti de la fenêtre une première fois,
+      // il ne peut structurellement plus jamais y rentrer (NOW() ne fait qu'augmenter), donc un
+      // nouvel Œil affecté après ce point ne pouvait plus jamais déclencher lui-même l'alerte H
+      // ni le transfert H+30 le concernant. assigned_at (déjà posé à NOW() par les 4 points
+      // d'affectation réels — POST /:id/accept, /:id/assign-admin, /:id/resume-after-h30,
+      // hireOeilCore) capture le moment de CETTE affectation précise ; GREATEST retombe sur
+      // scheduled_at tant que l'affectation est antérieure (cas normal, jamais transféré —
+      // comportement inchangé), et re-ancre sur assigned_at dès qu'une (ré)affectation survient
+      // après que scheduled_at soit déjà dépassé (Œil transféré une ou plusieurs fois). NULL-safe
+      // par construction (GREATEST ignore les NULL en PostgreSQL, contrairement à une comparaison
+      // brute) : couvre aussi les missions créées avec oeil_id direct (réservation cash), où
+      // assigned_at n'est jamais posé à la création.
       const { rows: lateH } = await db.query(`
         SELECT m.*, u.first_name, u.last_name, u.phone
         FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status = 'assigned'
-        AND m.scheduled_at BETWEEN NOW() - INTERVAL '1 minute' * $1::numeric AND NOW()
+        AND GREATEST(m.scheduled_at, m.assigned_at) BETWEEN NOW() - INTERVAL '1 minute' * $1::numeric AND NOW()
         AND m.oeil_id IS NOT NULL
       `, [alertWindowMinutes]);
 
@@ -707,12 +721,19 @@ initDb().then(() => {
       }
 
       // Missions H+30min → transfert automatique
+      // Même ancrage GREATEST(scheduled_at, assigned_at) que la requête H ci-dessus, et même
+      // raison (CONSTAT 01) — sans ce correctif, un Œil affecté en remplacement après qu'un
+      // premier transfert H+30 ait déjà eu lieu ne pouvait plus jamais être détecté en retard
+      // pour SA PROPRE présence, quel que soit le nombre de transferts ultérieurs. is_priority
+      // repasse déjà à false à chaque réaffectation réelle (POST /:id/accept, /:id/assign-admin,
+      // /:id/resume-after-h30, hireOeilCore) : aucun changement nécessaire sur ce filtre, qui
+      // n'était pas la cause du bug.
       const { rows: lateH30 } = await db.query(`
         SELECT m.*, u.first_name, u.last_name
         FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status = 'assigned'
-        AND m.scheduled_at BETWEEN NOW() - INTERVAL '1 minute' * $1::numeric AND NOW() - INTERVAL '1 minute' * $2::numeric
+        AND GREATEST(m.scheduled_at, m.assigned_at) BETWEEN NOW() - INTERVAL '1 minute' * $1::numeric AND NOW() - INTERVAL '1 minute' * $2::numeric
         AND m.oeil_id IS NOT NULL
         AND m.is_priority = false
       `, [autoTransferMinutes, alertWindowMinutes]);
