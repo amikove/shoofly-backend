@@ -56,7 +56,11 @@ async function runAutoValidateMissions(db, emitToUser = null) {
         }
         validated = true;
 
-        if (mission.payment_method === 'payzone') {
+        // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
+        // symétrie NULL que routes/missions.js POST /:id/validate (voir son commentaire détaillé) :
+        // NULL est une mission historique pré-modèle-cash (2026-08-13), toujours réglée par
+        // PayZone à l'époque, jamais par une branche cash qui la débiterait à tort.
+        if (mission.payment_method !== 'cash') {
           if (mission.transfer_type === 'during') {
             await client.query(`UPDATE mission_transfer_chain SET ended_at=NOW() WHERE mission_id=$1 AND ended_at IS NULL`, [mission.id]);
             const { rows: chain } = await client.query(
@@ -173,4 +177,48 @@ async function runValidationReminders(db, emitToUser = null) {
   }
 }
 
-module.exports = { runAutoValidateMissions, runValidationReminders };
+// CONSTAT 12 (audit-360, 2026-08-21) — même rappel H+6 que runValidationReminders ci-dessus,
+// mais pour une mission gelée en sous_reclamation par une demande d'assistance catégorie
+// 'mission' (voir POST /:id/assistance et checkAssistanceRequestExpiry, routes/missions.js) :
+// le client y attend lui aussi une réponse dans la même fenêtre client_validation_hours (c'est
+// exactement ce qui fixe mission_assistance_requests.expires_at à la création), sans jamais
+// recevoir de rappel intermédiaire jusqu'ici. Mêmes réglages (client_validation_hours,
+// client_validation_reminder_hours), même cadence, même canal (notify) que le rappel existant —
+// fonction séparée plutôt qu'une branche de plus dans runValidationReminders, même raisonnement
+// que celui déjà documenté au-dessus (table/colonnes différentes : mission_assistance_requests
+// vs missions).
+async function runAssistanceReminders(db, emitToUser = null) {
+  const clientValidationHours = await getSetting(db, 'client_validation_hours', 12);
+  const reminderHours = await getSetting(db, 'client_validation_reminder_hours', 6);
+  const { rows: requests } = await db.query(`
+    SELECT ar.*, m.title AS mission_title, m.client_id AS mission_client_id
+    FROM mission_assistance_requests ar
+    JOIN missions m ON m.id = ar.mission_id
+    WHERE ar.category='mission' AND ar.status='pending'
+      AND ar.created_at < NOW() - INTERVAL '1 hour' * $1::numeric
+      AND ar.created_at >= NOW() - INTERVAL '1 hour' * $2::numeric
+      AND ar.reminder_sent_at IS NULL
+  `, [reminderHours, clientValidationHours]);
+
+  for (const ar of requests) {
+    try {
+      // Garde atomique — même principe que validation_reminder_sent_at ci-dessus.
+      const { rowCount } = await db.query(
+        `UPDATE mission_assistance_requests SET reminder_sent_at=NOW() WHERE id=$1 AND reminder_sent_at IS NULL`,
+        [ar.id]
+      );
+      if (rowCount === 0) continue;
+
+      const hoursLeft = Math.max(0, Math.round(clientValidationHours - reminderHours));
+      await notify(db, ar.mission_client_id, '⏳ Réponse en attente',
+        `Votre Œil a signalé un problème sur "${ar.mission_title}" et attend toujours votre réponse. Sans action de votre part, sa déclaration sera considérée comme acceptée dans environ ${hoursLeft}h.`,
+        'warning', ar.mission_id, emitToUser, 'mission_view', 'assistanceReminderH6Title', 'assistanceReminderH6Body',
+        { missionTitle: ar.mission_title, hoursLeft });
+      console.log(`⏳ Rappel assistance (H+${reminderHours}) envoyé — mission ${ar.mission_id}, demande ${ar.id}`);
+    } catch (e) {
+      console.error(`❌ Rappel assistance demande ${ar.id} error:`, e.message);
+    }
+  }
+}
+
+module.exports = { runAutoValidateMissions, runValidationReminders, runAssistanceReminders };

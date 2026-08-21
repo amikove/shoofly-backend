@@ -1698,11 +1698,18 @@ router.get('/admin/flagged-messages', authenticate, requireRole('admin'), asyncH
 // ── Admin : réclamations ────────────────────────────────────
 router.get('/admin/claims', authenticate, requireRole('admin'), requirePermission('claims'), asyncHandler(async (req, res) => {
   const db = getDb();
+  // CONSTAT 13 (audit-360) : age_hours — ancienneté de la réclamation depuis son ouverture
+  // (cl.created_at), pour Reclamations.jsx (shoofly-react, FE-4 de ce même lot, consomme ce
+  // champ). Aucun changement de tri (toujours cl.created_at ASC comme avant) : uniquement une
+  // donnée supplémentaire dans la réponse. Calculé côté SQL plutôt que côté client pour rester
+  // cohérent quel que soit le fuseau/l'horloge du navigateur admin (une durée entre deux
+  // TIMESTAMPTZ est indépendante du fuseau, mais NOW() doit rester la référence serveur).
   const { rows } = await db.query(`
     SELECT cl.*,
       m.title AS mission_title, m.price AS mission_price, m.oeil_earning, m.oeil_id,
       c.first_name||' '||c.last_name AS client_name,
-      o.first_name||' '||o.last_name AS oeil_name
+      o.first_name||' '||o.last_name AS oeil_name,
+      EXTRACT(EPOCH FROM (NOW() - cl.created_at)) / 3600 AS age_hours
     FROM claims cl
     JOIN missions m ON m.id = cl.mission_id
     JOIN users c ON c.id = cl.client_id
@@ -1747,7 +1754,9 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   try {
     await walletService.withTransaction(db, async (client) => {
       if (decision === 'oeil') {
-        if (mission.payment_method === 'payzone') {
+        // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — voir le commentaire
+        // détaillé sur routes/missions.js POST /:id/validate (même correctif de symétrie NULL).
+        if (mission.payment_method !== 'cash') {
           await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Mission validée après réclamation', mission.id);
         } else if (!isClientAbsent) {
           cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (réclamation résolue en faveur de l\'Œil)');
@@ -1771,7 +1780,9 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
         // 'cash', refundOnCancellation n'est jamais appelée : le client a payé l'Œil directement
         // en espèces, Shoofly n'a jamais rien à lui recréditer (garde-fou explicite de la
         // session — refund.js reste intact, seul ce point d'appel est conditionné).
-        refund = mission.payment_method === 'payzone'
+        // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
+        // symétrie NULL que ci-dessus (decision==='oeil').
+        refund = mission.payment_method !== 'cash'
           ? await refundOnCancellation(client, mission, false, 'Remboursement suite à réclamation')
           : 0;
         await transitionMission(client, mission.id, 'sous_reclamation', 'cancelled', req.user.id, {
