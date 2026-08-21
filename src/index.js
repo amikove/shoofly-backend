@@ -788,6 +788,17 @@ initDb().then(() => {
           WHERE id=$3
         `, [m.oeil_id, deadline, m.id]);
 
+        // CONSTAT 16 (audit-360) : même pattern que releaseMissionForReplacement (routes/missions.js)
+        // — émettre mission_status_changed et poster un message système dans le chat, room jamais
+        // fermée ici (mission remise en recherche, pas clôturée). sender_id=m.oeil_id : c'est
+        // toujours l'Œil assigné au moment du SELECT ci-dessus (requête filtrée sur oeil_id IS NOT
+        // NULL), jamais NULL à ce stade malgré l'UPDATE qui vient de le vider en base.
+        io.to(`mission:${m.id}`).emit('mission_status_changed', { missionId: m.id, status: 'pending' });
+        await db.query(
+          `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,$3,'system',$4)`,
+          [m.id, m.oeil_id, "L'Œil n'a pas démarré la mission à l'heure. Recherche d'un remplaçant en cours.", 'autoTransferH30SystemMessage']
+        );
+
         // Remboursement client si pas de remplaçant (géré par cron deadline)
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
