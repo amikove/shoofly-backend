@@ -412,7 +412,15 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
         throw err;
       }
 
-      if (mission.payment_method === 'payzone') {
+      // CONSTAT 04 (audit-360) : NULL (mission historique pré-modèle-cash, 2026-08-13) doit être
+      // traité symétriquement à l'affectation, où NULL est déjà exempté du test === 'cash' —
+      // voir checkCashCommissionBalance, jamais appelée hors payment_method === 'cash'. Avant ce
+      // correctif, `=== 'payzone'` faisait tomber NULL dans la branche cash (settleCashCommission
+      // ci-dessous), qui DÉBITE l'Œil d'une commission au lieu de le CRÉDITER de oeil_earning —
+      // double préjudice financier sur une mission historique réellement payée par PayZone (NULL
+      // = seule méthode existant avant le modèle cash). `!== 'cash'` traite payzone ET NULL de
+      // façon identique, cash reste seul à emprunter l'autre branche.
+      if (mission.payment_method !== 'cash') {
         if (mission.transfer_type === 'during') {
           // Split au prorata du temps réel de chaque Œil dans la chaîne de transferts —
           // fonctionne peu importe le nombre de transferts (remplace l'ancien split 50/50 figé à 2 Œils).
@@ -502,15 +510,39 @@ router.post('/:id/claim', authenticate, asyncHandler(async (req, res) => {
 
   const emitToUser = req.app.get('emitToUser');
 
-
+  // CONSTAT 11 (audit-360) : même garde de concurrence atomique que POST /:id/validate
+  // (ligne ~406 ci-dessus) — le SELECT + les `if` ci-dessus ne sont qu'un snapshot pre-check
+  // (message d'erreur rapide, pas une garantie). transitionMission garde uniquement sur
+  // `status='completed'`, jamais sur validated_at — or une validation (client via /validate, ou
+  // l'auto-validation cron) ne change PAS status (reste 'completed', seul validated_at change) :
+  // sans ceci, une validation concurrente entre le SELECT ci-dessus et l'UPDATE de
+  // transitionMission pouvait geler en sous_reclamation une mission déjà payée. Réutilise
+  // exactement le même mécanisme que /:id/validate (UPDATE conditionné + rowCount, dans une
+  // transaction) plutôt que d'étendre extraGuards de missionStateMachine.js (générique à ~15
+  // appelants dans 3 fichiers, ne supporte pas nativement une garde IS NULL — voir le commentaire
+  // de transitionMission lui-même sur ce piège précis) : aucun mécanisme nouveau, seulement le
+  // même déjà validé, appliqué ici. UPDATE inoffensif (updated_at, de toute façon réécrit juste
+  // après par transitionMission) : sert uniquement à verrouiller la ligne (row lock tenu jusqu'au
+  // commit) le temps que transitionMission fasse sa propre écriture dans la MÊME transaction.
   try {
-    await transitionMission(db, mission.id, 'completed', 'sous_reclamation', req.user.id, { note: 'Réclamation client' });
+    await walletService.withTransaction(db, async (client) => {
+      const { rowCount } = await client.query(
+        `UPDATE missions SET updated_at=NOW() WHERE id=$1 AND status='completed' AND validated_at IS NULL`,
+        [mission.id]
+      );
+      if (rowCount === 0) {
+        const err = new Error('Cette mission a changé de statut entre-temps, veuillez rafraîchir.');
+        err.code = 'STALE';
+        throw err;
+      }
+      await transitionMission(client, mission.id, 'completed', 'sous_reclamation', req.user.id, { note: 'Réclamation client' });
+      await client.query(`INSERT INTO claims (mission_id, client_id, comment) VALUES ($1, $2, $3)`, [req.params.id, req.user.id, comment.trim()]);
+    });
   } catch (e) {
+    if (e.code === 'STALE') return res.status(409).json({ error: e.message });
     if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
     throw e;
   }
-  await db.query(`INSERT INTO claims (mission_id, client_id, comment) VALUES ($1, $2, $3)`, [req.params.id, req.user.id, comment.trim()]);
-  
 
   // Notifier les admins
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`);
@@ -1809,7 +1841,9 @@ router.post('/:id/status', authenticate, [
       // Shoofly n'a jamais encaissé le client d'une mission cash (il paie l'Œil directement en
       // espèces), donc "rembourser" n'a aucun sens ici. refund.js n'est jamais modifié ; seul ce
       // point d'appel est conditionné (garde-fou explicite de la session).
-      refund = mission.payment_method === 'payzone'
+      // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — voir le commentaire détaillé
+      // sur POST /:id/validate (même correctif de symétrie NULL, 4 occurrences dans ce fichier).
+      refund = mission.payment_method !== 'cash'
         ? await refundOnCancellation(db, mission, initiatedByClient)
         : 0;
 
@@ -2680,7 +2714,9 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
     let cashSettlement = null;
     try {
       await walletService.withTransaction(db, async (client) => {
-        if (mission.payment_method === 'payzone') {
+        // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
+        // symétrie NULL que POST /:id/validate ci-dessus (voir son commentaire détaillé).
+        if (mission.payment_method !== 'cash') {
           await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée par le client (paiement intégral)', mission.id);
         } else {
           cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (assistance validée par le client)');
@@ -3394,7 +3430,9 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
       // Mission cash (2026-08-13) : refundOnCancellation n'est appelée QUE pour 'payzone' —
       // Shoofly n'a jamais encaissé le client d'une mission cash. refund.js n'est jamais
       // modifié ; seul ce point d'appel est conditionné (garde-fou explicite de la session).
-      const refund = mission.payment_method === 'payzone'
+      // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
+      // symétrie NULL que POST /:id/validate ci-dessus (voir son commentaire détaillé).
+      const refund = mission.payment_method !== 'cash'
         ? await refundOnCancellation(db, mission, false, 'Remboursement — aucun Œil disponible')
         : 0;
       const cancelBody = mission.payment_method === 'cash'

@@ -1137,6 +1137,15 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- proposer le choix) que sur "annuler" (déjà exclue par son statut 'cancelled', posé quand
     -- même pour garder un historique complet). Voir handleClientDisabled, routes/missions.js.
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS client_disabled_ack_at TIMESTAMPTZ;
+
+    -- CONSTAT 12 (audit-360, 2026-08-21) — le rappel H+6 client (validation_reminder_sent_at
+    -- ci-dessus) ne couvrait que status='completed' ; une mission gelée en sous_reclamation par
+    -- une demande d'assistance catégorie 'mission' (voir checkAssistanceRequestExpiry,
+    -- routes/missions.js) attend elle aussi une réponse du client dans la même fenêtre de
+    -- client_validation_hours, sans jamais recevoir de rappel intermédiaire. Même garde
+    -- anti-doublon, même principe que validation_reminder_sent_at (jobs/autoValidateMissions.js:
+    -- runAssistanceReminders).
+    ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMPTZ;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

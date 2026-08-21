@@ -32,7 +32,7 @@ const { initDb, getDb, checkDbConnection } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
 const walletService = require('./services/walletService');
-const { runAutoValidateMissions, runValidationReminders } = require('./jobs/autoValidateMissions');
+const { runAutoValidateMissions, runValidationReminders, runAssistanceReminders } = require('./jobs/autoValidateMissions');
 const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
 const { runWalletReconciliation } = require('./jobs/walletReconciliation');
 const { runCashplusExpiry } = require('./jobs/cashplusExpiry');
@@ -469,6 +469,7 @@ initDb().then(() => {
   let cronCashplusExpiryRunning = false;
   let cronActivityPhotoRunning = false;
   let cronValidationReminderRunning = false;
+  let cronAssistanceReminderRunning = false;
   let cronCandidatureRelanceRunning = false;
   let cronUnreadEmailFallbackRunning = false;
 
@@ -1351,6 +1352,18 @@ initDb().then(() => {
       await runValidationReminders(getDb(), app.get('emitToUser'));
     } catch (e) { console.error('❌ Cron rappel validation error:', e.message); }
     finally { cronValidationReminderRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron horaire — Rappel intermédiaire client, mission gelée en sous_reclamation par une
+  // demande d'assistance (CONSTAT 12, audit-360) ── Même cadence que les 2 crons ci-dessus (les
+  // 3 checkpoints de la même fenêtre client_validation_hours), verrou dédié pour la même raison.
+  cron.schedule('0 * * * *', async () => {
+    if (cronAssistanceReminderRunning) { console.warn('⏭️ Cron rappel assistance déjà en cours, tick ignoré'); return; }
+    cronAssistanceReminderRunning = true;
+    try {
+      await runAssistanceReminders(getDb(), app.get('emitToUser'));
+    } catch (e) { console.error('❌ Cron rappel assistance error:', e.message); }
+    finally { cronAssistanceReminderRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 30 min — Missions jamais assignées (12h+, encore >4h avant le créneau) ──
