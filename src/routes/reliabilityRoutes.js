@@ -7,6 +7,21 @@ const asyncHandler = require('../middleware/asyncHandler');
 
 const DEFAULT_REACTIVATION_SCORE = 70; // score appliqué à une réintégration si l'admin n'en précise pas un autre (repli si settings.reactivation_default_score absent)
 
+// BE-4 constat 17 (2026-08-21) : AdminFiabilite.jsx borne déjà reset_score à [50,90] côté écran
+// (<input type="number" min="50" max="90">, aux 2 endroits qui appellent ces routes) mais rien
+// ne rejouait cette borne côté serveur — un appel API direct pouvait imposer n'importe quel
+// score. 50 = seuil de suspension automatique (reliabilityScore.js) : réintégrer EN dessous
+// n'aurait aucun sens (l'Œil serait immédiatement re-suspendu au prochain recalcul). 90 = borne
+// haute délibérée côté produit (un Œil réintégré démarre en observation, jamais au niveau d'un
+// dossier irréprochable). N'affecte QUE ce qui est explicitement transmis par l'appelant :
+// undefined/null continue de retomber sur settings.reactivation_default_score, inchangé.
+function validateResetScore(rawResetScore) {
+  if (rawResetScore === undefined || rawResetScore === null) return { provided: false };
+  const n = Number(rawResetScore);
+  if (!Number.isInteger(n) || n < 50 || n > 90) return { provided: true, valid: false };
+  return { provided: true, valid: true, value: n };
+}
+
 // ── GET /reliability/me — Œil consulte son propre score ───
 router.get('/me', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
@@ -115,6 +130,19 @@ router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), as
   const db = getDb();
   const { decision, response, reset_score } = req.body; // decision: 'approved' | 'rejected'
 
+  // BE-4 constat 17 : validé AVANT toute écriture — la demande ne doit pas basculer en
+  // 'approved' (verrou POST /review-request : un seul 'pending' à la fois pour cet Œil) si la
+  // réactivation qui doit suivre est de toute façon rejetée juste après, sous peine de la
+  // laisser bloquée dans un état orphelin (approuvée en base, jamais réellement réactivée, plus
+  // moyen de la retraiter). N'entre en jeu que pour une approbation : reset_score n'a aucun
+  // effet sur un rejet.
+  if (decision === 'approved') {
+    const resolvedEarly = validateResetScore(reset_score);
+    if (resolvedEarly.provided && !resolvedEarly.valid) {
+      return res.status(400).json({ error: 'Le score de réintégration doit être un entier entre 50 et 90.' });
+    }
+  }
+
   const { rows: [request] } = await db.query(
     `UPDATE reliability_review_requests SET status=$1, admin_response=$2, reviewed_by=$3, reviewed_at=NOW()
      WHERE id=$4 RETURNING *`,
@@ -123,7 +151,8 @@ router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), as
   if (!request) return res.status(404).json({ error: 'Demande introuvable' });
 
   if (decision === 'approved') {
-      const newScore = reset_score || await getSetting(db, 'reactivation_default_score', DEFAULT_REACTIVATION_SCORE);
+      const resolved = validateResetScore(reset_score);
+      const newScore = resolved.provided ? resolved.value : await getSetting(db, 'reactivation_default_score', DEFAULT_REACTIVATION_SCORE);
       await reactivateWithCorrectiveEvent(db, request.oeil_id, newScore, req.user.id);
     await db.query(
       `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
@@ -194,7 +223,11 @@ router.get('/admin/all-scores', authenticate, requireRole('admin'), asyncHandler
 router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
     const db = getDb();
     const { reset_score } = req.body;
-    const newScore = reset_score || await getSetting(db, 'reactivation_default_score', DEFAULT_REACTIVATION_SCORE);
+    const resolved = validateResetScore(reset_score); // BE-4 constat 17
+    if (resolved.provided && !resolved.valid) {
+      return res.status(400).json({ error: 'Le score de réintégration doit être un entier entre 50 et 90.' });
+    }
+    const newScore = resolved.provided ? resolved.value : await getSetting(db, 'reactivation_default_score', DEFAULT_REACTIVATION_SCORE);
     const { rows: [oeilCheck] } = await db.query(`SELECT id, first_name, last_name FROM users WHERE id=$1 AND role='oeil'`, [req.params.oeilId]);
     if (!oeilCheck) return res.status(404).json({ error: 'Œil introuvable' });
     await reactivateWithCorrectiveEvent(db, req.params.oeilId, newScore, req.user.id);

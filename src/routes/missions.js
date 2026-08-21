@@ -80,6 +80,97 @@ async function handleClientDisabled(db, clientId, emitToUser) {
   }
 }
 
+// Retire les missions en cours d'un Œil suspendu et les réattribue via la cascade de
+// confirmation séquentielle, sans jamais resolliciter le client. Extrait de
+// PUT /admin/:id/toggle-active (users.js) pour être réutilisé tel quel par la suspension
+// automatique par score (checkAndUpdateSuspension, utils/reliabilityScore.js — BE-4 constat 09,
+// 2026-08-21) : même traitement dans les deux cas, aucune duplication de cette boucle.
+// transfer_type toujours forcé à 'before' (jamais 'during') et transfer_no_penalty toujours
+// true, quel que soit le statut de départ de la mission ('assigned'/'en_route'/'active') : une
+// suspension, qu'elle soit décidée par un admin ou déclenchée automatiquement par le score, ne
+// doit produire AUCUN mouvement financier ni pénalité pour l'Œil suspendu — le remplaçant
+// touche l'intégralité de oeil_earning.
+//
+// reliabilityScore.js require ce module en différé (à l'intérieur de checkAndUpdateSuspension,
+// pas en haut de son fichier) car routes/missions.js require déjà utils/reliabilityScore.js
+// plus haut (ligne 9) — un require au niveau module dans l'autre sens créerait un cycle et
+// renverrait un module.exports encore incomplet (router pas encore assigné) à ce point du
+// chargement. io/emitToUser peuvent valoir null : ni req ni socket réel n'existent depuis
+// checkAndUpdateSuspension (appelée par ~9 sites à travers tout le projet, jamais avec ce
+// contexte) — notify() et advanceCandidateCascade() dégradent déjà proprement sur null (garde
+// `if (emitToUser)`/`if (io)` déjà en place pour les stubs de test) : notification DB et
+// WhatsApp restent posés, seul le push temps réel est sauté.
+async function reassignMissionsOnSuspension(db, io, emitToUser, oeilId, opts = {}) {
+  const {
+    actorId = null,
+    transferReason = 'Compte prestataire suspendu',
+    historyNote = 'Réattribution automatique — Œil suspendu',
+  } = opts;
+
+  const { rows: strandedMissions } = await db.query(
+    `SELECT * FROM missions WHERE oeil_id=$1 AND status IN ('assigned','en_route','active')`,
+    [oeilId]
+  );
+  const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+  const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+  let reassignedCount = 0;
+  for (const mission of strandedMissions) {
+    // Une demande de modification pendante n'a plus de destinataire une fois l'Œil suspendu
+    // réattribué (mission_edit_requests ne stocke aucun oeil_id) — appliquée et close ici comme
+    // une approbation, AVANT la cascade ci-dessous, pour que le nouvel Œil hérite d'une mission
+    // déjà à jour (voir RAPPORT_DIAGNOSTIC_2_POINTS_OUVERTS_E2E.md, Point 2 §4).
+    const { rows: [appliedEditRequest] } = await db.query(
+      `UPDATE mission_edit_requests SET status='approved', resolved_at=NOW()
+       WHERE mission_id=$1 AND status='pending' RETURNING *`,
+      [mission.id]
+    );
+    if (appliedEditRequest) {
+      await applyMissionEditChanges(db, mission.id, appliedEditRequest.proposed_changes);
+    }
+
+    const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+    const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+    let updated;
+    try {
+      updated = await transitionMission(db, mission.id, mission.status, 'pending', actorId, {
+        extraFields: {
+          is_priority: true,
+          transfer_type: 'before',
+          transferred_from: oeilId,
+          transfer_reason: transferReason,
+          transfer_deadline: deadline,
+          transfer_no_penalty: true,
+          oeil_id: null,
+          batch_wave_count: 0,
+          transfer_h30_no_show: false,
+        },
+        note: historyNote,
+      });
+    } catch (e) {
+      if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
+      throw e;
+    }
+    reassignedCount++;
+
+    // Retire la propre candidature de l'Œil suspendu sur sa propre mission (même correctif
+    // que POST /:id/transfer, voir bug fantôme audit 2.9) avant de lancer la cascade.
+    await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, oeilId]);
+
+    await advanceCandidateCascade(db, io, emitToUser, updated, {});
+
+    const reassignTitle = '📋 Mission réattribuée';
+    const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la suspension de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`;
+    await notify(db, oeilId, reassignTitle, reassignBody,
+      'mission', mission.id, emitToUser, null, 'missionReassignedNoPenaltyTitle', 'missionReassignedNoPenaltyBody', { missionTitle: mission.title });
+
+    const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [oeilId]);
+    if (oeilContact?.phone) {
+      await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
+    }
+  }
+  return reassignedCount;
+}
+
 // Délai de grâce lecture seule sur le chat après clôture (2026-07-31) — voir schema.js
 // (colonne missions.closed_at, posée par transitionMission à chaque transition vers
 // completed/cancelled) et prompt de session dédié. N'affecte QUE la lecture : l'envoi
@@ -4390,6 +4481,7 @@ router.advanceCandidateCascade = advanceCandidateCascade;
 router.notify = notify;
 router.closeMissionChatRoom = closeMissionChatRoom;
 router.handleClientDisabled = handleClientDisabled;
+router.reassignMissionsOnSuspension = reassignMissionsOnSuspension;
 router.chatAccessExpiresAt = chatAccessExpiresAt;
 router.pricing = pricing;
 router.prepareMissionInsert = prepareMissionInsert;

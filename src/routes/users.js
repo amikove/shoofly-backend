@@ -14,8 +14,6 @@ const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
 const { getSetting, invalidateSettingsCache } = require('../utils/settings');
 const { isWithinSchedule } = require('../utils/schedule');
-const { sendWhatsAppTemplate } = require('../services/wasel');
-const waselTemplates = require('../config/waselTemplates');
 const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
 const asyncHandler = require('../middleware/asyncHandler');
 // Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
@@ -1431,78 +1429,22 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
     // suspendu — le remplaçant touche l'intégralité de oeil_earning.
     let reassignedCount = 0;
     if (target.role === 'oeil' && u.is_suspended) {
+      // BE-4 constat 10 (2026-08-21) : le texte annonçait pouvoir "terminer ses missions en
+      // cours" alors qu'elles sont retirées juste en dessous (reassignMissionsOnSuspension) —
+      // corrigé pour ne plus promettre ce qui n'arrive pas ; le détail par mission réattribuée
+      // (accurate, inchangé) est de toute façon communiqué séparément ci-dessous.
       await missionRoutes.notify(db, req.params.id, '🔴 Compte suspendu',
-        'Votre compte a été suspendu par un administrateur. Vous conservez l\'accès à votre compte : vous pouvez toujours vous connecter, terminer vos missions en cours et demander un examen de votre dossier.',
+        'Votre compte a été suspendu par un administrateur. Vous conservez l\'accès à votre compte : vous pouvez toujours vous connecter et demander un examen de votre dossier.',
         'error', null, emitToUser, null, 'accountSuspendedAdminTitle', 'accountSuspendedAdminBody', null);
 
-      const { rows: strandedMissions } = await db.query(
-        `SELECT * FROM missions WHERE oeil_id=$1 AND status IN ('assigned','en_route','active')`,
-        [req.params.id]
-      );
-      const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
-      const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
-      for (const mission of strandedMissions) {
-        // Une demande de modification pendante sur cette mission n'a plus de destinataire une
-        // fois l'Œil suspendu réattribué (mission_edit_requests ne stocke aucun oeil_id) —
-        // sans ça, elle resterait orpheline et pourrait réapparaître chez le nouvel Œil, qui
-        // n'a jamais négocié ces changements (angle mort diagnostiqué le 2026-07-30, voir
-        // RAPPORT_DIAGNOSTIC_2_POINTS_OUVERTS_E2E.md, Point 2 §4). On l'applique et on la
-        // clôture ici comme une approbation (mêmes effets que POST /edit-requests/:id/approve
-        // sur la mission, réutilise applyMissionEditChanges), AVANT la cascade de réattribution
-        // ci-dessous, pour que le nouvel Œil hérite d'une mission déjà à jour, sans demande en
-        // attente qui ne le concernerait pas. UPDATE...RETURNING atomique (au lieu d'un SELECT
-        // puis UPDATE) : ne fait rien si la demande a été résolue entre-temps par un autre
-        // chemin (ex. expiration), et n'ajoute aucune requête supplémentaire quand aucune
-        // demande n'est pendante.
-        const { rows: [appliedEditRequest] } = await db.query(
-          `UPDATE mission_edit_requests SET status='approved', resolved_at=NOW()
-           WHERE mission_id=$1 AND status='pending' RETURNING *`,
-          [mission.id]
-        );
-        if (appliedEditRequest) {
-          await missionRoutes.applyMissionEditChanges(db, mission.id, appliedEditRequest.proposed_changes);
-        }
-
-        const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
-        const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
-        let updated;
-        try {
-          updated = await transitionMission(db, mission.id, mission.status, 'pending', req.user.id, {
-            extraFields: {
-              is_priority: true,
-              transfer_type: 'before',
-              transferred_from: req.params.id,
-              transfer_reason: 'Compte prestataire suspendu par un administrateur',
-              transfer_deadline: deadline,
-              transfer_no_penalty: true,
-              oeil_id: null,
-              batch_wave_count: 0,
-              transfer_h30_no_show: false,
-            },
-            note: 'Réattribution automatique — Œil suspendu par un admin',
-          });
-        } catch (e) {
-          if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
-          throw e;
-        }
-        reassignedCount++;
-
-        // Retire la propre candidature de l'Œil suspendu sur sa propre mission (même correctif
-        // que POST /:id/transfer, voir bug fantôme audit 2.9) avant de lancer la cascade.
-        await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, req.params.id]);
-
-        await missionRoutes.advanceCandidateCascade(db, io, emitToUser, updated, {});
-
-        const reassignTitle = '📋 Mission réattribuée';
-        const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la suspension de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`;
-        await missionRoutes.notify(db, req.params.id, reassignTitle, reassignBody,
-          'mission', mission.id, emitToUser, null, 'missionReassignedNoPenaltyTitle', 'missionReassignedNoPenaltyBody', { missionTitle: mission.title });
-
-        const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [req.params.id]);
-        if (oeilContact?.phone) {
-          await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
-        }
-      }
+      // BE-4 constat 09 (2026-08-21) : boucle de réattribution extraite dans missions.js pour
+      // être réutilisée telle quelle par la suspension automatique par score (voir
+      // reassignMissionsOnSuspension, checkAndUpdateSuspension) — comportement inchangé ici.
+      reassignedCount = await missionRoutes.reassignMissionsOnSuspension(db, io, emitToUser, req.params.id, {
+        actorId: req.user.id,
+        transferReason: 'Compte prestataire suspendu par un administrateur',
+        historyNote: 'Réattribution automatique — Œil suspendu par un admin',
+      });
     } else if (target.role === 'oeil' && !u.is_suspended) {
       await missionRoutes.notify(db, req.params.id, '✅ Compte réactivé',
         'Votre compte a été réactivé par un administrateur. Vous pouvez de nouveau accepter de nouvelles missions.',
