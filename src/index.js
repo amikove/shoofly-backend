@@ -1525,12 +1525,20 @@ initDb().then(() => {
     finally { cronCashplusExpiryRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
-  // Keep-alive pour Render plan gratuit
-if (process.env.NODE_ENV === 'production') {
-  setInterval(() => {
-    require('https').get('https://shoofly-api.onrender.com/health', () => {})
-  }, 10 * 60 * 1000) // toutes les 10 minutes
-}
+  // Keep-alive pour Render plan gratuit — erreur/timeout interceptés pour ne pas remonter
+  // jusqu'au filet de sécurité process.on('uncaughtException') (crashAndLog, ligne 13), qui
+  // ferait crasher tout le process pour un simple ping non critique.
+  if (process.env.NODE_ENV === 'production') {
+    setInterval(() => {
+      const req = require('https').get('https://shoofly-api.onrender.com/health', (res) => {
+        res.resume();
+      });
+      req.setTimeout(10000, () => req.destroy());
+      req.on('error', (err) => {
+        console.warn(`⚠️ Keep-alive ping échoué (ignoré): ${err.message}`);
+      });
+    }, 10 * 60 * 1000); // toutes les 10 minutes
+  }
 
   server.listen(PORT, () => {
     console.log(`\n🚀 SHOOFLY API + WebSocket on port ${PORT}`);
