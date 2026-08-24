@@ -22,11 +22,17 @@ const GENERATE_TOKEN_PATH = '/cpws/cpmarchand/index.cfm/generate_token';
 // par le client, même principe que toutes les validations serveur déjà en place sur ce projet.
 const ALLOWED_AMOUNTS = [100, 200, 300, 500];
 
-// fees = 3,3% TTC + 3,3 MAD TTC du montant, à la charge de l'Œil (RECAP §3, contrat CashPlus).
-// Arrondi 2 décimales — seule précision disponible côté doc résumée ("probablement" 2
-// décimales, non confirmé contre un test réel — voir RECAP §3 et le rapport de session).
+// fees = 0, TOUJOURS — changement du 2026-08-24. CashPlus a confirmé directement que le champ
+// "fees" de leur API generate_token doit être 0 pour ce compte marchand : leur système ne
+// supporte pas de frais à la charge du client sur cette configuration (message d'erreur reçu
+// jusque-là : "Les frais ne sont pas à la charge du client"). Décision business validée en
+// conséquence : les frais sont supprimés pour l'Œil, qui paie désormais exactement le montant
+// rechargé, sans supplément à l'agence. Ancienne formule (3,3% TTC + 3,3 MAD TTC, RECAP §3)
+// abandonnée pour cette raison précise — pas un choix de simplification, une contrainte imposée
+// par le prestataire. `amount` reste en paramètre pour ne pas casser la signature de l'appelant
+// (routes/users.js) ni callGenerateToken, même s'il n'est plus utilisé dans le calcul.
 function computeFees(amount) {
-  return Math.round((Number(amount) * 0.033 + 3.3) * 100) / 100;
+  return 0;
 }
 
 // Formate en "yyyy-mm-dd HH:nn:ss" (masque ColdFusion — HH=24h, nn=minutes), heure
