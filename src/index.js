@@ -31,6 +31,7 @@ const jwt = require('jsonwebtoken');
 const { initDb, getDb, checkDbConnection } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
+const { transitionMission } = require('./utils/missionStateMachine');
 const walletService = require('./services/walletService');
 const { runAutoValidateMissions, runValidationReminders, runAssistanceReminders } = require('./jobs/autoValidateMissions');
 const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
@@ -779,15 +780,19 @@ initDb().then(() => {
         const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
         const graceMinutes = m.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
         const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
-        await db.query(`
-          UPDATE missions SET
-            status='pending', is_priority=true,
-            transfer_type='before', transferred_from=$1,
-            transfer_reason='Mission non démarrée à l''heure — transfert automatique',
-            transfer_deadline=$2, oeil_id=NULL, updated_at=NOW(),
-            batch_wave_count=0, transfer_h30_no_show=true
-          WHERE id=$3
-        `, [m.oeil_id, deadline, m.id]);
+        await transitionMission(db, m.id, m.status, 'pending', null, {
+          extraFields: {
+            is_priority: true,
+            transfer_type: 'before',
+            transferred_from: m.oeil_id,
+            transfer_reason: 'Mission non démarrée à l\'heure — transfert automatique',
+            transfer_deadline: deadline,
+            oeil_id: null,
+            batch_wave_count: 0,
+            transfer_h30_no_show: true,
+          },
+          note: 'Transfert automatique — mission non démarrée à l\'heure (H+30)',
+        });
 
         // CONSTAT 16 (audit-360) : même pattern que releaseMissionForReplacement (routes/missions.js)
         // — émettre mission_status_changed et poster un message système dans le chat, room jamais

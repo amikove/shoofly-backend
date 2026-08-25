@@ -1731,6 +1731,9 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
         if (isClientAbsent) {
           strikeResult = await applyClientStrike(client, mission.client_id, mission.id, 'client_absent', req.user.id);
         }
+        // Symétrie avec la branche 'client' ci-dessous : la réclamation est résolue dans les
+        // deux cas, la mission ne doit plus rester sous surveillance.
+        await client.query(`UPDATE missions SET under_surveillance=false WHERE id=$1`, [mission.id]);
       } else {
         // Réclamation gagnée par le client, non imputable à lui : remboursement intégral —
         // uniquement pour 'payzone' (Shoofly a réellement encaissé le client en ligne). Pour
