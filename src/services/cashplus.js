@@ -187,6 +187,7 @@ async function callGenerateToken({ requestId, amount, fees, dateExpiration }) {
     if (Number(data.SUCCESS) === 1) {
       return { ok: true, token: data.TOKEN, dateExpiration: data.DATE_EXPIRATION };
     }
+    console.error(`[cashplus] Rejet — HTTP ${status} — MESSAGE=${data.MESSAGE}`);
     return { ok: false, message: data.MESSAGE || `Échec CashPlus (HTTP ${status})` };
   } catch (err) {
     console.error('[cashplus] Erreur réseau generate_token:', sanitizeNetworkErrorMessage(err.message));
