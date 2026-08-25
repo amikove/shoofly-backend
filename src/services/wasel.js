@@ -47,6 +47,7 @@ async function sendWhatsAppTemplateRaw(templateName, phone, variables) {
         lang: 'fr',
         variables: (variables || []).map(sanitizeTemplateVariable),
       }),
+      signal: AbortSignal.timeout(10000),
     });
 
     const data = await response.json().catch(() => null);

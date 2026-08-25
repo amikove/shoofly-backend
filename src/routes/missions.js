@@ -115,57 +115,64 @@ async function reassignMissionsOnSuspension(db, io, emitToUser, oeilId, opts = {
   const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
   let reassignedCount = 0;
   for (const mission of strandedMissions) {
-    // Une demande de modification pendante n'a plus de destinataire une fois l'Œil suspendu
-    // réattribué (mission_edit_requests ne stocke aucun oeil_id) — appliquée et close ici comme
-    // une approbation, AVANT la cascade ci-dessous, pour que le nouvel Œil hérite d'une mission
-    // déjà à jour (voir RAPPORT_DIAGNOSTIC_2_POINTS_OUVERTS_E2E.md, Point 2 §4).
-    const { rows: [appliedEditRequest] } = await db.query(
-      `UPDATE mission_edit_requests SET status='approved', resolved_at=NOW()
-       WHERE mission_id=$1 AND status='pending' RETURNING *`,
-      [mission.id]
-    );
-    if (appliedEditRequest) {
-      await applyMissionEditChanges(db, mission.id, appliedEditRequest.proposed_changes);
-    }
-
-    const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
-    const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
-    let updated;
+    // Isolation par itération (O-BE-2) : un crash sur CETTE mission (édition, cascade,
+    // notification, WhatsApp) ne doit jamais abandonner le reste du lot — même granularité
+    // que jobs/autoValidateMissions.js, jobs/candidatureRelance.js et jobs/whatsappRetry.js.
     try {
-      updated = await transitionMission(db, mission.id, mission.status, 'pending', actorId, {
-        extraFields: {
-          is_priority: true,
-          transfer_type: 'before',
-          transferred_from: oeilId,
-          transfer_reason: transferReason,
-          transfer_deadline: deadline,
-          transfer_no_penalty: true,
-          oeil_id: null,
-          batch_wave_count: 0,
-          transfer_h30_no_show: false,
-        },
-        note: historyNote,
-      });
+      // Une demande de modification pendante n'a plus de destinataire une fois l'Œil suspendu
+      // réattribué (mission_edit_requests ne stocke aucun oeil_id) — appliquée et close ici comme
+      // une approbation, AVANT la cascade ci-dessous, pour que le nouvel Œil hérite d'une mission
+      // déjà à jour (voir RAPPORT_DIAGNOSTIC_2_POINTS_OUVERTS_E2E.md, Point 2 §4).
+      const { rows: [appliedEditRequest] } = await db.query(
+        `UPDATE mission_edit_requests SET status='approved', resolved_at=NOW()
+         WHERE mission_id=$1 AND status='pending' RETURNING *`,
+        [mission.id]
+      );
+      if (appliedEditRequest) {
+        await applyMissionEditChanges(db, mission.id, appliedEditRequest.proposed_changes);
+      }
+
+      const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+      const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+      let updated;
+      try {
+        updated = await transitionMission(db, mission.id, mission.status, 'pending', actorId, {
+          extraFields: {
+            is_priority: true,
+            transfer_type: 'before',
+            transferred_from: oeilId,
+            transfer_reason: transferReason,
+            transfer_deadline: deadline,
+            transfer_no_penalty: true,
+            oeil_id: null,
+            batch_wave_count: 0,
+            transfer_h30_no_show: false,
+          },
+          note: historyNote,
+        });
+      } catch (e) {
+        if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
+        throw e;
+      }
+      reassignedCount++;
+
+      // Retire la propre candidature de l'Œil suspendu sur sa propre mission (même correctif
+      // que POST /:id/transfer, voir bug fantôme audit 2.9) avant de lancer la cascade.
+      await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, oeilId]);
+
+      await advanceCandidateCascade(db, io, emitToUser, updated, {});
+
+      const reassignTitle = '📋 Mission réattribuée';
+      const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la suspension de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`;
+      await notify(db, oeilId, reassignTitle, reassignBody,
+        'mission', mission.id, emitToUser, null, 'missionReassignedNoPenaltyTitle', 'missionReassignedNoPenaltyBody', { missionTitle: mission.title });
+
+      const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [oeilId]);
+      if (oeilContact?.phone) {
+        await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
+      }
     } catch (e) {
-      if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
-      throw e;
-    }
-    reassignedCount++;
-
-    // Retire la propre candidature de l'Œil suspendu sur sa propre mission (même correctif
-    // que POST /:id/transfer, voir bug fantôme audit 2.9) avant de lancer la cascade.
-    await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, oeilId]);
-
-    await advanceCandidateCascade(db, io, emitToUser, updated, {});
-
-    const reassignTitle = '📋 Mission réattribuée';
-    const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la suspension de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`;
-    await notify(db, oeilId, reassignTitle, reassignBody,
-      'mission', mission.id, emitToUser, null, 'missionReassignedNoPenaltyTitle', 'missionReassignedNoPenaltyBody', { missionTitle: mission.title });
-
-    const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [oeilId]);
-    if (oeilContact?.phone) {
-      await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
+      console.error(`❌ reassignMissionsOnSuspension: mission ${mission.id} error:`, e.message);
     }
   }
   return reassignedCount;
@@ -815,7 +822,7 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
         o.first_name||' '||o.last_name AS oeil_name,   o.phone AS oeil_phone,   o.avatar_url AS oeil_avatar,
         (SELECT COUNT(*) FROM mission_media WHERE mission_id=m.id)::int AS media_count,
         (SELECT COUNT(*) FROM mission_messages WHERE mission_id=m.id)::int AS message_count,
-        (SELECT COUNT(*) FROM mission_interests WHERE mission_id=m.id AND oeil_id='${req.user.id}')::int > 0 AS has_interested,
+        (SELECT COUNT(*) FROM mission_interests WHERE mission_id=m.id AND oeil_id=$${p++})::int > 0 AS has_interested,
         (SELECT score FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_score,
         (SELECT comment FROM ratings WHERE mission_id=m.id LIMIT 1) AS rating_comment,
         (SELECT score FROM client_ratings WHERE mission_id=m.id LIMIT 1) AS client_rating_score_given,
@@ -829,7 +836,7 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
       ${wc}
       ORDER BY ${orderBy}
       LIMIT $${p++} OFFSET $${p++}
-    `, [...params, limit, offset]);
+    `, [...params, req.user.id, limit, offset]);
 
 
 
@@ -890,6 +897,20 @@ function missionCreateFingerprint(insert) {
 // assez courte pour ne jamais gêner une resoumission volontaire après correction d'une erreur.
 const MISSION_CREATE_LOCK_WINDOW_SECONDS = 15;
 
+// Marge de tolérance sur "scheduled_at doit être dans le futur" : absorbe le temps de
+// remplissage/soumission du formulaire côté client, sans laisser passer une date manifestement
+// passée. Partagée entre la création (missionCreateValidators, via POST /missions ET POST
+// /payments/payzone/init) et la modification côté client (PUT /:id ci-dessous) — PUT
+// /:id/admin-edit (Super Admin) ne l'applique délibérément pas : cette route documente déjà
+// explicitement (voir son commentaire) qu'un Super Admin peut corriger une mission quel que soit
+// son statut, y compris une mission déjà passée/terminée dont scheduled_at est nécessairement
+// dans le passé — une contrainte "futur uniquement" partagée via validateMissionEditFields
+// casserait cet usage. Appliquée séparément à chaque site plutôt que dans cette fonction commune.
+const SCHEDULED_AT_PAST_TOLERANCE_MS = 5 * 60 * 1000;
+function isScheduledAtTooFarInPast(value) {
+  return new Date(value).getTime() < Date.now() - SCHEDULED_AT_PAST_TOLERANCE_MS;
+}
+
 // Réutilisé par POST /payments/payzone/init (routes/payments.js — paiement PayZone) :
 // mêmes règles de validation structurelle qu'à la création directe d'une mission.
 const missionCreateValidators = [
@@ -897,7 +918,10 @@ const missionCreateValidators = [
   body('title').trim().isLength({ min: 6, max: 200 }),
   body('address').trim().notEmpty(),
   body('city').trim().notEmpty(),
-  body('scheduled_at').isISO8601(),
+  body('scheduled_at').isISO8601().custom((value) => {
+    if (isScheduledAtTooFarInPast(value)) throw new Error('La date de la mission doit être dans le futur');
+    return true;
+  }),
   body('price').isFloat({ min: 0 }),
   body('replacement_preference').optional().isIn(['fast','choose']),
 ];
@@ -1060,6 +1084,12 @@ router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req,
   const { error, changes } = validateMissionEditFields(req.body, mission);
   if (error) return res.status(400).json({ error });
   if (Object.keys(changes).length === 0) return res.status(400).json({ error: 'Aucun champ à modifier' });
+  // Vérifié ici plutôt que dans validateMissionEditFields (partagée avec PUT /:id/admin-edit,
+  // qui doit rester libre de corriger une mission déjà passée) — voir commentaire sur
+  // SCHEDULED_AT_PAST_TOLERANCE_MS.
+  if ('scheduled_at' in changes && isScheduledAtTooFarInPast(changes.scheduled_at)) {
+    return res.status(400).json({ error: 'La date de la mission doit être dans le futur' });
+  }
 
   if (mission.status === 'pending') {
     const { rows: [updated] } = await db.query(
@@ -1823,6 +1853,22 @@ router.post('/:id/status', authenticate, [
   // ouvert pour le client sur ses propres missions à ces mêmes statuts (inchangé).
   if (status === 'cancelled' && req.user.role === 'oeil' && ['assigned', 'en_route', 'active'].includes(mission.status)) {
     return res.status(403).json({ error: 'L\'annulation directe d\'une mission assignée n\'est plus disponible pour l\'Œil. Utilisez "Demander assistance" pour signaler un empêchement ou une urgence.' });
+  }
+
+  // F-BE-3 : même trou côté client, mais UNIQUEMENT pour une mission cash — l'Œil s'est déjà
+  // déplacé/engagé sur la base d'un paiement en espèces réglé directement par le client à la
+  // fin ; une annulation unilatérale à ce stade le priverait de toute rémunération, sans qu'
+  // aucun mécanisme ne l'en dédommage (contrairement au paiement en ligne : PayZone a déjà
+  // encaissé et refundOnCancellation gère intégralement ce cas plus bas, comportement
+  // inchangé). Miroir exact du blocage Œil ci-dessus. La conséquence "note impactée / risque
+  // de blocage de compte" pour un client qui empêcherait ainsi la mission d'aboutir normalement
+  // est déjà couverte par le circuit existant Œil→"Demander assistance"→admin (PUT /admin/
+  // claims/:missionId/resolve, decision='oeil'+dispute_reason='client_absent' → applyClientStrike,
+  // utils/clientStrikes.js) — ce circuit reste accessible à l'Œil sur une mission encore
+  // assigned/en_route/active (POST /:id/assistance, catégorie 'mission'), donc inchangé et
+  // suffisant ; aucun nouveau déclenchement de strike ajouté ici.
+  if (status === 'cancelled' && req.user.role === 'client' && mission.payment_method === 'cash' && ['assigned', 'en_route', 'active'].includes(mission.status)) {
+    return res.status(403).json({ error: 'Cette mission est payée en espèces et déjà en cours : elle ne peut plus être annulée unilatéralement. Contactez le support si vous rencontrez un problème.' });
   }
 
   // Bloquer si rapport non soumis pour audit ou airbnb
@@ -3482,6 +3528,10 @@ async function checkTransferDeadlines(db, io, emitToUser) {
   `);
 
   for (const mission of expired) {
+    // Isolation par itération (O-BE-2) : un crash sur CETTE mission ne doit jamais abandonner
+    // le reste du lot — même granularité que jobs/autoValidateMissions.js,
+    // jobs/candidatureRelance.js et jobs/whatsappRetry.js.
+    try {
     // Clôturer la mission d'abord, sous garde de statut — si un remplaçant l'a
     // entre-temps acceptée/embauchée (sortie de pending/is_priority) entre le
     // SELECT ci-dessus et cette itération, on ne rejoue pas la pénalité et le
@@ -3601,6 +3651,9 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
         await sendWhatsAppTemplate(waselTemplates.mission_cancelled_no_replacement_client.template_name, clientContactNoReplacement.phone, [mission.title, `${refund} MAD`]);
       }
     }
+    } catch (e) {
+      console.error(`❌ checkTransferDeadlines: mission ${mission.id} error:`, e.message);
+    }
   }
 }
 
@@ -3633,6 +3686,10 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
 
   for (const mission of expired) {
+    // Isolation par itération (O-BE-2) : un crash sur CETTE mission ne doit jamais abandonner
+    // le reste du lot — même granularité que jobs/autoValidateMissions.js,
+    // jobs/candidatureRelance.js et jobs/whatsappRetry.js.
+    try {
     const oeilId = mission.oeil_id;
 
     const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
@@ -3708,6 +3765,9 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
 
     if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'pending', is_priority: true });
     console.log(`⏰ Confirmation de présence non reçue à temps — mission ${mission.id}, Œil ${oeilId} retiré sans pénalité`);
+    } catch (e) {
+      console.error(`❌ checkPresenceConfirmationDeadlines: mission ${mission.id} error:`, e.message);
+    }
   }
 }
 
@@ -4389,57 +4449,64 @@ async function checkMissionEditRequestExpiry(db, io, emitToUser) {
   `);
 
   for (const editRequest of expired) {
-    const { rowCount } = await db.query(
-      `UPDATE mission_edit_requests SET status='expired', resolved_at=NOW() WHERE id=$1 AND status='pending'`,
-      [editRequest.id]
-    );
-    if (rowCount === 0) continue; // déjà traitée entre-temps (approve/reject manuel)
-
-    const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [editRequest.mission_id]);
-    if (!mission) continue;
-
-    // Délai de grâce avant filet de sécurité (checkTransferDeadlines) — même réglages que
-    // POST /edit-requests/:id/reject ci-dessus.
-    const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
-    const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
-    const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
-    const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
-
-    let updatedMission;
+    // Isolation par itération (O-BE-2) : un crash sur CETTE demande ne doit jamais abandonner
+    // le reste du lot — même granularité que jobs/autoValidateMissions.js,
+    // jobs/candidatureRelance.js et jobs/whatsappRetry.js.
     try {
-      updatedMission = await transitionMission(db, mission.id, 'assigned', 'pending', null, {
-        extraFields: { oeil_id: null, is_priority: true, transfer_deadline: deadline, batch_wave_count: 0, transfer_h30_no_show: false },
-        note: 'Demande de modification expirée (délai dépassé sans réponse de l\'Œil)',
-      });
-    } catch (e) {
-      if (e instanceof MissionTransitionError) {
-        console.log(`ℹ️ checkMissionEditRequestExpiry: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
-        continue;
+      const { rowCount } = await db.query(
+        `UPDATE mission_edit_requests SET status='expired', resolved_at=NOW() WHERE id=$1 AND status='pending'`,
+        [editRequest.id]
+      );
+      if (rowCount === 0) continue; // déjà traitée entre-temps (approve/reject manuel)
+
+      const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [editRequest.mission_id]);
+      if (!mission) continue;
+
+      // Délai de grâce avant filet de sécurité (checkTransferDeadlines) — même réglages que
+      // POST /edit-requests/:id/reject ci-dessus.
+      const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+      const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+      const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+      const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+
+      let updatedMission;
+      try {
+        updatedMission = await transitionMission(db, mission.id, 'assigned', 'pending', null, {
+          extraFields: { oeil_id: null, is_priority: true, transfer_deadline: deadline, batch_wave_count: 0, transfer_h30_no_show: false },
+          note: 'Demande de modification expirée (délai dépassé sans réponse de l\'Œil)',
+        });
+      } catch (e) {
+        if (e instanceof MissionTransitionError) {
+          console.log(`ℹ️ checkMissionEditRequestExpiry: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
+          continue;
+        }
+        throw e;
       }
-      throw e;
+
+      // Même correctif que POST /edit-requests/:id/reject : retire la candidature de l'Œil sur
+      // sa propre mission avant de rouvrir la cascade (sinon le cron de sélection pourrait le
+      // réassigner à la mission qu'il vient de laisser expirer).
+      await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, mission.oeil_id]);
+
+      await notify(db, mission.client_id,
+        'Mission remise en recherche',
+        `L'Œil n'a pas répondu à temps à votre demande de modification sur "${mission.title}". Nous recherchons un nouvel Œil, sans frais ni pénalité pour vous.`,
+        'mission', mission.id, emitToUser, 'mission_view', 'editRequestExpiredClientTitle', 'editRequestExpiredClientBody',
+        { missionTitle: mission.title }
+      );
+
+      const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+      if (clientContact?.phone) {
+        await sendWhatsAppTemplate(waselTemplates.edit_request_expired.template_name, clientContact.phone, [mission.title, 'Mission remise en recherche']);
+      }
+
+      // Relance la cascade — transfer_type/transferred_from volontairement NULL, même
+      // justification que POST /edit-requests/:id/reject (éviter la pénalité -10 de
+      // checkTransferDeadlines pour une non-réponse qui n'est ni une annulation ni un abandon).
+      await advanceCandidateCascade(db, io, emitToUser, updatedMission, {});
+    } catch (e) {
+      console.error(`❌ checkMissionEditRequestExpiry: demande ${editRequest.id} (mission ${editRequest.mission_id}) error:`, e.message);
     }
-
-    // Même correctif que POST /edit-requests/:id/reject : retire la candidature de l'Œil sur
-    // sa propre mission avant de rouvrir la cascade (sinon le cron de sélection pourrait le
-    // réassigner à la mission qu'il vient de laisser expirer).
-    await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, mission.oeil_id]);
-
-    await notify(db, mission.client_id,
-      'Mission remise en recherche',
-      `L'Œil n'a pas répondu à temps à votre demande de modification sur "${mission.title}". Nous recherchons un nouvel Œil, sans frais ni pénalité pour vous.`,
-      'mission', mission.id, emitToUser, 'mission_view', 'editRequestExpiredClientTitle', 'editRequestExpiredClientBody',
-      { missionTitle: mission.title }
-    );
-
-    const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-    if (clientContact?.phone) {
-      await sendWhatsAppTemplate(waselTemplates.edit_request_expired.template_name, clientContact.phone, [mission.title, 'Mission remise en recherche']);
-    }
-
-    // Relance la cascade — transfer_type/transferred_from volontairement NULL, même
-    // justification que POST /edit-requests/:id/reject (éviter la pénalité -10 de
-    // checkTransferDeadlines pour une non-réponse qui n'est ni une annulation ni un abandon).
-    await advanceCandidateCascade(db, io, emitToUser, updatedMission, {});
   }
 }
 
@@ -4484,7 +4551,9 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
         );
         if (rowCount === 0) return; // déjà traitée entre-temps (réponse client juste avant ce tick)
 
-        if (mission.payment_method === 'payzone') {
+        // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
+        // symétrie NULL que POST :id/validate ci-dessus (voir son commentaire détaillé).
+        if (mission.payment_method !== 'cash') {
           await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée automatiquement (délai client dépassé)', mission.id);
         }
         // else (cash) : commission volontairement laissée en attente (commission_decision reste
@@ -4502,7 +4571,9 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
       throw e;
     }
 
-    if (mission.payment_method === 'payzone') {
+    // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
+    // symétrie NULL que POST :id/validate ci-dessus (voir son commentaire détaillé).
+    if (mission.payment_method !== 'cash') {
       await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedOeilTitle', 'assistanceAutoValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
     } else {
       await notify(db, mission.oeil_id, 'Mission clôturée automatiquement', `Délai écoulé sans réponse du client — "${mission.title}" clôturée. La décision concernant la commission (débitée ou libérée) vous sera communiquée séparément par un administrateur.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedPendingCommissionOeilTitle', 'assistanceAutoValidatedPendingCommissionOeilBody', { missionTitle: mission.title });

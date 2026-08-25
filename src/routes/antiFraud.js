@@ -443,43 +443,50 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
   const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
   const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
   for (const mission of strandedMissions) {
-    const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
-    const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
-    let updated;
+    // Isolation par itération (O-BE-2) : un crash sur CETTE mission ne doit jamais abandonner
+    // le reste du lot — même granularité que jobs/autoValidateMissions.js,
+    // jobs/candidatureRelance.js et jobs/whatsappRetry.js.
     try {
-      updated = await transitionMission(db, mission.id, mission.status, 'pending', req.user.id, {
-        extraFields: {
-          is_priority: true,
-          transfer_type: 'before',
-          transferred_from: req.params.userId,
-          transfer_reason: 'Compte prestataire bloqué pour fraude',
-          transfer_deadline: deadline,
-          oeil_id: null,
-          batch_wave_count: 0,
-          transfer_h30_no_show: false,
-        },
-        note: 'Réattribution automatique — Œil bloqué par un admin (anti-fraude)',
-      });
+      const graceMinutes = mission.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+      const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+      let updated;
+      try {
+        updated = await transitionMission(db, mission.id, mission.status, 'pending', req.user.id, {
+          extraFields: {
+            is_priority: true,
+            transfer_type: 'before',
+            transferred_from: req.params.userId,
+            transfer_reason: 'Compte prestataire bloqué pour fraude',
+            transfer_deadline: deadline,
+            oeil_id: null,
+            batch_wave_count: 0,
+            transfer_h30_no_show: false,
+          },
+          note: 'Réattribution automatique — Œil bloqué par un admin (anti-fraude)',
+        });
+      } catch (e) {
+        if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
+        throw e;
+      }
+      reassignedCount++;
+
+      // Retire la propre candidature de l'Œil bloqué sur sa propre mission (même correctif que
+      // POST /:id/transfer et toggle-active, voir bug fantôme audit 2.9) avant de lancer la cascade.
+      await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, req.params.userId]);
+
+      await missionRoutes.advanceCandidateCascade(db, io, emitToUser, updated, {});
+
+      // Formulation neutre côté client : ne mentionne ni blocage ni fraude.
+      const title = '⚠️ Changement sur votre mission';
+      const body = `Votre mission "${mission.title}" est en cours de réattribution suite à un changement côté prestataire. Nous recherchons un remplaçant en urgence.`;
+      await db.query(
+        `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'info',$4,'mission_view',$5,$6,$7)`,
+        [mission.client_id, title, body, mission.id, 'missionChangeAlertTitle', 'missionChangeAlertBody', JSON.stringify({ missionTitle: mission.title })]
+      );
+      if (emitToUser) emitToUser(mission.client_id, 'notification', { title, body });
     } catch (e) {
-      if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
-      throw e;
+      console.error(`❌ POST /anti-fraud/block: réattribution mission ${mission.id} error:`, e.message);
     }
-    reassignedCount++;
-
-    // Retire la propre candidature de l'Œil bloqué sur sa propre mission (même correctif que
-    // POST /:id/transfer et toggle-active, voir bug fantôme audit 2.9) avant de lancer la cascade.
-    await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, req.params.userId]);
-
-    await missionRoutes.advanceCandidateCascade(db, io, emitToUser, updated, {});
-
-    // Formulation neutre côté client : ne mentionne ni blocage ni fraude.
-    const title = '⚠️ Changement sur votre mission';
-    const body = `Votre mission "${mission.title}" est en cours de réattribution suite à un changement côté prestataire. Nous recherchons un remplaçant en urgence.`;
-    await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'info',$4,'mission_view',$5,$6,$7)`,
-      [mission.client_id, title, body, mission.id, 'missionChangeAlertTitle', 'missionChangeAlertBody', JSON.stringify({ missionTitle: mission.title })]
-    );
-    if (emitToUser) emitToUser(mission.client_id, 'notification', { title, body });
   }
 
   res.json({ message: 'Compte bloqué', user_id: req.params.userId, reassigned_missions: reassignedCount });
