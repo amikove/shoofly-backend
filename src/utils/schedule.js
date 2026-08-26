@@ -20,6 +20,21 @@ function nowInMorocco(date = new Date()) {
   };
 }
 
+// Date (jour civil) d'un instant telle que vue à Casablanca, format YYYY-MM-DD — même technique
+// que nowInMorocco ci-dessus et que formatCashPlusDate (services/cashplus.js), pour tout code qui
+// doit dater un enregistrement (ex. expenses.expense_date) selon le jour marocain plutôt que le
+// jour UTC du process. Équivalent backend de casablancaYMD (shoofly-react, utils/casablancaTime.js,
+// commit 8a3b332) — même nom et même comportement, module distinct car les deux dépôts ne
+// partagent pas de code (CommonJS ici, ES modules côté frontend).
+function casablancaYMD(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Africa/Casablanca',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(date);
+  const get = (type) => parts.find(p => p.type === type)?.value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
 function isWithinSchedule(disponibilites, date = new Date()) {
   if (!disponibilites) return true; // pas de créneaux = on se fie au toggle manuel
   const d = typeof disponibilites === 'string' ? JSON.parse(disponibilites) : disponibilites;
@@ -33,4 +48,4 @@ function isWithinSchedule(disponibilites, date = new Date()) {
   return mins >= hd * 60 + md && mins <= hf * 60 + mf;
 }
 
-module.exports = { isWithinSchedule, nowInMorocco };
+module.exports = { isWithinSchedule, nowInMorocco, casablancaYMD };
