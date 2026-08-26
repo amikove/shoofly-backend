@@ -10,6 +10,7 @@ const { logReliabilityEvent, computeLatePenalty, isNewOeil, reverseReliabilityEv
 const { computeAvgResponseMinutesBulk } = require('../utils/responseTime');
 const { refundOnCancellation } = require('../utils/refund');
 const { getSetting } = require('../utils/settings');
+const { casablancaYMD } = require('../utils/schedule');
 const { logStatus } = require('../utils/missionHistory');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const walletService = require('../services/walletService');
@@ -370,7 +371,7 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
   if (freePromo) {
     await db.query(
       `INSERT INTO expenses (amount, category, description, expense_date, created_by) VALUES ($1, $2, $3, $4, $5)`,
-      [freePromo.platform_amount, 'Promotions', `[Généré automatiquement] Mission offerte "${title}" — code promo ${freePromo.code}`, new Date().toISOString().slice(0, 10), null]
+      [freePromo.platform_amount, 'Promotions', `[Généré automatiquement] Mission offerte "${title}" — code promo ${freePromo.code}`, casablancaYMD(), null]
     );
   }
 
@@ -2449,7 +2450,7 @@ await notify(db, mission.oeil_id, `Nouvelle note: ${req.body.score}/5 ⭐`, `"${
           await walletService.credit(client, mission.oeil_id, 'oeil', bonus, 'Bonus qualité — note 5 étoiles', mission.id);
           await client.query(
             `INSERT INTO expenses (amount, category, description, expense_date, created_by) VALUES ($1, $2, $3, $4, $5)`,
-            [bonus, 'Marketing', `[Généré automatiquement] Bonus qualité 5 étoiles — mission "${mission.title}"`, new Date().toISOString().slice(0, 10), null]
+            [bonus, 'Marketing', `[Généré automatiquement] Bonus qualité 5 étoiles — mission "${mission.title}"`, casablancaYMD(), null]
           );
         });
         await notify(db, mission.oeil_id, `Bonus qualité 5 étoiles 🎁`, `+${bonus} MAD de bonus pour "${mission.title}" — merci pour votre excellent travail !`, 'bonus', mission.id, emitToUser, null, 'fiveStarBonusTitle', 'fiveStarBonusBody', { amount: bonus, missionTitle: mission.title });
