@@ -1225,16 +1225,27 @@ router.get('/admin/dashboard/financier', authenticate, requireRole('admin'), req
     comparison = await computeFinance(compare_from, compare_to);
   }
 
+  // `expense_date` est de type DATE ; les bornes reçues ici sont des instants ISO complets
+  // (Date.toISOString() de casablancaStartOfDay/EndOfDay côté DateRangeFilter). Un cast implicite
+  // `'...T23:00:00Z'::date` largue l'heure ET le fuseau → la borne basse retombe sur la VEILLE du
+  // jour marocain demandé (surinclusion d'exactement 1 jour, hors Ramadan). On ré-ancre chaque
+  // borne sur le jour civil de Casablanca — même résultat que casablancaYMD() utilisé par la liste
+  // /admin/expenses juste en dessous, avec laquelle la carte doit s'accorder au centime.
   const { rows: [expensesRow] } = await db.query(
-    `SELECT COALESCE(SUM(amount),0)::numeric AS n FROM expenses WHERE expense_date BETWEEN $1 AND $2`,
+    `SELECT COALESCE(SUM(amount),0)::numeric AS n FROM expenses
+     WHERE expense_date BETWEEN ($1::timestamptz AT TIME ZONE 'Africa/Casablanca')::date
+                        AND ($2::timestamptz AT TIME ZONE 'Africa/Casablanca')::date`,
     [date_from, date_to]
   );
   current.expenses = parseFloat(expensesRow.n);
   current.net_profit = current.commission - current.expenses;
 
   if (comparison) {
+    // Même ré-ancrage Casablanca que pour la période courante ci-dessus.
     const { rows: [expensesCompareRow] } = await db.query(
-      `SELECT COALESCE(SUM(amount),0)::numeric AS n FROM expenses WHERE expense_date BETWEEN $1 AND $2`,
+      `SELECT COALESCE(SUM(amount),0)::numeric AS n FROM expenses
+       WHERE expense_date BETWEEN ($1::timestamptz AT TIME ZONE 'Africa/Casablanca')::date
+                          AND ($2::timestamptz AT TIME ZONE 'Africa/Casablanca')::date`,
       [compare_from, compare_to]
     );
     comparison.expenses = parseFloat(expensesCompareRow.n);
