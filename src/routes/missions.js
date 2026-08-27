@@ -1103,6 +1103,20 @@ router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req,
   }
 
   if (mission.status === 'assigned') {
+    // F-BE-3 (2e saut) : une mission cash déjà assignée est fermée à la demande de modification
+    // client, en miroir du 403 posé sur POST /:id/status{cancelled} (l.~1871). Sans ce verrou, le
+    // client force un refus ou une expiration de la demande (Œil qui décline / ne répond pas sous
+    // 30-120 min) → /edit-requests reject|expiry renvoie la mission en 'pending', oeil_id=NULL, et
+    // l'annulation client y est alors autorisée sans condition (allowedFromThisRoute.pending) :
+    // contournement en 2 sauts de F-BE-3, aboutissant à l'annulation gratuite que le 403 devait
+    // empêcher. Restreint à payment_method='cash' : en payzone, PayZone a déjà encaissé et
+    // refundOnCancellation gère le cas — flux de demande de modification inchangé hors cash.
+    // Modification d'une mission cash assignée = passe par le support (même consigne que le 403).
+    // en_route/active tombent déjà sur le 400 générique en bas de cette route (contre-épreuve OK).
+    if (mission.payment_method === 'cash') {
+      return res.status(403).json({ error: 'Cette mission est payée en espèces et déjà assignée : ses informations ne peuvent plus être modifiées unilatéralement. Contactez le support pour tout changement.' });
+    }
+
     const { rows: [pendingRequest] } = await db.query(
       `SELECT id FROM mission_edit_requests WHERE mission_id=$1 AND status='pending'`,
       [mission.id]
