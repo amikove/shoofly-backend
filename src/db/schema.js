@@ -17,6 +17,19 @@ function getDb() {
       // en plus du trafic HTTP/WebSocket qui partage le même pool (audit perf 2026-07-26).
       max: 15,
     });
+    // pg émet 'error' sur le POOL quand un client INACTIF (au repos dans le pool, hors de toute
+    // requête) tombe : coupure réseau, redémarrage ou timeout côté Postgres, RST TCP. Sans
+    // écouteur, EventEmitter transforme cet 'error' en exception non interceptée qui remonte
+    // jusqu'à process.on('uncaughtException') (index.js) → crashAndLog → process.exit(1) — tout
+    // le service tombe pour un client au repos, alors qu'aucune requête active n'est en cause.
+    // pg a déjà retiré ET fermé le client fautif du pool AVANT d'émettre (voir pg-pool
+    // makeIdleListener : _remove(client) puis emit) et en recrée un à la demande au prochain
+    // query() : le pool s'auto-répare, on se contente donc de journaliser. Même intention que le
+    // req.on('error') du keep-alive Render (O-BE-1, index.js) — empêcher une erreur d'infra non
+    // critique d'atteindre le filet de dernier recours.
+    pool.on('error', (err) => {
+      console.error(`❌ Pool PG — erreur sur client inactif (client retiré et remplacé automatiquement par pg) : ${err.message}`);
+    });
   }
   return pool;
 }

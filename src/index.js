@@ -744,91 +744,111 @@ initDb().then(() => {
       const noShowH30PenaltyPoints = await getSetting(db, 'no_show_h30_penalty_points', -20);
       const noShowH30DebitCapMad = await getSetting(db, 'no_show_h30_debit_cap_mad', 100);
       for (const m of lateH30) {
-        // Pénalité fiabilité — le score est entièrement recalculé par logReliabilityEvent ci-dessous,
-        // pas besoin de le décrémenter manuellement ici (ancien code mort, toujours écrasé après coup).
-        // Cooldown — cette mission est structurellement 'before' (jamais démarrée ; transfer_type
-        // mis à 'before' juste plus bas), donc même formule 'before' que releaseMissionForReplacement
-        // (missions.js) : ancrée sur scheduled_at, pas sur l'instant du tick. L'ancien code posait
-        // à tort la formule 'during' (transfer_cooldown_hours, ancrée NOW()) — jusqu'à 2h05 de
-        // cooldown en trop vs. un Œil ayant déclaré URGENCE quelques minutes plus tôt pour la même
-        // situation (RAPPORT_COOLDOWN_H30_FORMULE.md).
-        await db.query(
-          `UPDATE users SET
-            transfer_cooldown_until = GREATEST($3::timestamptz - INTERVAL '1 hour', NOW()) + INTERVAL '1 hour' * $1::numeric,
-            transfer_count = transfer_count + 1
-           WHERE id = $2`,
-          [transferCooldownBeforeHours, m.oeil_id, m.scheduled_at]
-        );
-        // Le débit journalisé doit être plafonné au solde réel de l'Œil — sinon la ligne
-        // wallet_transactions afficherait -100 alors que balance n'a baissé que du solde
-        // disponible, cassant la réconciliation SUM(wallet_transactions) == balance. lockBalance
-        // + debit() dans la même transaction (plutôt qu'un débit de 100 fixe) : le montant passé
-        // à debit() est déjà borné au solde verrouillé, donc INSUFFICIENT_BALANCE n'est jamais
-        // levée ici ; si le solde est déjà à 0, on ne journalise rien (pas de ligne à 0 MAD).
-        const deducted = await walletService.withTransaction(db, async (client) => {
-          const currentBalance = await walletService.lockBalance(client, m.oeil_id, 'oeil');
-          const deducted = Math.min(noShowH30DebitCapMad, currentBalance || 0);
-          if (deducted > 0) {
-            await walletService.debit(client, m.oeil_id, 'oeil', deducted, 'Pénalité — mission non démarrée à l\'heure', m.id);
-          }
-          return deducted;
-        });
-        await logReliabilityEvent(db, m.oeil_id, m.id, noShowH30PenaltyPoints, 'Mission non démarrée à l\'heure (H+30)', true);
+        // Isolation par itération (O-BE-2) : une exception sur CETTE mission (transition périmée,
+        // débit, journalisation fiabilité, notification) ne doit jamais interrompre le traitement
+        // des missions suivantes du même lot — même granularité que jobs/autoValidateMissions.js
+        // et les 5 sites O-BE-2 de routes/missions.js / routes/antiFraud.js. Le catch de tick
+        // ci-dessous (ligne ~834) reste, mais ne couvre plus que ce qui est HORS boucle.
+        try {
+          // La transition d'état passe EN PREMIER — avant le cooldown, le débit et surtout
+          // logReliabilityEvent. logReliabilityEvent peut faire tomber le score sous 50 →
+          // checkAndUpdateSuspension → reassignMissionsOnSuspension, qui réattribue lui-même
+          // TOUTES les missions 'assigned'/'en_route'/'active' de cet Œil (celle-ci comprise) via
+          // SA PROPRE transitionMission. Si on journalisait la pénalité d'abord, cette mission
+          // serait déjà repassée en 'pending' (avec transfer_h30_no_show=false et le motif
+          // "compte suspendu", pas "non démarrée") quand le transitionMission ci-dessous
+          // s'exécuterait → garde optimiste WHERE status='assigned' en échec → MissionTransitionError
+          // STALE_STATE, qui (sans l'isolation par itération ci-dessus) emportait tout le reste du
+          // lot. En transférant d'abord, la mission est déjà 'pending' + oeil_id NULL quand la
+          // cascade de suspension interroge les missions de l'Œil : elle ne la reprend pas,
+          // transfer_h30_no_show reste true, et la notification de pénalité H+30 plus bas part bien.
+          const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
+          const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
+          const graceMinutes = m.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
+          const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
+          await transitionMission(db, m.id, m.status, 'pending', null, {
+            extraFields: {
+              is_priority: true,
+              transfer_type: 'before',
+              transferred_from: m.oeil_id,
+              transfer_reason: 'Mission non démarrée à l\'heure — transfert automatique',
+              transfer_deadline: deadline,
+              oeil_id: null,
+              batch_wave_count: 0,
+              transfer_h30_no_show: true,
+            },
+            note: 'Transfert automatique — mission non démarrée à l\'heure (H+30)',
+          });
 
-        // Transfert automatique
-        const graceMinutesQueue = await getSetting(db, 'transfer_grace_minutes_queue', 45);
-        const graceMinutesOther = await getSetting(db, 'transfer_grace_minutes_other', 60);
-        const graceMinutes = m.type === 'file_attente' ? graceMinutesQueue : graceMinutesOther;
-        const deadline = new Date(Date.now() + graceMinutes * 60 * 1000);
-        await transitionMission(db, m.id, m.status, 'pending', null, {
-          extraFields: {
-            is_priority: true,
-            transfer_type: 'before',
-            transferred_from: m.oeil_id,
-            transfer_reason: 'Mission non démarrée à l\'heure — transfert automatique',
-            transfer_deadline: deadline,
-            oeil_id: null,
-            batch_wave_count: 0,
-            transfer_h30_no_show: true,
-          },
-          note: 'Transfert automatique — mission non démarrée à l\'heure (H+30)',
-        });
+          // Pénalité fiabilité — le score est entièrement recalculé par logReliabilityEvent ci-dessous,
+          // pas besoin de le décrémenter manuellement ici (ancien code mort, toujours écrasé après coup).
+          // Cooldown — cette mission est structurellement 'before' (jamais démarrée ; transfer_type
+          // mis à 'before' juste au-dessus), donc même formule 'before' que releaseMissionForReplacement
+          // (missions.js) : ancrée sur scheduled_at, pas sur l'instant du tick. L'ancien code posait
+          // à tort la formule 'during' (transfer_cooldown_hours, ancrée NOW()) — jusqu'à 2h05 de
+          // cooldown en trop vs. un Œil ayant déclaré URGENCE quelques minutes plus tôt pour la même
+          // situation (RAPPORT_COOLDOWN_H30_FORMULE.md).
+          await db.query(
+            `UPDATE users SET
+              transfer_cooldown_until = GREATEST($3::timestamptz - INTERVAL '1 hour', NOW()) + INTERVAL '1 hour' * $1::numeric,
+              transfer_count = transfer_count + 1
+             WHERE id = $2`,
+            [transferCooldownBeforeHours, m.oeil_id, m.scheduled_at]
+          );
+          // Le débit journalisé doit être plafonné au solde réel de l'Œil — sinon la ligne
+          // wallet_transactions afficherait -100 alors que balance n'a baissé que du solde
+          // disponible, cassant la réconciliation SUM(wallet_transactions) == balance. lockBalance
+          // + debit() dans la même transaction (plutôt qu'un débit de 100 fixe) : le montant passé
+          // à debit() est déjà borné au solde verrouillé, donc INSUFFICIENT_BALANCE n'est jamais
+          // levée ici ; si le solde est déjà à 0, on ne journalise rien (pas de ligne à 0 MAD).
+          const deducted = await walletService.withTransaction(db, async (client) => {
+            const currentBalance = await walletService.lockBalance(client, m.oeil_id, 'oeil');
+            const deducted = Math.min(noShowH30DebitCapMad, currentBalance || 0);
+            if (deducted > 0) {
+              await walletService.debit(client, m.oeil_id, 'oeil', deducted, 'Pénalité — mission non démarrée à l\'heure', m.id);
+            }
+            return deducted;
+          });
+          await logReliabilityEvent(db, m.oeil_id, m.id, noShowH30PenaltyPoints, 'Mission non démarrée à l\'heure (H+30)', true);
 
-        // CONSTAT 16 (audit-360) : même pattern que releaseMissionForReplacement (routes/missions.js)
-        // — émettre mission_status_changed et poster un message système dans le chat, room jamais
-        // fermée ici (mission remise en recherche, pas clôturée). sender_id=m.oeil_id : c'est
-        // toujours l'Œil assigné au moment du SELECT ci-dessus (requête filtrée sur oeil_id IS NOT
-        // NULL), jamais NULL à ce stade malgré l'UPDATE qui vient de le vider en base.
-        io.to(`mission:${m.id}`).emit('mission_status_changed', { missionId: m.id, status: 'pending' });
-        await db.query(
-          `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,$3,'system',$4)`,
-          [m.id, m.oeil_id, "L'Œil n'a pas démarré la mission à l'heure. Recherche d'un remplaçant en cours.", 'autoTransferH30SystemMessage']
-        );
+          // CONSTAT 16 (audit-360) : même pattern que releaseMissionForReplacement (routes/missions.js)
+          // — émettre mission_status_changed et poster un message système dans le chat, room jamais
+          // fermée ici (mission remise en recherche, pas clôturée). sender_id=m.oeil_id : c'est
+          // toujours l'Œil assigné au moment du SELECT ci-dessus (requête filtrée sur oeil_id IS NOT
+          // NULL), jamais NULL à ce stade malgré l'UPDATE qui vient de le vider en base.
+          io.to(`mission:${m.id}`).emit('mission_status_changed', { missionId: m.id, status: 'pending' });
+          await db.query(
+            `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,$3,'system',$4)`,
+            [m.id, m.oeil_id, "L'Œil n'a pas démarré la mission à l'heure. Recherche d'un remplaçant en cours.", 'autoTransferH30SystemMessage']
+          );
 
-        // Remboursement client si pas de remplaçant (géré par cron deadline)
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, '⚠️ Mission transférée automatiquement', $2, 'warning', $3, 'mission_view', $4, $5, $6)`,
-          [m.client_id, `Votre Œil n'a pas démarré "${m.title}" à l'heure. Nous recherchons un remplaçant en urgence.`, m.id,
-           'missionAutoTransferredClientTitle', 'missionAutoTransferredClientBody', JSON.stringify({ missionTitle: m.title })]
-        );
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, '⚠️ Pénalité appliquée', $2, 'error', $3, 'reliability_page', $4, $5, $6)`,
-          [m.oeil_id, `Vous n'avez pas démarré "${m.title}" à l'heure. -${deducted} MAD déduits et cooldown ${transferCooldownBeforeHours}h appliqué.`, m.id,
-           'penaltyAppliedTitle', 'penaltyAppliedBody', JSON.stringify({ missionTitle: m.title, amount: deducted, cooldownHours: transferCooldownBeforeHours })]
-        );
-
-        // Liste admins récupérée une seule fois par tick (voir plus haut)
-        for (const admin of admins) {
+          // Remboursement client si pas de remplaçant (géré par cron deadline)
           await db.query(
             `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-             VALUES ($1, '🔄 Transfert automatique H+30', $2, 'warning', $3, 'admin_missions', $4, $5, $6)`,
-            [admin.id, `Mission "${m.title}" transférée automatiquement — Œil ${m.first_name} ${m.last_name} n'a pas démarré.`, m.id,
-             'autoTransferAdminTitle', 'autoTransferAdminBody', JSON.stringify({ missionTitle: m.title, oeilName: `${m.first_name} ${m.last_name}` })]
+             VALUES ($1, '⚠️ Mission transférée automatiquement', $2, 'warning', $3, 'mission_view', $4, $5, $6)`,
+            [m.client_id, `Votre Œil n'a pas démarré "${m.title}" à l'heure. Nous recherchons un remplaçant en urgence.`, m.id,
+             'missionAutoTransferredClientTitle', 'missionAutoTransferredClientBody', JSON.stringify({ missionTitle: m.title })]
           );
+          await db.query(
+            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+             VALUES ($1, '⚠️ Pénalité appliquée', $2, 'error', $3, 'reliability_page', $4, $5, $6)`,
+            [m.oeil_id, `Vous n'avez pas démarré "${m.title}" à l'heure. -${deducted} MAD déduits et cooldown ${transferCooldownBeforeHours}h appliqué.`, m.id,
+             'penaltyAppliedTitle', 'penaltyAppliedBody', JSON.stringify({ missionTitle: m.title, amount: deducted, cooldownHours: transferCooldownBeforeHours })]
+          );
+
+          // Liste admins récupérée une seule fois par tick (voir plus haut)
+          for (const admin of admins) {
+            await db.query(
+              `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
+               VALUES ($1, '🔄 Transfert automatique H+30', $2, 'warning', $3, 'admin_missions', $4, $5, $6)`,
+              [admin.id, `Mission "${m.title}" transférée automatiquement — Œil ${m.first_name} ${m.last_name} n'a pas démarré.`, m.id,
+               'autoTransferAdminTitle', 'autoTransferAdminBody', JSON.stringify({ missionTitle: m.title, oeilName: `${m.first_name} ${m.last_name}` })]
+            );
+          }
+          console.log(`🔄 Transfert auto H+30 pour mission ${m.id}`);
+        } catch (e) {
+          console.error(`❌ Cron H+30 — mission ${m.id} :`, e.message);
         }
-        console.log(`🔄 Transfert auto H+30 pour mission ${m.id}`);
       }
 
     } catch (e) { console.error('❌ Cron H/H+30 error:', e.message); }

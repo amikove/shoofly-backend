@@ -298,7 +298,12 @@ router.get('/admin/all', authenticate, requireRole('admin'), asyncHandler(async 
   }));
 
 // ── GET /users/admin/profile/:userId — fiche détaillée consolidée (client ou Œil) ──
-router.get('/admin/profile/:userId', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+// requirePermission('users') : la fiche expose email, téléphone, date de naissance, solde,
+// gains cumulés et l'historique complet des transactions wallet — même périmètre de données
+// personnelles/financières que les autres routes de gestion d'utilisateurs
+// (/admin/:id/toggle-active, /admin/clients/:id/strikes, /admin/clients/:id/unblock), toutes
+// déjà derrière cette permission. Un Super Admin la contourne (voir middleware/permissions.js).
+router.get('/admin/profile/:userId', authenticate, requireRole('admin'), requirePermission('users'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { userId } = req.params;
   const { page = 1, limit = 20, date_from, date_to } = req.query;
