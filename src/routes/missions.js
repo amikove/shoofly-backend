@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
-const { requireSuperAdmin } = require('../middleware/permissions');
+const { requireSuperAdmin, requirePermission } = require('../middleware/permissions');
 const { logReliabilityEvent, computeLatePenalty, isNewOeil, reverseReliabilityEvent } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutesBulk } = require('../utils/responseTime');
 const { refundOnCancellation } = require('../utils/refund');
@@ -3042,9 +3042,15 @@ router.post('/:id/force-reassign', authenticate, requireRole('admin'), asyncHand
 // l'Œil — juge qu'elle n'était pas légitime (abus répété, déclaration mensongère, etc.).
 // Catégorie 'urgence' uniquement : la catégorie 'mission' (client absent/injoignable...) est déjà
 // arbitrée par un humain via PUT /admin/claims/:missionId/resolve avant toute conséquence, elle
-// n'a pas ce besoin. requireRole('admin') générique (pas requireSuperAdmin) : même gate que les
-// autres actions admin touchant reliability_score (voir routes/reliabilityRoutes.js).
-router.post('/assistance-requests/:id/requalify', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+// n'a pas ce besoin. Gate = requireRole('admin') + requirePermission('identity') (pas
+// requireSuperAdmin) : cette route mute reliability_events (logReliabilityEvent → auto-suspension
+// possible) ; même permission que les 6 routes admin « Fiabilité » de routes/reliabilityRoutes.js,
+// alignée sur la page /admin/fiabilite (requiredPermission="identity"). Super admin : bypass.
+// NB : le bouton « Requalifier » qui appelle cette route vit dans l'onglet Fiabilité de
+// /admin/users/:userId (UserProfile.jsx), page gardée requiredPermission="users" côté écran — un
+// admin « users » sans « identity » verra donc le bouton et recevra un 403 (suivi frontend à
+// prévoir : masquer le bouton hors permission identity).
+router.post('/assistance-requests/:id/requalify', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
 

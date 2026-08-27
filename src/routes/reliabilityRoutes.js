@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
+const { requirePermission } = require('../middleware/permissions');
 const { getReliabilityLevel, reactivateWithCorrectiveEvent } = require('../utils/reliabilityScore');
 const { getSetting } = require('../utils/settings');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -87,8 +88,22 @@ router.post('/review-request', authenticate, requireRole('oeil'), asyncHandler(a
   res.status(201).json({ request });
 }));
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// Routes admin « Fiabilité » — TOUTES derrière requirePermission('identity').
+// Ces routes lisent OU mutent le score de fiabilité et le statut de suspension d'un Œil ; elles
+// sont exclusivement consommées par la page frontend /admin/fiabilite (AdminFiabilite.jsx), déjà
+// gardée requiredPermission="identity" (shoofly-react App.jsx). Avant ce correctif : requireRole
+// ('admin') seul — n'importe quel compte admin, même profil « Personnalisé » à permissions vides,
+// pouvait réactiver un Œil, réinitialiser son score ou trancher une demande d'examen. On aligne
+// le gate serveur sur le gate écran. requireRole('admin') est conservé AVANT (garde le 403 « rôle »
+// pour un non-admin) ; requirePermission('identity') ajouté juste après (super admin : bypass, voir
+// middleware/permissions.js). Même pattern que users.js (requirePermission('users') sur
+// /admin/profile/:userId). POST /missions/assistance-requests/:id/requalify porte le même gate
+// identity pour la même raison (voir routes/missions.js).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
 // ── GET /reliability/admin/requests — liste admin ─────────
-router.get('/admin/requests', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.get('/admin/requests', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { status = 'pending' } = req.query;
 
@@ -104,7 +119,7 @@ router.get('/admin/requests', authenticate, requireRole('admin'), asyncHandler(a
 }));
 
 // ── GET /reliability/admin/:oeilId/history — historique complet ──
-router.get('/admin/:oeilId/history', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.get('/admin/:oeilId/history', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: events } = await db.query(
     `SELECT e.*,
@@ -126,7 +141,7 @@ router.get('/admin/:oeilId/history', authenticate, requireRole('admin'), asyncHa
 }));
 
 // ── POST /reliability/admin/requests/:id/decide ───────────
-router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { decision, response, reset_score } = req.body; // decision: 'approved' | 'rejected'
 
@@ -171,7 +186,7 @@ router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), as
 }));
 
 // ── GET /reliability/admin/suspended — Œils actuellement suspendus ──
-router.get('/admin/suspended', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.get('/admin/suspended', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT id, first_name, last_name, email, city, quartier,
@@ -184,7 +199,7 @@ router.get('/admin/suspended', authenticate, requireRole('admin'), asyncHandler(
 }));
 
 // ── GET /reliability/admin/all-scores — tous les Œils avec leur score, triable + paginé ──
-router.get('/admin/all-scores', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.get('/admin/all-scores', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { city, quartier, page = 1, limit = 20, sort = 'score_asc' } = req.query;
   const offset = (page - 1) * limit;
@@ -220,7 +235,7 @@ router.get('/admin/all-scores', authenticate, requireRole('admin'), asyncHandler
 }));
 
 // ── POST /reliability/admin/:oeilId/reactivate — réactivation directe (sans demande d'examen) ──
-router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
     const db = getDb();
     const { reset_score } = req.body;
     const resolved = validateResetScore(reset_score); // BE-4 constat 17
