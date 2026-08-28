@@ -174,6 +174,7 @@ async function callGenerateToken({ requestId, amount, fees, dateExpiration }) {
     marchand_code: marchandCode,
     hmac,
     date_expiration: formatCashPlusDate(dateExpiration),
+    json_data: '',
   });
 
   try {
