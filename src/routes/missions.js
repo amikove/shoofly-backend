@@ -3829,6 +3829,10 @@ async function checkActivityPhotoDeadlines(db, io, emitToUser) {
   const intervalMinutes = await getSetting(db, 'activity_photo_interval_minutes', 45);
 
   for (const mission of overdue) {
+    // Isolation par itération (RG9, audit régression 360° v4) : une exception sur CETTE mission
+    // (notify, émission socket) ne doit pas abandonner le reste du lot — même granularité que
+    // checkTransferDeadlines / checkPresenceConfirmationDeadlines / checkMissionEditRequestExpiry.
+    try {
     // Garde d'idempotence posée sur l'UPDATE lui-même : si une photo vient d'arriver pile à ce
     // tick (routes/media.js repasse alerted à false en concurrence), on ne notifie personne.
     const { rowCount } = await db.query(
@@ -3855,6 +3859,7 @@ async function checkActivityPhotoDeadlines(db, io, emitToUser) {
 
     if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, activity_photo_alerted: true });
     console.log(`🚨 Photo de suivi manquante — mission ${mission.id}, alerte envoyée`);
+    } catch (e) { console.error(`❌ checkActivityPhotoDeadlines: mission ${mission.id} error:`, e.message); }
   }
 }
 
@@ -4557,6 +4562,12 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
   `);
 
   for (const ar of expired) {
+    // Isolation par itération (RG9, audit régression 360° v4) : la boucle n'avait pas de
+    // try/catch propre — seul le withTransaction interne en a un. Une exception dans le bloc
+    // notifications / closeMissionChatRoom ci-dessous, ou le `throw e` de l'inner catch (erreur
+    // non MissionTransitionError), abandonnait le reste du lot. Même granularité que
+    // checkMissionEditRequestExpiry juste au-dessus ; les `continue` internes restent valides.
+    try {
     const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [ar.mission_id]);
 
     // La mission a pu quitter sous_reclamation par une autre voie (ex: admin résolvant
@@ -4626,6 +4637,7 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
       // ci-dessus.
       closeMissionChatRoom(io, mission.id);
     }
+    } catch (e) { console.error(`❌ checkAssistanceRequestExpiry: demande ${ar.id} (mission ${ar.mission_id}) error:`, e.message); }
   }
 }
 
