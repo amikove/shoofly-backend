@@ -3127,7 +3127,11 @@ router.post('/assistance-requests/:id/requalify', authenticate, requireRole('adm
 // (commission_decision IS NULL). Réservée à category='mission' + status='auto_validated' +
 // payment_method='cash' — jamais de strike associé ici (aucun jugement humain, voir le
 // commentaire de checkAssistanceRequestExpiry).
-router.post('/assistance-requests/:id/commission', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+// requirePermission('finance') : cette route déclenche un débit wallet réel (settleCashCommission
+// ci-dessous), exactement comme sa jumelle POST /admin/claims/:missionId/commission (users.js) qui
+// porte déjà cette garde. Sans elle, un admin sans 'finance' (profils moderation/gestion) pouvait
+// la solliciter par appel direct et contourner le cloisonnement financier.
+router.post('/assistance-requests/:id/commission', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { decision } = req.body; // 'debit' | 'release'
   if (!['debit', 'release'].includes(decision)) return res.status(400).json({ error: 'Décision invalide (attendu : debit ou release)' });
@@ -3171,7 +3175,11 @@ router.post('/assistance-requests/:id/commission', authenticate, requireRole('ad
 }));
 
 // ── GET /missions/assistance-requests/commission-pending ── Admin : file d'attente commission (auto-validation cash) ──
-router.get('/assistance-requests/commission-pending', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+// requirePermission('finance') : symétrie avec sa jumelle GET /admin/claims/commission-pending
+// (users.js), déjà gardée 'finance'. Les deux files sont chargées ensemble par le même écran
+// (shoofly-react/pages/admin/Reclamations.jsx, un seul Promise.all) — un profil sans 'finance'
+// voyait déjà cette section échouer sur le premier appel, la garde ne casse donc aucun usage.
+router.get('/assistance-requests/commission-pending', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
     SELECT ar.*, m.title AS mission_title, m.price AS mission_price, m.commission AS mission_commission, m.oeil_id,
