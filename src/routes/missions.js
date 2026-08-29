@@ -4572,6 +4572,12 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
       continue;
     }
 
+    // RG13 (audit régression 360° v4) : le `return` d'idempotence dans le callback ci-dessous
+    // ne sort que de withTransaction, PAS de l'itération. `applied` remonte hors du callback
+    // pour que le bloc notifications + closeMissionChatRoom en fin d'itération ne se rejoue pas
+    // quand l'UPDATE ... WHERE status='pending' n'a touché aucune ligne (demande déjà
+    // auto_validated par un tick précédent, ou réponse du client juste avant l'UPDATE).
+    let applied = false;
     try {
       await walletService.withTransaction(db, async (client) => {
         const { rowCount } = await client.query(
@@ -4579,6 +4585,7 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
           [ar.id]
         );
         if (rowCount === 0) return; // déjà traitée entre-temps (réponse client juste avant ce tick)
+        applied = true;
 
         // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
         // symétrie NULL que POST :id/validate ci-dessus (voir son commentaire détaillé).
@@ -4600,20 +4607,25 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
       throw e;
     }
 
-    // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
-    // symétrie NULL que POST :id/validate ci-dessus (voir son commentaire détaillé).
-    if (mission.payment_method !== 'cash') {
-      await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedOeilTitle', 'assistanceAutoValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
-    } else {
-      await notify(db, mission.oeil_id, 'Mission clôturée automatiquement', `Délai écoulé sans réponse du client — "${mission.title}" clôturée. La décision concernant la commission (débitée ou libérée) vous sera communiquée séparément par un administrateur.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedPendingCommissionOeilTitle', 'assistanceAutoValidatedPendingCommissionOeilBody', { missionTitle: mission.title });
-    }
-    await notify(db, mission.client_id, 'Mission clôturée automatiquement', `Vous n'avez pas répondu à temps concernant "${mission.title}" — la déclaration de l'Œil a été considérée comme acceptée.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedClientTitle', 'assistanceAutoValidatedClientBody', { missionTitle: mission.title });
+    // RG13 : rejouer les notifications / la fermeture de room seulement si l'UPDATE
+    // d'idempotence a réellement basculé cette demande (sinon doublon « Mission clôturée
+    // automatiquement » à l'Œil et au client, room refermée pour rien).
+    if (applied) {
+      // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
+      // symétrie NULL que POST :id/validate ci-dessus (voir son commentaire détaillé).
+      if (mission.payment_method !== 'cash') {
+        await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedOeilTitle', 'assistanceAutoValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
+      } else {
+        await notify(db, mission.oeil_id, 'Mission clôturée automatiquement', `Délai écoulé sans réponse du client — "${mission.title}" clôturée. La décision concernant la commission (débitée ou libérée) vous sera communiquée séparément par un administrateur.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedPendingCommissionOeilTitle', 'assistanceAutoValidatedPendingCommissionOeilBody', { missionTitle: mission.title });
+      }
+      await notify(db, mission.client_id, 'Mission clôturée automatiquement', `Vous n'avez pas répondu à temps concernant "${mission.title}" — la déclaration de l'Œil a été considérée comme acceptée.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedClientTitle', 'assistanceAutoValidatedClientBody', { missionTitle: mission.title });
 
-    // Ce chemin transitionne sous_reclamation -> completed sans passer par POST /:id/status
-    // (voir RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.3) — fermeture de room
-    // répliquée ici pour cette même raison. Après le commit, même règle que les notify()
-    // ci-dessus.
-    closeMissionChatRoom(io, mission.id);
+      // Ce chemin transitionne sous_reclamation -> completed sans passer par POST /:id/status
+      // (voir RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.3) — fermeture de room
+      // répliquée ici pour cette même raison. Après le commit, même règle que les notify()
+      // ci-dessus.
+      closeMissionChatRoom(io, mission.id);
+    }
   }
 }
 
