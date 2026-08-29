@@ -509,6 +509,9 @@ initDb().then(() => {
       `, [dateStr]);
 
       for (const m of missions) {
+        // Isolation par itération (RG9, audit régression 360° v4) : une exception sur CETTE
+        // mission n'abandonne pas le reste du lot — même motif que la boucle lateH30 plus bas.
+        try {
         const deadlineAt = new Date(Date.now() + deadlineMinutes * 60 * 1000);
         await db.query(
           `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1 WHERE id=$2`,
@@ -540,6 +543,7 @@ initDb().then(() => {
           console.warn(`[wasel] Œil ${m.oeil_id} sans téléphone renseigné — envoi ignoré (presence_confirmation_request_j1)`);
         }
         console.log(`⏰ Confirmation de présence demandée (J-1) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
+        } catch (e) { console.error(`❌ Cron J-1 (Œil) — mission ${m.id} :`, e.message); }
       }
 
       // ── Rappel CLIENT J-1 — purement informatif, aucune confirmation attendue ──
@@ -563,6 +567,8 @@ initDb().then(() => {
       `, [dateStr]);
 
       for (const m of clientMissionsJ1) {
+        // Isolation par itération (RG9) — voir la boucle Œil ci-dessus.
+        try {
         const missionTimeClient = new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
         await db.query(
@@ -589,6 +595,7 @@ initDb().then(() => {
         }
         await db.query(`UPDATE missions SET client_reminder_j1_sent_at = NOW() WHERE id = $1`, [m.id]);
         console.log(`📅 Rappel J-1 envoyé au client pour mission ${m.id}`);
+        } catch (e) { console.error(`❌ Cron J-1 (client) — mission ${m.id} :`, e.message); }
       }
     } catch (e) { console.error('❌ Cron J-1 rappel error:', e.message); }
     finally { cronReminderJ1Running = false; }
@@ -645,6 +652,10 @@ initDb().then(() => {
       // Notification in-app admin
       const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
       for (const admin of admins) {
+        // Isolation par itération (RG9) — un INSERT notif qui échoue pour un admin ne prive
+        // pas les autres du récap. La boucle de construction du corps de l'email ci-dessus
+        // (pur concat de chaînes) n'a aucun mode d'échec et reste hors garde.
+        try {
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
            VALUES ($1, $2, $3, 'warning', 'admin_missions', $4, $5, $6)`,
@@ -655,6 +666,7 @@ initDb().then(() => {
            null,
            JSON.stringify({ count: missions.length })]
         );
+        } catch (e) { console.error(`❌ Cron récap admin — admin ${admin.id} :`, e.message); }
       }
       console.log(`📋 Récap admin envoyé — ${missions.length} missions demain`);
     } catch (e) { console.error('❌ Cron récap admin error:', e.message); }
@@ -701,6 +713,11 @@ initDb().then(() => {
       `, [alertWindowMinutes]);
 
       for (const m of lateH) {
+        // Isolation par itération (RG9, audit régression 360° v4) : PRIORITAIRE — cette boucle
+        // partage le tick (verrou cronAlertHRunning) avec lateH30 juste en dessous. Sans cette
+        // garde, une exception ici était rattrapée par le catch de tick et empêchait TOUTE la
+        // boucle de transferts automatiques H+30 de s'exécuter au même passage.
+        try {
         // Alerte Œil
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -728,6 +745,7 @@ initDb().then(() => {
           type: 'error'
         });
         console.log(`🚨 Alerte H pour mission ${m.id}`);
+        } catch (e) { console.error(`❌ Cron H — mission ${m.id} :`, e.message); }
       }
 
       // Missions H+30min → transfert automatique
@@ -886,6 +904,8 @@ initDb().then(() => {
       // (audit perf 2026-07-26).
       const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
       for (const m of expired) {
+        // Isolation par itération (RG9) — voir la boucle lateH plus haut.
+        try {
         for (const admin of admins) {
           await db.query(
             `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -896,6 +916,7 @@ initDb().then(() => {
           );
         }
         console.log(`🔍 Alerte mission expirée ${m.id}`);
+        } catch (e) { console.error(`❌ Cron missions expirées — mission ${m.id} :`, e.message); }
       }
     } catch (e) { console.error('❌ Cron missions expirées error:', e.message); }
     finally { cronExpiredMissionsRunning = false; }
@@ -947,6 +968,9 @@ initDb().then(() => {
         AND (m.presence_confirmation_requested_at IS NULL OR m.presence_confirmation_requested_at < NOW() - INTERVAL '33 minutes')
       `, [reminderEarlyMinutes - 20, reminderEarlyMinutes + 20]);
       for (const m of missions2h) {
+        // Isolation par itération (RG9) — voir la boucle lateH plus haut. Ce cron partage son
+        // verrou (cronPreMissionRemindersRunning) avec la boucle H-45 juste en dessous.
+        try {
         const deadlineSamedayMinutes = await getSetting(db, 'presence_confirmation_deadline_minutes_sameday', 45);
         const deadlineAt = new Date(Date.now() + deadlineSamedayMinutes * 60 * 1000);
         await db.query(
@@ -978,6 +1002,7 @@ initDb().then(() => {
           console.warn(`[wasel] Œil ${m.oeil_id} sans téléphone renseigné — envoi ignoré (presence_confirmation_request_sameday)`);
         }
         console.log(`⏰ Confirmation de présence demandée (H-2) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
+        } catch (e) { console.error(`❌ Cron H-2 — mission ${m.id} :`, e.message); }
       }
 
       // H-45min — second point de contrôle actif et indépendant du précédent. Fenêtre élargie
@@ -1005,6 +1030,8 @@ initDb().then(() => {
       // admin passive plus bas) — audit perf 2026-07-26.
       const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
       for (const m of missions45) {
+        // Isolation par itération (RG9) — voir la boucle H-2 ci-dessus.
+        try {
         const responseMinutesH45 = await getSetting(db, 'presence_confirmation_deadline_minutes_h45', 15);
         const deadlineAt = new Date(Date.now() + responseMinutesH45 * 60 * 1000);
         // presence_confirmation_h45_email_sent_at remis à NULL à chaque nouvelle ouverture de ce
@@ -1057,6 +1084,7 @@ initDb().then(() => {
              JSON.stringify({ missionTitle: m.title, lateMinutes: reminderLateMinutes })]
           );
         }
+        } catch (e) { console.error(`❌ Cron H-45 — mission ${m.id} :`, e.message); }
       }
     } catch (e) { console.error('❌ Cron rappels error:', e.message); }
     finally { cronPreMissionRemindersRunning = false; }
@@ -1094,6 +1122,8 @@ initDb().then(() => {
       `, [reminderEarlyMinutes - 20, reminderEarlyMinutes + 20]);
 
       for (const m of clientMissionsH2) {
+        // Isolation par itération (RG9) — voir la boucle lateH plus haut.
+        try {
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
            VALUES ($1, $2, $3, 'mission', $4, 'mission_view', $5, $6, $7)`,
@@ -1118,6 +1148,7 @@ initDb().then(() => {
         }
         await db.query(`UPDATE missions SET client_reminder_h2_sent_at = NOW() WHERE id = $1`, [m.id]);
         console.log(`📅 Rappel H-2 envoyé au client pour mission ${m.id}`);
+        } catch (e) { console.error(`❌ Cron rappel client H-2 — mission ${m.id} :`, e.message); }
       }
     } catch (e) { console.error('❌ Cron rappel client H-2 error:', e.message); }
     finally { cronClientReminderH2Running = false; }
@@ -1232,6 +1263,11 @@ initDb().then(() => {
       `);
 
       for (const mission of tiebreaksExpired) {
+        // Isolation par itération (RG9, audit régression 360° v4) : ce cron partage son verrou
+        // (cronCandidateWindowRunning) avec la boucle des lots expirés juste en dessous. Sans
+        // cette garde, une exception sur un départage gelait l'avancement de TOUTE la cascade
+        // de recrutement du tick. Les `continue` internes existants sont conservés tels quels.
+        try {
         const { rows: confirmed } = await db.query(`
           SELECT mi.oeil_id
           FROM mission_interests mi
@@ -1280,6 +1316,7 @@ initDb().then(() => {
         // Pas de WhatsApp ici — le client a déjà été informé qu'un remplaçant était
         // recherché, aucune action rapide n'est attendue de lui à ce stade (filtrage
         // WhatsApp 2026-07-25).
+        } catch (e) { console.error(`❌ Cron cascade départage — mission ${mission.id} :`, e.message); }
       }
 
       // 2) Lots entiers expirés sans aucune confirmation — passage au lot suivant
@@ -1291,8 +1328,13 @@ initDb().then(() => {
       `);
 
       for (const mission of batchesExpired) {
+        // Isolation par itération (RG9) — « poison pill » identifiée par l'audit : sans cette
+        // garde, une seule mission qui fait lever advanceCandidateCascade bloquait l'avancement
+        // de tous les autres lots expirés du même tick, à chaque tick.
+        try {
         console.log(`⏱️ Lot expiré sans aucune confirmation — mission ${mission.id}, passage au lot suivant`);
         await advanceCandidateCascade(db, io, emitToUser, mission, {});
+        } catch (e) { console.error(`❌ Cron cascade lot expiré — mission ${mission.id} :`, e.message); }
       }
     } catch (e) { console.error('❌ Cron cascade candidat error:', e.message); }
     finally { cronCandidateWindowRunning = false; }
@@ -1319,8 +1361,13 @@ initDb().then(() => {
           AND urgent_whatsapp_next_wave_at IS NOT NULL AND urgent_whatsapp_next_wave_at <= NOW()
       `);
       for (const mission of dueMissions) {
+        // Isolation par itération (RG9) — trouvée pendant l'analyse, hors liste initiale de
+        // l'audit, même classe de défaut que les 12 boucles listées : sendUrgentWhatsAppWave
+        // qui lève sur une mission abandonnait les vagues des missions suivantes du tick.
+        try {
         const sent = await sendUrgentWhatsAppWave(db, mission);
         console.log(`📲 Vague WhatsApp mission urgente ${mission.id} — ${sent} Œil(s) contacté(s)`);
+        } catch (e) { console.error(`❌ Cron vagues WhatsApp urgentes — mission ${mission.id} :`, e.message); }
       }
     } catch (e) { console.error('❌ Cron vagues WhatsApp missions urgentes error:', e.message); }
     finally { cronUrgentWhatsAppWaveRunning = false; }
@@ -1354,6 +1401,9 @@ initDb().then(() => {
       `, [seuilMinutes]);
 
       for (const m of dueMissions) {
+        // Isolation par itération (RG9) — trouvée pendant l'analyse, hors liste initiale de
+        // l'audit, même classe de défaut que les 12 boucles listées.
+        try {
         const { rowCount } = await db.query(
           `UPDATE missions SET candidature_whatsapp_sent_at=NOW() WHERE id=$1 AND candidature_whatsapp_sent_at IS NULL`,
           [m.id]
@@ -1362,6 +1412,7 @@ initDb().then(() => {
           await sendWhatsAppTemplate(waselTemplates.oeil_applied.template_name, m.client_phone, [String(m.n), m.title]);
           console.log(`📲 Seuil WhatsApp candidatures (délai) déclenché pour mission ${m.id} — ${m.n} candidature(s)`);
         }
+        } catch (e) { console.error(`❌ Cron seuil WhatsApp candidatures — mission ${m.id} :`, e.message); }
       }
     } catch (e) { console.error('❌ Cron seuil WhatsApp candidatures error:', e.message); }
     finally { cronCandidatureWhatsAppRunning = false; }
@@ -1447,6 +1498,8 @@ initDb().then(() => {
       // 2026-07-26).
       const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
       for (const m of staleMissions) {
+        // Isolation par itération (RG9) — voir la boucle lateH plus haut.
+        try {
           for (const admin of admins) {
             await db.query(
               `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -1482,6 +1535,7 @@ initDb().then(() => {
 
           await db.query(`UPDATE missions SET stale_notified_at = NOW() WHERE id = $1`, [m.id]);
           console.log(`⏳ Notification mission sans Œil envoyée pour ${m.id}`);
+        } catch (e) { console.error(`❌ Cron missions sans Œil — mission ${m.id} :`, e.message); }
         }
     } catch (e) { console.error('❌ Cron missions sans Œil error:', e.message); }
     finally { cronStaleMissionsRunning = false; }
@@ -1518,6 +1572,9 @@ initDb().then(() => {
 
       for (const ticket of tickets) {
         if (!systemSenderId) { console.warn('⏭️ Cron auto-résolution tickets : aucun admin actif trouvé, tick ignoré'); break; }
+        // Isolation par itération (RG9) — voir la boucle lateH plus haut. Le `break` ci-dessus
+        // (garde de contrôle de boucle, pas de traitement d'item) reste volontairement hors try.
+        try {
         await db.query(
           `UPDATE support_tickets SET status='resolved', resolved_by=NULL, resolved_at=NOW(), updated_at=NOW() WHERE id=$1`,
           [ticket.id]
@@ -1535,6 +1592,7 @@ initDb().then(() => {
           'ticketAutoResolvedTitle', 'ticketAutoResolvedBody', { reference: ticket.reference, ticketId: ticket.id }
         );
         console.log(`📋 Ticket ${ticket.reference} auto-résolu après 72h d'inactivité`);
+        } catch (e) { console.error(`❌ Cron auto-résolution tickets — ticket ${ticket.id} :`, e.message); }
       }
     } catch (e) { console.error('❌ Cron auto-résolution tickets error:', e.message); }
     finally { cronTicketAutoResolveRunning = false; }
