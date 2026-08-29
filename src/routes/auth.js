@@ -201,7 +201,17 @@ router.put('/me', authenticate, asyncHandler(async (req, res) => {
 
   }));
 
-router.put('/password', authenticate, asyncHandler(async (req, res) => {
+router.put('/password', authenticate, [
+  // Aligné sur /register et /reset-password (mêmes contraintes sur un mot de passe) : sans ce
+  // garde, new_password:"" produisait un hash de chaîne vide écrit en base (compte verrouillé,
+  // /login exigeant password.notEmpty()), et new_password absent/non-string faisait lever
+  // bcrypt.hashSync(undefined, 10) → 500 au lieu d'un 400 propre. isString() d'abord pour que
+  // l'absence/le mauvais type soit rejetée par le validateur, pas par bcrypt.
+  body('new_password').isString().isLength({ min: 6 }),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
   const db = getDb();
   const { rows: [user] } = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
   if (!bcrypt.compareSync(req.body.current_password, user.password))
