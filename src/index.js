@@ -923,16 +923,29 @@ initDb().then(() => {
       const reminderEarlyMinutes = await getSetting(db, 'reminder_before_mission_minutes_early', 120);
       const reminderLateMinutes = await getSetting(db, 'reminder_before_mission_minutes_late', 45);
 
-      // H-2h (marge ±10min, dimensionnée pour la fréquence du cron */30 * * * *) — point de
-      // contrôle actif à chaque passage dans la fenêtre, que la mission ait déjà été confirmée
-      // à J-1 ou jamais sollicitée (mission assignée le jour même).
+      // H-2h — fenêtre ±20min, VOLONTAIREMENT plus large que la période du cron */30 : le
+      // chevauchement de 10min entre deux ticks consécutifs garantit qu'aucune bande de
+      // scheduled_at ne tombe entre les mailles. L'ancienne marge ±10min (20min < 30min de
+      // période) laissait au contraire un trou de 10min par période — une mission planifiée à
+      // certaines minutes n'était balayée à aucun tick et ne recevait donc aucune demande de
+      // confirmation H-2 (constat N1, audit régression 360° v4 du 2026-08-29).
+      // Garde d'idempotence ajoutée en même temps : sans elle, le tick chevauchant renverrait
+      // une 2e demande (notification + WhatsApp en double, deadline repoussée) pour la même
+      // mission. On ne peut pas filtrer sur `presence_confirmation_requested_at IS NULL` seul —
+      // ce point de contrôle DOIT se rouvrir même si J-1 l'a déjà posé (cf. en-tête du cron) ;
+      // on exclut donc uniquement une demande TRÈS récente : < 33min ≈ période du cron (30) +
+      // marge de jitter, et sous l'écart minimal H-2→H-45 (35min aux réglages par défaut) pour
+      // ne jamais neutraliser le point de contrôle H-45.
+      // Point de contrôle actif à chaque passage dans la fenêtre, que la mission ait déjà été
+      // confirmée à J-1 ou jamais sollicitée (mission assignée le jour même).
       const { rows: missions2h } = await db.query(`
         SELECT m.*, u.phone FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status = 'assigned'
         AND m.scheduled_at BETWEEN NOW() + INTERVAL '1 minute' * $1::numeric AND NOW() + INTERVAL '1 minute' * $2::numeric
         AND m.oeil_id IS NOT NULL
-      `, [reminderEarlyMinutes - 10, reminderEarlyMinutes + 10]);
+        AND (m.presence_confirmation_requested_at IS NULL OR m.presence_confirmation_requested_at < NOW() - INTERVAL '33 minutes')
+      `, [reminderEarlyMinutes - 20, reminderEarlyMinutes + 20]);
       for (const m of missions2h) {
         const deadlineSamedayMinutes = await getSetting(db, 'presence_confirmation_deadline_minutes_sameday', 45);
         const deadlineAt = new Date(Date.now() + deadlineSamedayMinutes * 60 * 1000);
@@ -967,19 +980,27 @@ initDb().then(() => {
         console.log(`⏰ Confirmation de présence demandée (H-2) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
       }
 
-      // H-45min (marge ±10min) — second point de contrôle actif et indépendant du précédent.
+      // H-45min — second point de contrôle actif et indépendant du précédent. Fenêtre élargie
+      // à ±20min (même raison qu'en H-2 ci-dessus : ±10min < période */30 laissait un trou de
+      // 10min par période, constat N1). Même garde d'idempotence que H-2 (33min) — indispensable
+      // ici aussi, le tick chevauchant renverrait sinon une 2e demande.
       // Délai de réponse configurable (presence_confirmation_deadline_minutes_h45, 15 min par
       // défaut) : avec le lot de candidats par défaut (candidate_batch_size=10,
       // candidate_confirmation_minutes=10 + candidate_tiebreak_window_minutes=5 = 15min par
-      // cycle de réattribution), 15min de délai de réponse ici laissent encore ~30min de marge
-      // avant l'heure de la mission pour 2 cycles complets de réattribution par lot.
+      // cycle de réattribution), au centre de la fenêtre (~45min avant la mission) 15min de
+      // délai laissent ~30min de marge pour 2 cycles complets ; au bord bas de la fenêtre
+      // élargie (~25min avant), il ne reste qu'un cycle — dégradation assumée : ce point de
+      // contrôle est un SECOND filet, la mission concernée a déjà reçu le point de contrôle
+      // H-2 (lui-même élargi), et un H-45 même serré vaut mieux que la bande jamais balayée
+      // que corrige N1.
       const { rows: missions45 } = await db.query(`
         SELECT m.*, u.phone FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status = 'assigned'
         AND m.scheduled_at BETWEEN NOW() + INTERVAL '1 minute' * $1::numeric AND NOW() + INTERVAL '1 minute' * $2::numeric
         AND m.oeil_id IS NOT NULL
-      `, [reminderLateMinutes - 10, reminderLateMinutes + 10]);
+        AND (m.presence_confirmation_requested_at IS NULL OR m.presence_confirmation_requested_at < NOW() - INTERVAL '33 minutes')
+      `, [reminderLateMinutes - 20, reminderLateMinutes + 20]);
       // Un seul SELECT admins par tick, réutilisé pour chaque mission ci-dessous (voir alerte
       // admin passive plus bas) — audit perf 2026-07-26.
       const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
@@ -1059,14 +1080,18 @@ initDb().then(() => {
       const emitToUser = app.get('emitToUser');
       const reminderEarlyMinutes = await getSetting(db, 'reminder_before_mission_minutes_early', 120);
 
-      // Même marge ±10min que le bloc Œil H-2 (dimensionnée pour la fréquence */30 * * * *).
+      // Même fenêtre ±20min que le bloc Œil H-2 (élargie au-delà de la période */30 pour le
+      // chevauchement volontaire entre ticks, constat N1). Pas de garde d'idempotence à base de
+      // temps ici : le filtre `client_reminder_h2_sent_at IS NULL` ci-dessous + l'UPDATE de
+      // cette colonne en fin de boucle suffisent déjà à empêcher un 2e envoi sur le tick
+      // chevauchant.
       const { rows: clientMissionsH2 } = await db.query(`
         SELECT m.*, u.phone FROM missions m
         JOIN users u ON u.id = m.client_id
         WHERE m.status = 'assigned'
         AND m.scheduled_at BETWEEN NOW() + INTERVAL '1 minute' * $1::numeric AND NOW() + INTERVAL '1 minute' * $2::numeric
         AND m.client_reminder_h2_sent_at IS NULL
-      `, [reminderEarlyMinutes - 10, reminderEarlyMinutes + 10]);
+      `, [reminderEarlyMinutes - 20, reminderEarlyMinutes + 20]);
 
       for (const m of clientMissionsH2) {
         await db.query(
