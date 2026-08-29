@@ -1394,7 +1394,11 @@ router.get('/admin/stats', authenticate, requireRole('admin'), requirePermission
   });
 }));
 
-router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+// requirePermission('identity') : vérifier un Œil (is_verified=true → il peut prendre des
+// missions) est une écriture d'identité, au même titre que .../identity-requests/:id/approve
+// ci-dessous ; asymétrie corrigée avec la lecture GET /admin/identity-requests, déjà gardée
+// 'identity'. Aucun appelant frontend (adminAPI.verifyOeil est défini mais jamais appelé).
+router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   await db.query(`UPDATE oeil_profiles SET is_verified=true, id_verified_at=NOW() WHERE user_id=$1`, [req.params.id]);
@@ -2155,7 +2159,10 @@ router.get('/admin/identity-requests', authenticate, requireRole('admin'), requi
 }));
 
 // ── POST /users/admin/identity-requests/:id/approve ──
-router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+// requirePermission('identity') : symétrie avec GET /admin/identity-requests (déjà gardé
+// 'identity') — approuver est irréversible côté produit (l'Œil peut dès lors prendre des
+// missions). Même volet que les 7 routes fiabilité gardées 'identity' par 7a5d0fc.
+router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
 
   const { rows: [doc] } = await db.query(
@@ -2189,7 +2196,9 @@ router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('a
 }));
 
 // ── POST /users/admin/identity-requests/:id/reject ──
-router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+// requirePermission('identity') : même garde que /approve ci-dessus et que la lecture
+// GET /admin/identity-requests.
+router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { reason } = req.body;
 
