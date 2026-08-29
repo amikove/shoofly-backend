@@ -31,6 +31,7 @@ const jwt = require('jsonwebtoken');
 const { initDb, getDb, checkDbConnection } = require('./db/schema');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
+const { casablancaYMD } = require('./utils/schedule');
 const { transitionMission } = require('./utils/missionStateMachine');
 const walletService = require('./services/walletService');
 const { runAutoValidateMissions, runValidationReminders, runAssistanceReminders } = require('./jobs/autoValidateMissions');
@@ -489,7 +490,11 @@ initDb().then(() => {
       const emitToUser = app.get('emitToUser');
       const tomorrow = new Date();
       tomorrow.setDate(tomorrow.getDate() + 1);
-      const dateStr = tomorrow.toISOString().slice(0, 10);
+      // Jour civil "demain" vu de Casablanca, pas la date UTC de l'instant tomorrow (RG2, audit
+      // 360° v4). Doit rester aligné avec le AT TIME ZONE des 2 requêtes ci-dessous : les deux
+      // moitiés (JS + SQL) parlent la même langue "jour civil marocain", indépendamment du
+      // fuseau de session Postgres. Même helper et même motif que FIN-BE-2 (expenses.expense_date).
+      const dateStr = casablancaYMD(tomorrow);
       const deadlineMinutes = await getSetting(db, 'presence_confirmation_deadline_minutes', 120);
 
       const { rows: missions } = await db.query(`
@@ -497,7 +502,7 @@ initDb().then(() => {
         FROM missions m
         JOIN users u ON u.id = m.oeil_id
         WHERE m.status IN ('assigned')
-        AND DATE(m.scheduled_at) = $1
+        AND DATE(m.scheduled_at AT TIME ZONE 'Africa/Casablanca') = $1
         AND m.oeil_id IS NOT NULL
         AND m.presence_confirmed_at IS NULL
         AND m.presence_confirmation_requested_at IS NULL
@@ -553,7 +558,7 @@ initDb().then(() => {
         FROM missions m
         JOIN users u ON u.id = m.client_id
         WHERE m.status = 'assigned'
-        AND DATE(m.scheduled_at) = $1
+        AND DATE(m.scheduled_at AT TIME ZONE 'Africa/Casablanca') = $1
         AND m.client_reminder_j1_sent_at IS NULL
       `, [dateStr]);
 
@@ -597,7 +602,10 @@ initDb().then(() => {
       const db = getDb();
       const tomorrow = new Date();
       tomorrow.setDate(tomorrow.getDate() + 1);
-      const dateStr = tomorrow.toISOString().slice(0, 10);
+      // Jour civil "demain" vu de Casablanca (RG2) — voir cron 20h ci-dessus. Aligné avec le
+      // AT TIME ZONE de la requête ci-dessous ; ligne 627 (toLocaleDateString + timeZone) déjà
+      // correcte, laissée telle quelle.
+      const dateStr = casablancaYMD(tomorrow);
 
       const { rows: missions } = await db.query(`
         SELECT m.*,
@@ -607,7 +615,7 @@ initDb().then(() => {
         JOIN users u ON u.id = m.oeil_id
         JOIN users c ON c.id = m.client_id
         WHERE m.status IN ('assigned')
-        AND DATE(m.scheduled_at) = $1
+        AND DATE(m.scheduled_at AT TIME ZONE 'Africa/Casablanca') = $1
         AND m.oeil_id IS NOT NULL
         AND m.presence_confirmed_at IS NULL
         ORDER BY m.city, m.quartier
