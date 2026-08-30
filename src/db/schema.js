@@ -12,9 +12,11 @@ function getDb() {
       // Sans ceci, une tentative de connexion qui ne répond jamais (DB injoignable) reste
       // ouverte indéfiniment et finit par épuiser le pool — voir checkDbConnection ci-dessous.
       connectionTimeoutMillis: 4000,
-      // Défaut pg (10) trop juste : les 14 cron.schedule (index.js) n'ont aucun décalage entre
-      // eux, donc plusieurs peuvent se réveiller au même tick (ex: toutes les heures rondes),
-      // en plus du trafic HTTP/WebSocket qui partage le même pool (audit perf 2026-07-26).
+      // Défaut pg (10) trop juste : les 24 cron.schedule (index.js) sont étalés sur des minutes
+      // de déclenchement distinctes depuis RG11 (audit régression 360° v4) — au pire 4 ticks
+      // coïncident (contre ~22 à la minute :00 auparavant), en plus du trafic HTTP/WebSocket qui
+      // partage le même pool (audit perf 2026-07-26). max laissé à 15 : l'étalement a réduit la
+      // demande de pointe des crons, 15 reste confortable, aucun re-dimensionnement requis.
       max: 15,
     });
     // pg émet 'error' sur le POOL quand un client INACTIF (au repos dans le pool, hors de toute
