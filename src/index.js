@@ -882,7 +882,7 @@ initDb().then(() => {
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les heures — Missions expirées (niveau 3) ─
-  cron.schedule('0 * * * *', async () => {
+  cron.schedule('8 * * * *', async () => {
     if (cronExpiredMissionsRunning) { console.warn('⏭️ Cron missions expirées déjà en cours, tick ignoré'); return; }
     cronExpiredMissionsRunning = true;
     try {
@@ -935,7 +935,7 @@ initDb().then(() => {
   // (checkPresenceConfirmationDeadlines, cron dédié ci-dessous, qui ne distingue jamais quel
   // point de contrôle a posé la deadline) — rien de nouveau n'est construit pour la
   // réattribution elle-même, seule l'ouverture du point de contrôle change ici.
-  cron.schedule('*/30 * * * *', async () => {
+  cron.schedule('7-59/30 * * * *', async () => {
     if (cronPreMissionRemindersRunning) { console.warn('⏭️ Cron rappels avant mission déjà en cours, tick ignoré'); return; }
     cronPreMissionRemindersRunning = true;
     try {
@@ -1100,7 +1100,7 @@ initDb().then(() => {
   // plutôt que d'ajouter un réglage quasi-identique : un admin qui change ce délai le fait pour
   // "2h avant la mission" au sens large, pas spécifiquement pour la mécanique de confirmation
   // de l'Œil — pas de valeur codée en dur alors qu'un réglage équivalent existe déjà.
-  cron.schedule('*/30 * * * *', async () => {
+  cron.schedule('14-59/30 * * * *', async () => {
     if (cronClientReminderH2Running) { console.warn('⏭️ Cron rappel client H-2 déjà en cours, tick ignoré'); return; }
     cronClientReminderH2Running = true;
     try {
@@ -1168,7 +1168,7 @@ initDb().then(() => {
   }, { timezone: 'Africa/Casablanca' });
 
   // Expirer les demandes de modification de mission sans réponse de l'Œil toutes les 5 minutes
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('1-59/5 * * * *', async () => {
     if (cronMissionEditExpiryRunning) { console.warn('⏭️ Cron expiration demandes de modification déjà en cours, tick ignoré'); return; }
     cronMissionEditExpiryRunning = true;
     try {
@@ -1182,7 +1182,7 @@ initDb().then(() => {
 
   // Expirer les demandes "Demander assistance" (catégorie mission) sans réponse du client,
   // toutes les 5 minutes — même cadence que les autres vérifications de deadline ci-dessus.
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('2-59/5 * * * *', async () => {
     if (cronAssistanceRequestExpiryRunning) { console.warn('⏭️ Cron expiration demandes assistance déjà en cours, tick ignoré'); return; }
     cronAssistanceRequestExpiryRunning = true;
     try {
@@ -1201,7 +1201,7 @@ initDb().then(() => {
   // (routes/missions.js), qui délègue elle-même à advanceCandidateCascade — même cadence que
   // les autres vérifications de deadline (checkTransferDeadlines, checkMissionEditRequestExpiry
   // ci-dessus), largement suffisante face au délai le plus court (45min, cas jour même).
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('3-59/5 * * * *', async () => {
     if (cronPresenceConfirmationRunning) { console.warn('⏭️ Cron confirmations de présence déjà en cours, tick ignoré'); return; }
     cronPresenceConfirmationRunning = true;
     try {
@@ -1217,7 +1217,7 @@ initDb().then(() => {
   // (PROMPT 2, 2026-08-17) — même cadence que les autres vérifications de deadline ci-dessus,
   // largement suffisante face à la fenêtre la plus courte en jeu (activity_photo_interval_
   // minutes, défaut 45 min). Voir checkActivityPhotoDeadlines, routes/missions.js.
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('4-59/5 * * * *', async () => {
     if (cronActivityPhotoRunning) { console.warn('⏭️ Cron photo de suivi déjà en cours, tick ignoré'); return; }
     cronActivityPhotoRunning = true;
     try {
@@ -1350,7 +1350,7 @@ initDb().then(() => {
   // ET ici pour les vagues suivantes, logique non dupliquée) : NULL tant qu'aucune vague n'est
   // en attente (mission non urgente, déjà assignée, ou pool d'Œils éligibles épuisé — dans ce
   // dernier cas l'alerte admin "mission sans Œil depuis 12h" ci-dessous prend le relais).
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('1-59/5 * * * *', async () => {
     if (cronUrgentWhatsAppWaveRunning) { console.warn('⏭️ Cron vagues WhatsApp missions urgentes déjà en cours, tick ignoré'); return; }
     cronUrgentWhatsAppWaveRunning = true;
     try {
@@ -1383,7 +1383,7 @@ initDb().then(() => {
   // champ de suivi que le déclencheur synchrone (missions.candidature_whatsapp_sent_at, garde
   // atomique WHERE ... IS NULL). Exclut les missions déjà résolues (status != 'pending')
   // — inutile d'alerter le client sur des candidatures d'une mission déjà assignée/annulée.
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('2-59/5 * * * *', async () => {
     if (cronCandidatureWhatsAppRunning) { console.warn('⏭️ Cron seuil WhatsApp candidatures déjà en cours, tick ignoré'); return; }
     cronCandidatureWhatsAppRunning = true;
     try {
@@ -1421,7 +1421,7 @@ initDb().then(() => {
   // ── Cron toutes les 5 min — Relance candidatures non choisies (PROMPT 5, 2026-08-18) ────
   // Logique extraite dans jobs/candidatureRelance.js (même raison que runAutoValidateMissions :
   // testable indépendamment d'un vrai tick cron).
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('3-59/5 * * * *', async () => {
     if (cronCandidatureRelanceRunning) { console.warn('⏭️ Cron relance candidatures déjà en cours, tick ignoré'); return; }
     cronCandidatureRelanceRunning = true;
     try {
@@ -1432,7 +1432,7 @@ initDb().then(() => {
 
   // ── Cron toutes les 2 min — Relance par email des WhatsApp à délai court non lus (PROMPT 5,
   // 2026-08-18) ── Logique extraite dans jobs/unreadWhatsappEmailFallback.js (même raison).
-  cron.schedule('*/2 * * * *', async () => {
+  cron.schedule('1-59/2 * * * *', async () => {
     if (cronUnreadEmailFallbackRunning) { console.warn('⏭️ Cron relance email déjà en cours, tick ignoré'); return; }
     cronUnreadEmailFallbackRunning = true;
     try {
@@ -1441,7 +1441,7 @@ initDb().then(() => {
     finally { cronUnreadEmailFallbackRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
-  cron.schedule('0 * * * *', async () => {
+  cron.schedule('15 * * * *', async () => {
     if (cronAutoValidateRunning) { console.warn('⏭️ Cron auto-validation déjà en cours, tick ignoré'); return; }
     cronAutoValidateRunning = true;
     try {
@@ -1454,7 +1454,7 @@ initDb().then(() => {
   // Même cadence que le cron d'auto-validation ci-dessus (les deux checkpoints de la même
   // fenêtre de client_validation_hours), verrou dédié pour rester indépendant si l'un des deux
   // devait un jour changer de fréquence.
-  cron.schedule('0 * * * *', async () => {
+  cron.schedule('20 * * * *', async () => {
     if (cronValidationReminderRunning) { console.warn('⏭️ Cron rappel validation déjà en cours, tick ignoré'); return; }
     cronValidationReminderRunning = true;
     try {
@@ -1466,7 +1466,7 @@ initDb().then(() => {
   // ── Cron horaire — Rappel intermédiaire client, mission gelée en sous_reclamation par une
   // demande d'assistance (CONSTAT 12, audit-360) ── Même cadence que les 2 crons ci-dessus (les
   // 3 checkpoints de la même fenêtre client_validation_hours), verrou dédié pour la même raison.
-  cron.schedule('0 * * * *', async () => {
+  cron.schedule('25 * * * *', async () => {
     if (cronAssistanceReminderRunning) { console.warn('⏭️ Cron rappel assistance déjà en cours, tick ignoré'); return; }
     cronAssistanceReminderRunning = true;
     try {
@@ -1476,7 +1476,7 @@ initDb().then(() => {
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 30 min — Missions jamais assignées (12h+, encore >4h avant le créneau) ──
-  cron.schedule('*/30 * * * *', async () => {
+  cron.schedule('21-59/30 * * * *', async () => {
     if (cronStaleMissionsRunning) { console.warn('⏭️ Cron missions sans Œil déjà en cours, tick ignoré'); return; }
     cronStaleMissionsRunning = true;
     try {
@@ -1544,7 +1544,7 @@ initDb().then(() => {
   // ── Cron toutes les heures — auto-résolution des tickets après 72h d'inactivité ──
   // IMPORTANT : is_urgent=true est EXCLU explicitement de la requête (jamais concerné
   // par cette auto-résolution, quelle que soit la durée d'inactivité).
-  cron.schedule('0 * * * *', async () => {
+  cron.schedule('40 * * * *', async () => {
     if (cronTicketAutoResolveRunning) { console.warn('⏭️ Cron auto-résolution tickets déjà en cours, tick ignoré'); return; }
     cronTicketAutoResolveRunning = true;
     try {
@@ -1601,7 +1601,7 @@ initDb().then(() => {
   // ── Cron toutes les 15 min — Retry des échecs d'envoi WhatsApp non résolus ──
   // Visibilité admin : GET /users/admin/whatsapp-failures. Voir jobs/whatsappRetry.js pour la
   // limite de tentatives (whatsapp_retry_max_attempts, settings) et la logique de retry.
-  cron.schedule('*/15 * * * *', async () => {
+  cron.schedule('9-59/15 * * * *', async () => {
     if (cronWhatsappRetryRunning) { console.warn('⏭️ Cron retry WhatsApp déjà en cours, tick ignoré'); return; }
     cronWhatsappRetryRunning = true;
     try {
@@ -1618,7 +1618,7 @@ initDb().then(() => {
   // notification live dès qu'un NOUVEL écart est détecté (notify()+room:admin, voir
   // jobs/walletReconciliation.js), plus consultation à la demande via GET
   // /users/admin/wallet-reconciliation-alerts.
-  cron.schedule('0 * * * *', async () => {
+  cron.schedule('50 * * * *', async () => {
     if (cronWalletReconciliationRunning) { console.warn('⏭️ Cron réconciliation wallet déjà en cours, tick ignoré'); return; }
     cronWalletReconciliationRunning = true;
     try {
@@ -1632,7 +1632,7 @@ initDb().then(() => {
   // ── Cron toutes les 5 min — Expiration des demandes de recharge CashPlus ──
   // Même fréquence que les autres vérifications de deadline du projet (transfert, edit-request,
   // assistance) — voir jobs/cashplusExpiry.js. Purement informatif (aucune action financière).
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('4-59/5 * * * *', async () => {
     if (cronCashplusExpiryRunning) { console.warn('⏭️ Cron expiration CashPlus déjà en cours, tick ignoré'); return; }
     cronCashplusExpiryRunning = true;
     try {
