@@ -18,7 +18,7 @@ const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveQuartier, validateCityInput } = require('../constants/villes');
-const { isValidSubcategory } = require('../constants/missionCategories');
+const { isValidSubcategory, getSubcategoryMinPrice } = require('../constants/missionCategories');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
 const { checkCashCommissionBalance, settleCashCommission } = require('../utils/cashCommission');
 const { generateUniqueReference } = require('../utils/ticketReference');
@@ -302,8 +302,21 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
   // acceptant n'importe quel prix >= 0. Exempté pour une mission gratuite via code promo déjà
   // validée ci-dessus (freePromo non-null) : ce 0 MAD est volontaire, ce n'est pas un tarif
   // client à plancher.
+  //
+  // D1 (audit régression 360° v4, 2026-08-31) — jusqu'ici SEUL le plancher global de 80 MAD
+  // était appliqué, quelle que soit la sous-catégorie : un appel API direct pouvait réserver
+  // n'importe quelle sous-catégorie file_attente (« Consulat étranger » = 169 MAD attendus,
+  // etc.) à 80 MAD, le frontend n'appliquant ces planchers spécifiques que dans le formulaire
+  // (NewMissionModal.jsx, getMinPrice). On porte la table (constants/missionCategories.js,
+  // SUBCATEGORY_MIN_PRICES) et on prend le MAX du plancher global et du plancher spécifique —
+  // max, pas simple remplacement, pour ne jamais AFFAIBLIR le plancher global si un admin
+  // remontait `min_price` au-dessus d'une valeur de la table. Sous-catégorie absente de la
+  // table (« Autre », « À préciser », ou catégorie hors file_attente non listée) : seul le
+  // plancher global s'applique, comportement inchangé.
   if (!freePromo) {
-    const minPrice = await getSetting(db, 'min_price', 80);
+    const globalMin = await getSetting(db, 'min_price', 80);
+    const subMin = getSubcategoryMinPrice(subcategory); // null si pas de plancher spécifique
+    const minPrice = subMin !== null ? Math.max(globalMin, subMin) : globalMin;
     if (+price < minPrice) return { error: `Le prix minimum est de ${minPrice} MAD` };
   }
 
