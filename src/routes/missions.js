@@ -1573,8 +1573,8 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
 
   // Le chat/média reste privé au client propriétaire, à l'Œil ACTUELLEMENT assigné et à
   // l'admin — indépendamment de la garde ci-dessus qui, elle, laisse volontairement tout
-  // Œil consulter les détails publics (titre/prix/adresse...) d'une mission 'pending' pour
-  // décider d'y candidater. Une mission repassée en pending (urgence, refus, expiration de
+  // Œil consulter les détails publics (titre/prix/ville/quartier...) d'une mission 'pending'
+  // pour décider d'y candidater. Une mission repassée en pending (urgence, refus, expiration de
   // présence, suspension, blocage anti-fraude) garde l'historique de conversation/médias du
   // ou des Œil(s) précédent(s) — jamais purgé — qu'un Œil simplement candidat à la reprise
   // n'a aucune raison de voir (faille corrigée le 2026-08-09, cf. audit sécurité : upstream,
@@ -1585,9 +1585,18 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   // ou son motif d'urgence en texte libre — même cercle de confiance que canSeeChat ci-dessus
   // (POINT 2 audit sécurité global 08-09 : jusqu'ici exposés à tout Œil via SELECT m.*, y
   // compris un simple candidat à la reprise browsant le pool 'pending').
+  // address (RG10, audit régression 360° v4, 2026-08-31) : l'adresse postale complète n'est
+  // utile qu'une fois la mission acceptée. Le pool de missions disponibles est servi par
+  // GET /missions?mode=available, filtré à la ville de l'Œil (:773) et n'affichant côté
+  // frontend que ville/quartier ; GET /:id, lui, n'a pas ce filtre ville et laissait tout
+  // Œil (non vérifié, hors ville) énumérer des id de mission et lire l'adresse de n'importe
+  // quelle mission 'pending'. Aucun écran Œil ne consomme address depuis GET /:id pour une
+  // mission non assignée (candidature confirmée par traçage frontend) — on l'aligne donc sur
+  // le même cercle de confiance que le chat.
   if (!canSeeChat) {
     mission.transfer_reason = null;
     mission.transferred_from = null;
+    mission.address = null;
   }
 
   const [{ rows: [report] }, { rows: [rating] }] = await Promise.all([
