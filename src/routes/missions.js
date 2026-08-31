@@ -1631,93 +1631,18 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
 }));
 
 // ── POST /missions/:id/accept ──────────────────────────────
-
-
-
+// Fermé pour l'Œil (2026-08-31, RG3 audit régression 360° v4) — défense en profondeur derrière la
+// disparition du bouton « Accepter » côté frontend depuis ~2026-06-23 : le masquage à l'affichage
+// seul n'est jamais suffisant sur ce projet. Grep exhaustif shoofly-react confirmé (missionsAPI.accept
+// était défini src/api/index.js mais n'avait AUCUN site d'appel dans src/) ; le binding mort y est
+// retiré dans le même chantier. Même principe que la fermeture de /:id/refuse (e44af9f, 2026-07-28)
+// et /:id/transfer (prompt 18, 2026-07-30), toutes deux 403 pour l'Œil.
+// Ce chemin d'auto-acceptation directe est remplacé par le flux de candidature : POST /:id/interest
+// (qui vérifie transfer_cooldown_until ET le conflit de créneau) puis hireOeilCore (checkOeilAssignable).
+// Il n'exécutait lui-même AUCUN de ces contrôles (trou documenté v3 §5.2 / RG3) — le fermer supprime
+// ce contournement de double-booking plutôt que de recopier les gardes dans une route vestige.
 router.post('/:id/accept', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
-  const db = getDb();
-  const emitToUser = req.app.get('emitToUser');
-  const io = req.app.get('io');
-
-  const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
-  if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
-  if (mission.status !== 'pending') return res.status(400).json({ error: 'Mission plus disponible' });
-  if (isBatchLive(mission)) {
-    return res.status(400).json({ error: "Cette mission est en phase de sélection de remplaçant, merci de manifester votre intérêt via le bouton dédié plutôt que d'accepter directement." });
-  }
-
-  const { rows: [profile] } = await db.query('SELECT is_verified FROM oeil_profiles WHERE user_id=$1', [req.user.id]);
-  if (!profile?.is_verified) return res.status(403).json({ error: 'Profil non vérifié' });
-
-  // Mission cash (2026-08-13) : ce chemin d'affectation n'appelait jusqu'ici aucun contrôle de
-  // la famille checkOeilAssignable (déjà signalé, hors périmètre de ce correctif) — le solde
-  // wallet doit néanmoins y être vérifié comme sur les 3 autres points d'affectation réels
-  // (prepareMissionInsert, hireOeilCore, assign-admin), sans quoi un Œil pourrait contourner le
-  // contrôle en acceptant directement plutôt qu'en passant par une candidature. N'exécute rien
-  // pour 'payzone'.
-  if (mission.payment_method === 'cash') {
-    const balanceCheck = await checkCashCommissionBalance(db, req.user.id, mission.commission);
-    if (balanceCheck.error) return res.status(400).json({ error: balanceCheck.error });
-  }
-
-
-    // Valeur calculée ici (dépend de is_priority/transferred_from lus juste au-dessus)
-    // car transitionMission ne prend que des valeurs statiques, pas des expressions SQL.
-    const oeil2Id = (mission.is_priority === true && mission.transferred_from !== null) ? req.user.id : mission.oeil2_id;
-
-    let updated;
-    try {
-      updated = await transitionMission(db, req.params.id, 'pending', 'assigned', req.user.id, {
-        extraFields: {
-          oeil_id: req.user.id, oeil2_id: oeil2Id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
-          presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
-          candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
-          urgent_whatsapp_next_wave_at: null,
-        },
-        note: 'Acceptée directement par l\'Œil',
-      });
-    } catch (e) {
-      if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
-      throw e;
-    }
-
-    // Ardoise vierge sur la cascade par lot pour cette mission (même correctif que sur
-    // presence_confirmed_at, voir session précédente) : un candidat non retenu ici ne doit
-    // jamais réapparaître "déjà confirmé/sollicité" si cette mission repart un jour en pending.
-    await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [updated.id]);
-
-    // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
-    // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
-    if (mission.transfer_type === 'during') {
-      const { rows: [{ n: nextOrder }] } = await db.query(
-        `SELECT COALESCE(MAX(sequence_order), 0) + 1 AS n FROM mission_transfer_chain WHERE mission_id=$1`,
-        [updated.id]
-      );
-      await db.query(
-        `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
-         VALUES ($1, $2, NOW(), $3)`,
-        [updated.id, req.user.id, nextOrder]
-      );
-    }
-
-  const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [req.user.id]);
-  const oeilName = `${oeil.first_name} ${oeil.last_name}`;
-
-  await notify(db, mission.client_id, 'Œil assigné 👁️', `${oeilName} a accepté "${mission.title}"`, 'mission', mission.id, emitToUser, null, 'oeilAssignedTitle', 'oeilAssignedBody', {oeilName, missionTitle: mission.title});
-  await notify(db, req.user.id, 'Mission acceptée', `Vous avez accepté "${mission.title}"`, 'mission', mission.id, emitToUser, null, 'missionAcceptedOeilTitle', 'missionAcceptedOeilBody', {missionTitle: mission.title});
-
-  const { rows: [clientContactAccept] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-  if (clientContactAccept?.phone) {
-    await sendWhatsAppTemplate(waselTemplates.oeil_assigned_client.template_name, clientContactAccept.phone, [oeilName, mission.title]);
-  }
-
-  await db.query(`INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key,params) VALUES ($1,$2,$3,'system',$4,$5)`,
-    [mission.id, req.user.id, `${oeil.first_name} a accepté la mission.`, 'oeilAccepted', JSON.stringify({ oeilName: oeil.first_name })]);
-
-  io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'assigned', oeil_name: oeilName });
-  io.to('room:admin').emit('mission_updated', updated);
-
-  res.json({ mission: updated });
+  return res.status(403).json({ error: "L'acceptation directe d'une mission n'est plus disponible. Manifestez votre intérêt via le bouton dédié (candidature) ; le client ou un administrateur vous affectera ensuite." });
 }));
 
 
