@@ -814,9 +814,20 @@ initDb().then(() => {
           // à tort la formule 'during' (transfer_cooldown_hours, ancrée NOW()) — jusqu'à 2h05 de
           // cooldown en trop vs. un Œil ayant déclaré URGENCE quelques minutes plus tôt pour la même
           // situation (RAPPORT_COOLDOWN_H30_FORMULE.md).
+          //
+          // GREATEST(transfer_cooldown_until, <calcul>) — jumeau du constat G3
+          // (rapport-verification-fonctionnelle-prod-2026-09-01 / rapport-G3-cooldown-greatest) :
+          // ce site écrit le même users.transfer_cooldown_until que les 3 UPDATE de
+          // releaseMissionForReplacement / checkTransferDeadlines (missions.js), avec la même
+          // formule 'before' ancrée sur scheduled_at (peut courir plusieurs jours). L'affectation
+          // nue RACCOURCISSAIT un cooldown déjà posé plus lointain ; le GREATEST externe préserve
+          // le plus long — une 2ᵉ indisponibilité renforce la protection anti-substitution, elle
+          // ne l'annule pas. Le GREATEST interne (borne d'ancre scheduled_at − 1h vs NOW()) est
+          // inchangé. NULL initial géré par GREATEST (PostgreSQL 18.2 : NULL ignoré sauf si tous
+          // les arguments sont NULL — aucun COALESCE nécessaire).
           await db.query(
             `UPDATE users SET
-              transfer_cooldown_until = GREATEST($3::timestamptz - INTERVAL '1 hour', NOW()) + INTERVAL '1 hour' * $1::numeric,
+              transfer_cooldown_until = GREATEST(transfer_cooldown_until, GREATEST($3::timestamptz - INTERVAL '1 hour', NOW()) + INTERVAL '1 hour' * $1::numeric),
               transfer_count = transfer_count + 1
              WHERE id = $2`,
             [transferCooldownBeforeHours, m.oeil_id, m.scheduled_at]

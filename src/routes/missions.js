@@ -2657,17 +2657,28 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
   // à la pénalité de fiabilité ci-dessous (skipReliabilityPenalty), ce cooldown n'a pas de flag de
   // bypass : une indisponibilité réelle rend l'Œil temporairement indisponible pour de nouvelles
   // missions, urgence authentique ou non.
+  //
+  // GREATEST(transfer_cooldown_until, <calcul>) aux DEUX branches (constat G3,
+  // rapport-verification-fonctionnelle-prod-2026-09-01) : un cooldown déjà posé et plus lointain
+  // — typiquement un 'before' ancré sur scheduled_at, qui peut courir plusieurs jours — ne doit
+  // jamais être RACCOURCI par un transfert ultérieur. Une 2ᵉ indisponibilité renforce la
+  // protection anti-substitution, elle ne l'annule pas. GREATEST ignore un transfer_cooldown_until
+  // NULL (premier cooldown jamais posé sur cet Œil) et renvoie alors la seule valeur calculée —
+  // comportement PostgreSQL vérifié en 18.2 (NULL ignoré sauf si TOUS les arguments sont NULL),
+  // donc aucun COALESCE nécessaire. Aucun chemin ne réduit volontairement ce cooldown ailleurs
+  // (grep exhaustif : les seules écritures sont ici, l'autre branche, le cron checkTransferDeadlines
+  // et le cron H+30 d'index.js) → wrapper GREATEST sans effet de bord.
   if (transferType === 'during') {
     const transferCooldownHours = await getSetting(db, 'transfer_cooldown_hours', 4);
     await db.query(
-      `UPDATE users SET transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $2::numeric, transfer_count=transfer_count+1 WHERE id=$1`,
+      `UPDATE users SET transfer_cooldown_until=GREATEST(transfer_cooldown_until, NOW() + INTERVAL '1 hour' * $2::numeric), transfer_count=transfer_count+1 WHERE id=$1`,
       [oeilId, transferCooldownHours]
     );
   } else {
     const transferCooldownBeforeHours = await getSetting(db, 'transfer_cooldown_before_hours', 3);
     await db.query(
       `UPDATE users SET
-         transfer_cooldown_until = GREATEST($3::timestamptz - INTERVAL '1 hour', NOW()) + INTERVAL '1 hour' * $2::numeric,
+         transfer_cooldown_until = GREATEST(transfer_cooldown_until, GREATEST($3::timestamptz - INTERVAL '1 hour', NOW()) + INTERVAL '1 hour' * $2::numeric),
          transfer_count = transfer_count + 1
        WHERE id=$1`,
       [oeilId, transferCooldownBeforeHours, mission.scheduled_at]
@@ -3578,10 +3589,16 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
             { missionTitle: mission.title, amount: deducted });
         }
         const abandonCooldownHours = await getSetting(db, 'abandon_during_mission_cooldown_hours', 48);
+        // GREATEST(...) — ne jamais RACCOURCIR un cooldown déjà posé plus lointain (constat G3,
+        // rapport-verification-fonctionnelle-prod-2026-09-01). Ce site alimente le même
+        // transfer_cooldown_until que releaseMissionForReplacement, mais avec un réglage distinct
+        // et plus long (abandon_during_mission_cooldown_hours, 48h par défaut) : il n'y a pas de
+        // colonne dédiée abandon_*_until. NULL initial géré par GREATEST (PostgreSQL 18.2 : NULL
+        // ignoré sauf si tous les arguments sont NULL — aucun COALESCE nécessaire).
         await db.query(`
           UPDATE users SET
             transfer_no_replacement_count=transfer_no_replacement_count+1,
-            transfer_cooldown_until=NOW() + INTERVAL '1 hour' * $2::numeric
+            transfer_cooldown_until=GREATEST(transfer_cooldown_until, NOW() + INTERVAL '1 hour' * $2::numeric)
           WHERE id=$1
         `, [mission.transferred_from, abandonCooldownHours]);
        } else if (mission.transfer_type === 'before' && mission.transferred_from && !mission.transfer_no_penalty) {
