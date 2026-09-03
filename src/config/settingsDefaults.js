@@ -106,4 +106,29 @@ module.exports = {
   // confirmation de présence H-45) reste non lue ce délai après l'envoi — voir cron dédié,
   // index.js, et services/email.js.
   unread_whatsapp_email_fallback_minutes: '5',
+  // ── Anti-fraude (routes/antiFraud.js) ────────────────────────────────────────────────────
+  // Fenêtres de détection du moteur de score de risque (analyzeUser) et de l'écran admin
+  // Anti-fraude. Défauts = valeurs exactes précédemment codées en dur (audit
+  // rapport-audit-valeurs-temps-hardcodees-2026-09-01.md, §A) : aucun changement de
+  // comportement tant qu'un admin ne les modifie pas. Les seuils de COMPTAGE (>= 3, >= 2)
+  // restent dans l'objet RULES, hors périmètre. Regroupement justifié dans
+  // rapport-chantier-antifraude-fenetres-2026-09-03.md.
+  //
+  // -- Scoring d'un Œil --
+  fraud_oeil_cancel_lookback_days: '7',        // :138 annulations répétées (seuil RULES >= 3)
+  fraud_oeil_nomedia_lookback_days: '30',      // :150 missions terminées sans média (seuil RULES >= 2)
+  fraud_oeil_too_fast_lookback_days: '30',     // :160 fenêtre des missions terminées trop vite
+  fraud_oeil_too_fast_seconds: '300',          // :161 seuil "terminée en moins de 5 min" (completed_at - started_at)
+  // -- Manipulation de note : UNE clé (les 2 requêtes pivotent sur le même instant) --
+  fraud_rating_spike_window_hours: '48',       // :173 (5★ récents) + :179 (moyenne d'avant)
+  // -- Scoring d'un client --
+  fraud_client_cancel_lookback_days: '30',     // :205 annulations abusives (seuil RULES >= 3)
+  fraud_client_refund_lookback_days: '14',     // :216 demandes de remboursement répétées (seuil RULES >= 2)
+  fraud_client_fake_mission_lookback_days: '30', // :228 fenêtre des missions fictives
+  fraud_client_fake_mission_seconds: '600',    // :229 seuil "acceptée puis annulée en moins de 10 min" (cancelled_at - created_at)
+  // -- Scan de la messagerie (score de risque tous rôles) --
+  fraud_message_scan_lookback_days: '7',       // :256 ancienneté max des messages scannés (coordonnées directes)
+  // -- Écran admin Anti-fraude (GET /anti-fraud/dashboard) : affichage uniquement --
+  fraud_dashboard_recent_days: '7',            // :284 liste missions sans média + :303 liste messages suspects + :310 compteur no_media_missions
+  fraud_dashboard_cancellations_days: '30',    // :309 compteur cancellations_30d des stats
 };
