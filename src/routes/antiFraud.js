@@ -133,51 +133,60 @@ async function analyzeUser(db, userId) {
       totalScore += RULES.OEIL_DUPLICATE_MISSIONS.score;
     }
 
-    // Vérifier annulations répétées (7 jours)
+    // Vérifier annulations répétées (fenêtre configurable, défaut 7 jours — setting anti-fraude)
+    const oeilCancelLookbackDays = await getSetting(db, 'fraud_oeil_cancel_lookback_days', 7);
     const cancels = await db.query(
-      `SELECT COUNT(*)::int AS n FROM missions WHERE oeil_id=$1 AND status='cancelled' AND cancelled_at > NOW() - INTERVAL '7 days'`, [userId]
+      `SELECT COUNT(*)::int AS n FROM missions WHERE oeil_id=$1 AND status='cancelled' AND cancelled_at > NOW() - INTERVAL '1 day' * $2::numeric`,
+      [userId, oeilCancelLookbackDays]
     );
     if (cancels.rows[0].n >= 3) {
       alerts.push({ ...RULES.OEIL_MULTI_CANCEL, count: cancels.rows[0].n, detected_at: new Date() });
       totalScore += RULES.OEIL_MULTI_CANCEL.score;
     }
 
-    // Vérifier missions complétées sans médias
+    // Vérifier missions complétées sans médias (fenêtre configurable, défaut 30 jours)
+    const oeilNoMediaLookbackDays = await getSetting(db, 'fraud_oeil_nomedia_lookback_days', 30);
     const noMedia = await db.query(
       `SELECT m.id FROM missions m
        LEFT JOIN mission_media mm ON mm.mission_id=m.id
        WHERE m.oeil_id=$1 AND m.status='completed' AND mm.id IS NULL
-       AND m.completed_at > NOW() - INTERVAL '30 days'`, [userId]
+       AND m.completed_at > NOW() - INTERVAL '1 day' * $2::numeric`,
+      [userId, oeilNoMediaLookbackDays]
     );
     if (noMedia.rows.length >= 2) {
       alerts.push({ ...RULES.OEIL_NO_MEDIA, count: noMedia.rows.length, detected_at: new Date() });
       totalScore += RULES.OEIL_NO_MEDIA.score;
     }
-// Vérifier missions complétées trop rapidement (< 5 min)
+// Vérifier missions complétées trop rapidement (fenêtre + seuil configurables, défauts 30 j / 300 s)
+    const oeilTooFastLookbackDays = await getSetting(db, 'fraud_oeil_too_fast_lookback_days', 30);
+    const oeilTooFastSeconds = await getSetting(db, 'fraud_oeil_too_fast_seconds', 300);
     const tooFast = await db.query(
       `SELECT COUNT(*)::int AS n FROM missions
        WHERE oeil_id=$1 AND status='completed'
-       AND completed_at > NOW() - INTERVAL '30 days'
-       AND EXTRACT(EPOCH FROM (completed_at - started_at)) < 300`,
-      [userId]
+       AND completed_at > NOW() - INTERVAL '1 day' * $2::numeric
+       AND EXTRACT(EPOCH FROM (completed_at - started_at)) < $3::numeric`,
+      [userId, oeilTooFastLookbackDays, oeilTooFastSeconds]
     );
     if (tooFast.rows[0].n >= 2) {
       alerts.push({ ...RULES.OEIL_TOO_FAST_COMPLETE, count: tooFast.rows[0].n, detected_at: new Date() });
       totalScore += RULES.OEIL_TOO_FAST_COMPLETE.score;
     }
 
-    // Vérifier manipulation de note
+    // Vérifier manipulation de note (fenêtre avant/après configurable, défaut 48 h). UNE seule
+    // clé volontairement : les 2 requêtes doivent pivoter sur le même instant (5★ DANS la
+    // fenêtre récente vs moyenne AVANT cette même fenêtre) — 2 clés créeraient un trou/chevauchement.
+    const ratingSpikeWindowHours = await getSetting(db, 'fraud_rating_spike_window_hours', 48);
     const ratingSpike = await db.query(
       `SELECT COUNT(*)::int AS n FROM ratings
        WHERE oeil_id=$1 AND score=5
-       AND created_at > NOW() - INTERVAL '48 hours'`,
-      [userId]
+       AND created_at > NOW() - INTERVAL '1 hour' * $2::numeric`,
+      [userId, ratingSpikeWindowHours]
     );
     const avgBefore = await db.query(
       `SELECT AVG(score) AS avg FROM ratings
        WHERE oeil_id=$1
-       AND created_at < NOW() - INTERVAL '48 hours'`,
-      [userId]
+       AND created_at < NOW() - INTERVAL '1 hour' * $2::numeric`,
+      [userId, ratingSpikeWindowHours]
     );
     if (ratingSpike.rows[0].n >= 3 && avgBefore.rows[0].avg && parseFloat(avgBefore.rows[0].avg) < 3) {
       alerts.push({ ...RULES.OEIL_RATING_MANIPULATION, spike: ratingSpike.rows[0].n, avg_before: parseFloat(avgBefore.rows[0].avg).toFixed(1), detected_at: new Date() });
@@ -200,34 +209,39 @@ async function analyzeUser(db, userId) {
   }
 
 if (u.role === 'client') {
-    // Annulations abusives (30 jours)
+    // Annulations abusives (fenêtre configurable, défaut 30 jours)
+    const clientCancelLookbackDays = await getSetting(db, 'fraud_client_cancel_lookback_days', 30);
     const clientCancels = await db.query(
-      `SELECT COUNT(*)::int AS n FROM missions WHERE client_id=$1 AND status='cancelled' AND cancelled_at > NOW() - INTERVAL '30 days'`, [userId]
+      `SELECT COUNT(*)::int AS n FROM missions WHERE client_id=$1 AND status='cancelled' AND cancelled_at > NOW() - INTERVAL '1 day' * $2::numeric`,
+      [userId, clientCancelLookbackDays]
     );
     if (clientCancels.rows[0].n >= 3) {
       alerts.push({ ...RULES.CLIENT_ABUSE_CANCEL, count: clientCancels.rows[0].n, detected_at: new Date() });
       totalScore += RULES.CLIENT_ABUSE_CANCEL.score;
     }
 
-    // Demandes de remboursement répétées (14 jours)
-const refunds = await db.query(
+    // Demandes de remboursement répétées (fenêtre configurable, défaut 14 jours)
+    const clientRefundLookbackDays = await getSetting(db, 'fraud_client_refund_lookback_days', 14);
+    const refunds = await db.query(
       `SELECT COUNT(*)::int AS n FROM claims
        WHERE client_id=$1
-       AND created_at > NOW() - INTERVAL '14 days'`,
-      [userId]
+       AND created_at > NOW() - INTERVAL '1 day' * $2::numeric`,
+      [userId, clientRefundLookbackDays]
     );
     if (refunds.rows[0].n >= 2) {
       alerts.push({ ...RULES.CLIENT_REFUND_ABUSE, count: refunds.rows[0].n, detected_at: new Date() });
       totalScore += RULES.CLIENT_REFUND_ABUSE.score;
     }
 
-    // Mission fictive — acceptée et annulée immédiatement (< 10 min)
+    // Mission fictive — acceptée et annulée immédiatement (fenêtre + seuil configurables, défauts 30 j / 600 s)
+    const clientFakeMissionLookbackDays = await getSetting(db, 'fraud_client_fake_mission_lookback_days', 30);
+    const clientFakeMissionSeconds = await getSetting(db, 'fraud_client_fake_mission_seconds', 600);
     const fakeMissions = await db.query(
       `SELECT COUNT(*)::int AS n FROM missions
        WHERE client_id=$1 AND status='cancelled'
-       AND cancelled_at > NOW() - INTERVAL '30 days'
-       AND EXTRACT(EPOCH FROM (cancelled_at - created_at)) < 600`,
-      [userId]
+       AND cancelled_at > NOW() - INTERVAL '1 day' * $2::numeric
+       AND EXTRACT(EPOCH FROM (cancelled_at - created_at)) < $3::numeric`,
+      [userId, clientFakeMissionLookbackDays, clientFakeMissionSeconds]
     );
     if (fakeMissions.rows[0].n >= 2) {
       alerts.push({ ...RULES.CLIENT_FAKE_MISSION, count: fakeMissions.rows[0].n, detected_at: new Date() });
@@ -247,13 +261,15 @@ const refunds = await db.query(
   //   totalScore += RULES.PAYMENT_ANOMALY.score;
   // }
 
-  // Bypass plateforme (scan des messages)
+  // Bypass plateforme (scan des messages — fenêtre configurable, défaut 7 jours)
+  const messageScanLookbackDays = await getSetting(db, 'fraud_message_scan_lookback_days', 7);
   const suspiciousMessages = await db.query(
     `SELECT COUNT(*)::int AS n FROM mission_messages mm
      JOIN missions m ON m.id=mm.mission_id
      WHERE (m.client_id=$1 OR m.oeil_id=$1)
      AND (mm.content ~* '\\+212|whatsapp|telegram|instagram|06[0-9]{8}|07[0-9]{8}')
-     AND mm.created_at > NOW() - INTERVAL '7 days'`, [userId]
+     AND mm.created_at > NOW() - INTERVAL '1 day' * $2::numeric`,
+    [userId, messageScanLookbackDays]
   );
   if (suspiciousMessages.rows[0].n > 0) {
     alerts.push({ ...RULES.BYPASS_PLATFORM, count: suspiciousMessages.rows[0].n, detected_at: new Date() });
@@ -270,6 +286,13 @@ const refunds = await db.query(
 router.get('/dashboard', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
 
+  // Fenêtres d'AFFICHAGE de cet écran (settings anti-fraude) — distinctes des fenêtres de
+  // scoring d'analyzeUser : élargir un rapport ne doit pas changer le comportement de blocage.
+  // recentDays pilote les 2 listes récentes + le compteur no_media_missions ; cancellationsDays
+  // ne pilote que le compteur cancellations_30d.
+  const dashboardRecentDays = await getSetting(db, 'fraud_dashboard_recent_days', 7);
+  const dashboardCancellationsDays = await getSetting(db, 'fraud_dashboard_cancellations_days', 30);
+
   const [flaggedMissions, suspiciousWithdrawals, recentAlerts, stats] = await Promise.all([
     // Missions suspectes: complétées sans médias récemment
     db.query(`
@@ -281,11 +304,11 @@ router.get('/dashboard', authenticate, requireRole('admin'), asyncHandler(async 
       LEFT JOIN users c ON c.id=m.client_id
       LEFT JOIN users o ON o.id=m.oeil_id
       LEFT JOIN mission_media mm ON mm.mission_id=m.id
-      WHERE m.status='completed' AND m.completed_at > NOW() - INTERVAL '7 days'
+      WHERE m.status='completed' AND m.completed_at > NOW() - INTERVAL '1 day' * $1::numeric
       GROUP BY m.id, c.first_name, c.last_name, o.first_name, o.last_name
       HAVING COUNT(mm.id) = 0
       LIMIT 10
-    `),
+    `, [dashboardRecentDays]),
     // Virements suspects (> 2x moyenne globale)
     db.query(`
       SELECT w.*, u.first_name||' '||u.last_name AS oeil_name,
@@ -300,16 +323,16 @@ router.get('/dashboard', authenticate, requireRole('admin'), asyncHandler(async 
         u.first_name||' '||u.last_name AS sender_name
       FROM mission_messages mm JOIN users u ON u.id=mm.sender_id
       WHERE mm.content ~* '\\+212|whatsapp|telegram|06[0-9]{8}|07[0-9]{8}'
-      AND mm.created_at > NOW() - INTERVAL '7 days'
+      AND mm.created_at > NOW() - INTERVAL '1 day' * $1::numeric
       ORDER BY mm.created_at DESC LIMIT 10
-    `),
+    `, [dashboardRecentDays]),
     // Stats globales fraude
     db.query(`
       SELECT
-        (SELECT COUNT(*)::int FROM missions WHERE status='cancelled' AND cancelled_at > NOW() - INTERVAL '30 days') AS cancellations_30d,
-        (SELECT COUNT(*)::int FROM missions m WHERE m.status='completed' AND m.completed_at > NOW() - INTERVAL '7 days' AND NOT EXISTS (SELECT 1 FROM mission_media mm WHERE mm.mission_id=m.id)) AS no_media_missions,(SELECT COUNT(*)::int FROM withdrawals WHERE status='pending') AS pending_withdrawals,
+        (SELECT COUNT(*)::int FROM missions WHERE status='cancelled' AND cancelled_at > NOW() - INTERVAL '1 day' * $1::numeric) AS cancellations_30d,
+        (SELECT COUNT(*)::int FROM missions m WHERE m.status='completed' AND m.completed_at > NOW() - INTERVAL '1 day' * $2::numeric AND NOT EXISTS (SELECT 1 FROM mission_media mm WHERE mm.mission_id=m.id)) AS no_media_missions,(SELECT COUNT(*)::int FROM withdrawals WHERE status='pending') AS pending_withdrawals,
         (SELECT COUNT(*)::int FROM users WHERE is_active=false) AS blocked_accounts
-    `),
+    `, [dashboardCancellationsDays, dashboardRecentDays]),
   ]);
 
   res.json({

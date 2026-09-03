@@ -1609,6 +1609,14 @@ const {
   late_cancel_penalty_tier1_threshold_hours, late_cancel_penalty_tier2_threshold_hours,
   presence_confirmation_deadline_minutes_h45,
   password_reset_token_expiry_hours,
+  // Anti-fraude (routes/antiFraud.js) — voir config/settingsDefaults.js pour le détail ligne à ligne
+  fraud_oeil_cancel_lookback_days, fraud_oeil_nomedia_lookback_days,
+  fraud_oeil_too_fast_lookback_days, fraud_oeil_too_fast_seconds,
+  fraud_rating_spike_window_hours,
+  fraud_client_cancel_lookback_days, fraud_client_refund_lookback_days,
+  fraud_client_fake_mission_lookback_days, fraud_client_fake_mission_seconds,
+  fraud_message_scan_lookback_days,
+  fraud_dashboard_recent_days, fraud_dashboard_cancellations_days,
 } = req.body
   const updates = {
     commission, min_price, five_star_bonus_active, five_star_bonus_percent,
@@ -1642,6 +1650,13 @@ const {
     late_cancel_penalty_tier1_threshold_hours, late_cancel_penalty_tier2_threshold_hours,
     presence_confirmation_deadline_minutes_h45,
     password_reset_token_expiry_hours,
+    fraud_oeil_cancel_lookback_days, fraud_oeil_nomedia_lookback_days,
+    fraud_oeil_too_fast_lookback_days, fraud_oeil_too_fast_seconds,
+    fraud_rating_spike_window_hours,
+    fraud_client_cancel_lookback_days, fraud_client_refund_lookback_days,
+    fraud_client_fake_mission_lookback_days, fraud_client_fake_mission_seconds,
+    fraud_message_scan_lookback_days,
+    fraud_dashboard_recent_days, fraud_dashboard_cancellations_days,
   }
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
