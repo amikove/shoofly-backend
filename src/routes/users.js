@@ -12,7 +12,7 @@ const { applyClientStrike } = require('../utils/clientStrikes');
 const cashplusService = require('../services/cashplus');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
-const { getSetting, invalidateSettingsCache } = require('../utils/settings');
+const { getSetting, invalidateSettingsCache, isNumeric } = require('../utils/settings');
 const { isWithinSchedule } = require('../utils/schedule');
 const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -1575,6 +1575,19 @@ router.get('/admin/settings/defaults', authenticate, requireRole('admin'), requi
   res.json({ defaults: SETTINGS_DEFAULTS })
 }))
 
+// Comparaison tolérante au formatage pour l'historique (settings_history) — Parametres.jsx
+// envoie TOUT le payload de la catégorie active à chaque sauvegarde (pas seulement les champs
+// modifiés par l'admin, voir saveCategory), donc une comparaison de chaînes brutes créerait une
+// ligne d'historique de bruit à chaque simple ré-arrondi flottant (ex: '0.20' stocké en base vs
+// '0.2' = String(0.2) renvoyé par le FE pour la même valeur commission). Même tolérance
+// numérique que isNumeric (juste au-dessus) et que valuesEqual côté FE (Parametres.jsx, aperçu
+// de réinitialisation) — les deux doivent rester d'accord sur ce qui compte comme "changé".
+function settingValueChanged(oldValue, newValue) {
+  if (oldValue === undefined) return true;
+  if (isNumeric(oldValue) && isNumeric(newValue)) return Number(oldValue) !== Number(newValue);
+  return oldValue !== newValue;
+}
+
 router.put('/admin/settings', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
 const {
@@ -1692,16 +1705,68 @@ const {
     }
   }
 
-  for (const [key, value] of Object.entries(updates)) {
-    if (value !== undefined) {
-      await db.query(
+  // Historique (chantier "historique des réglages", 2026-09-04) — lecture de l'ancienne valeur
+  // + écriture settings + settings_history dans la MÊME transaction (walletService.withTransaction,
+  // déjà utilisé ailleurs dans ce fichier pour des écritures interdépendantes) : si l'UPDATE
+  // échoue, aucune ligne d'historique ne doit survivre — un throw dans le callback déclenche un
+  // ROLLBACK complet. Une ligne d'historique par CLÉ réellement modifiée (settingValueChanged
+  // ci-dessus), jamais une par appel.
+  const keysToUpdate = Object.entries(updates).filter(([, value]) => value !== undefined).map(([key]) => key)
+  await walletService.withTransaction(db, async (client) => {
+    const { rows: curRows } = await client.query(
+      `SELECT key, value FROM settings WHERE key = ANY($1::text[])`,
+      [keysToUpdate]
+    )
+    const curMap = Object.fromEntries(curRows.map(r => [r.key, r.value]))
+
+    for (const key of keysToUpdate) {
+      const newValue = String(updates[key])
+      const oldValue = curMap[key]
+      await client.query(
         `INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value=$2`,
-        [key, String(value)]
+        [key, newValue]
       )
+      if (settingValueChanged(oldValue, newValue)) {
+        await client.query(
+          `INSERT INTO settings_history (setting_key, old_value, new_value, changed_by) VALUES ($1, $2, $3, $4)`,
+          [key, oldValue ?? null, newValue, req.user.id]
+        )
+      }
     }
-  }
+  })
   invalidateSettingsCache()
   res.json({ ok: true })
+}))
+
+// ── GET /admin/settings/history — historique des modifications de réglages (chantier
+// "historique des réglages", 2026-09-04) — lit settings_history, écrite par PUT /admin/settings
+// ci-dessus. Pagination + filtre optionnel sur une clé, mêmes conventions que GET
+// /admin/all-scores (reliabilityRoutes.js) : where[]/params[] construits dynamiquement, wc
+// vide si aucun filtre. Permission 'finance' : même garde que GET /admin/settings lui-même,
+// aucune permission distincte à inventer pour une simple lecture de son historique.
+router.get('/admin/settings/history', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { setting_key, page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
+
+  let where = [], params = [], p = 1;
+  if (setting_key) { where.push(`sh.setting_key=$${p++}`); params.push(setting_key); }
+  const wc = where.length ? 'WHERE ' + where.join(' AND ') : '';
+
+  const { rows } = await db.query(`
+    SELECT sh.*, u.first_name||' '||u.last_name AS admin_name
+    FROM settings_history sh
+    LEFT JOIN users u ON u.id = sh.changed_by
+    ${wc}
+    ORDER BY sh.changed_at DESC
+    LIMIT $${p++} OFFSET $${p++}
+  `, [...params, limit, offset]);
+
+  const { rows: [{ n: total }] } = await db.query(
+    `SELECT COUNT(*)::int AS n FROM settings_history sh ${wc}`, params
+  );
+
+  res.json({ history: rows, total, page: +page, pages: Math.ceil(total / limit) });
 }))
 
 // ── Admin : messages suspects ───────────────────────────────

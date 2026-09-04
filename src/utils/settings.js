@@ -29,4 +29,4 @@ function invalidateSettingsCache() {
   cache.clear();
 }
 
-module.exports = { getSetting, invalidateSettingsCache };
+module.exports = { getSetting, invalidateSettingsCache, isNumeric };
