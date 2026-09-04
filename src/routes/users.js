@@ -1662,6 +1662,36 @@ const {
     fraud_message_scan_lookback_days,
     fraud_dashboard_recent_days, fraud_dashboard_cancellations_days,
   }
+
+  // C3 (audit valeurs-temps, 2026-09-03) — garde de cohérence inter-réglages :
+  // client_validation_reminder_hours DOIT rester STRICTEMENT inférieur à client_validation_hours.
+  // Sinon le rappel « à mi-parcours » (runValidationReminders / runAssistanceReminders,
+  // jobs/autoValidateMissions.js) partirait après l'auto-validation : sa fenêtre SELECT
+  // [NOW()-validation ; NOW()-reminder] s'inverse → il ne se déclenche même plus, et le
+  // « validée automatiquement dans ~Xh » affiché retombe à 0h (Math.max(0, …)). On bloque la
+  // sauvegarde à la source plutôt que de laisser cette dégradation silencieuse s'installer.
+  // Envoi partiel (Parametres.jsx sauvegarde par catégorie) : une des deux clés peut être
+  // absente du corps — on la complète alors avec la valeur déjà en base, sinon le défaut seedé.
+  // Garde inerte si l'une des valeurs effectives n'est pas numérique (entrée malformée : laissée
+  // au comportement pré-existant, non aggravée ici).
+  if (client_validation_hours !== undefined || client_validation_reminder_hours !== undefined) {
+    const { rows: curRows } = await db.query(
+      `SELECT key, value FROM settings WHERE key IN ('client_validation_hours', 'client_validation_reminder_hours')`
+    )
+    const cur = Object.fromEntries(curRows.map(r => [r.key, r.value]))
+    const effValidation = Number(
+      client_validation_hours ?? cur.client_validation_hours ?? SETTINGS_DEFAULTS.client_validation_hours
+    )
+    const effReminder = Number(
+      client_validation_reminder_hours ?? cur.client_validation_reminder_hours ?? SETTINGS_DEFAULTS.client_validation_reminder_hours
+    )
+    if (Number.isFinite(effValidation) && Number.isFinite(effReminder) && effReminder >= effValidation) {
+      return res.status(400).json({
+        error: `Configuration incohérente : le rappel intermédiaire de validation (client_validation_reminder_hours = ${effReminder}h) doit être strictement inférieur au délai d'auto-validation (client_validation_hours = ${effValidation}h). Sans cet écart, le rappel « à mi-parcours » serait envoyé après l'auto-validation de la mission — il perdrait tout son sens et cesserait même d'être déclenché.`
+      })
+    }
+  }
+
   for (const [key, value] of Object.entries(updates)) {
     if (value !== undefined) {
       await db.query(
