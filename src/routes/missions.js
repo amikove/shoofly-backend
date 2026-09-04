@@ -863,6 +863,16 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
       ${wc}
     `, params);
 
+  // C9 (audit valeurs-temps, 2026-09-03) — deux règles métier que le frontend client
+  // (client/Missions.jsx) recopiait en dur (12 h et 2 h). Descendues ici comme champs de la
+  // réponse — même principe que chat_access_expires_at ci-dessous — pour que l'UI suive
+  // automatiquement un changement de réglage admin au lieu de diverger (boutons « valider »/
+  // « réclamer » qui disparaissent trop tôt, dialogue de remboursement trompeur). Un seul
+  // getSetting par requête (cache 60 s), pas par ligne. Valeurs non sensibles : déjà citées
+  // telles quelles dans les notifications client et les CGV.
+  const clientValidationHours = await getSetting(db, 'client_validation_hours', 12);
+  const refundPartialThresholdHours = await getSetting(db, 'refund_partial_threshold_hours', 2);
+
   missions.forEach(m => {
     if (!(req.user.role === 'admin' || m.oeil_id === req.user.id)) {
       m.client_phone = null;
@@ -875,6 +885,8 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
       m.transferred_from = null;
     }
     m.chat_access_expires_at = chatAccessExpiresAt(m);
+    m.client_validation_hours = clientValidationHours;
+    m.refund_partial_threshold_hours = refundPartialThresholdHours;
   });
   res.json({ missions, total, page: +page, pages: Math.ceil(total / limit) });
 }));
@@ -920,6 +932,10 @@ const MISSION_CREATE_LOCK_WINDOW_SECONDS = 15;
 // son statut, y compris une mission déjà passée/terminée dont scheduled_at est nécessairement
 // dans le passé — une contrainte "futur uniquement" partagée via validateMissionEditFields
 // casserait cet usage. Appliquée séparément à chaque site plutôt que dans cette fonction commune.
+// C9 (audit valeurs-temps, 2026-09-01, §Étape 3) : délibérément une const et NON un réglage
+// admin — micro-tolérance d'ergonomie sans enjeu métier. Copie identique côté frontend
+// (shoofly-react, NewMissionModal.jsx) : les deux valeurs doivent être changées ensemble, dans
+// le même commit, si jamais elles doivent l'être.
 const SCHEDULED_AT_PAST_TOLERANCE_MS = 5 * 60 * 1000;
 function isScheduledAtTooFarInPast(value) {
   return new Date(value).getTime() < Date.now() - SCHEDULED_AT_PAST_TOLERANCE_MS;
@@ -1573,6 +1589,10 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   if (req.user.role === 'oeil' && mission.oeil_id !== req.user.id && mission.status !== 'pending') return res.status(403).json({ error: 'Accès refusé' });
 
   mission.chat_access_expires_at = chatAccessExpiresAt(mission);
+  // C9 (audit valeurs-temps, 2026-09-03) — cf. GET / : mêmes 2 règles métier descendues en
+  // champs de réponse pour que client/Missions.jsx cesse de recopier 12 h / 2 h en dur.
+  mission.client_validation_hours = await getSetting(db, 'client_validation_hours', 12);
+  mission.refund_partial_threshold_hours = await getSetting(db, 'refund_partial_threshold_hours', 2);
 
   // Délai de grâce dépassé : la mission continue de se charger normalement (titre/statut/
   // prix/note/rapport...) mais messages/media sont renvoyés vides pour client/Œil — admin

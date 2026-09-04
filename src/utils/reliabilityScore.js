@@ -27,17 +27,26 @@ async function computeLatePenalty(db, scheduledAt, actionLabel, asOfDate = null)
   // settingsDefaults.js — pour rester réactivable en un clic admin, sans déploiement, si
   // l'interprétation s'avérait fausse. tier1Points reste calculé ci-dessus, jamais supprimé.
   const tier1Enabled = (await getSetting(db, 'late_cancel_penalty_tier1_enabled', 'false')) === 'true';
+  // C10 (audit valeurs-temps, 2026-09-03) : les libellés de palier sont dérivés des DEUX
+  // réglages de seuil (late_cancel_penalty_tier1_threshold_hours / _tier2_threshold_hours) et
+  // non plus figés « 24h » / « 2h » en dur. Sinon un admin qui change un seuil rend le champ
+  // `reason` inséré dans reliability_events mensonger pour l'Œil pénalisé : il est affiché tel
+  // quel dans son historique (CompteSuspendu.jsx via GET /reliability/me) et côté admin
+  // (AdminFiabilite.jsx, UserProfile.jsx via GET /reliability/admin/:id/history et le profil).
+  // Aux défauts (24 / 2) ces chaînes sont identiques au caractère près aux littéraux précédents
+  // — aucun changement de comportement au déploiement. Format « Nh » conservé (jamais « N heure »)
+  // pour ne pas percuter le KPI ILIKE '%heure%' de routes/users.js.
   let points, timing;
   if (hoursBeforeMission === null || hoursBeforeMission > tier1ThresholdHours) {
     if (tier1Enabled) {
-      points = tier1Points; timing = 'plus de 24h avant';
+      points = tier1Points; timing = `plus de ${tier1ThresholdHours}h avant`;
     } else {
-      points = 0; timing = 'plus de 24h avant (préavis suffisant, aucune pénalité)';
+      points = 0; timing = `plus de ${tier1ThresholdHours}h avant (préavis suffisant, aucune pénalité)`;
     }
   } else if (hoursBeforeMission > tier2ThresholdHours) {
-    points = tier2Points; timing = 'entre 2h et 24h avant';
+    points = tier2Points; timing = `entre ${tier2ThresholdHours}h et ${tier1ThresholdHours}h avant`;
   } else {
-    points = tier3Points; timing = 'moins de 2h avant, très tardif';
+    points = tier3Points; timing = `moins de ${tier2ThresholdHours}h avant, très tardif`;
   }
   return { points, reason: `Mission ${actionLabel} (${timing})`, isGrave: points <= tier2Points };
 }
