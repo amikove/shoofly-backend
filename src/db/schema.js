@@ -1161,6 +1161,23 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- anti-doublon, même principe que validation_reminder_sent_at (jobs/autoValidateMissions.js:
     -- runAssistanceReminders).
     ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMPTZ;
+
+    -- ── Historique des modifications de réglages (chantier "historique des réglages",
+    -- 2026-09-04) — la refonte de l'écran Paramètres (RAPPORT_CHANTIER_REFONTE_PARAMETRES,
+    -- 2026-09-03) avait retiré le badge "dernière modification" par champ faute d'historique en
+    -- base ; cette table le fournit. Une ligne par CLÉ effectivement modifiée (pas par appel PUT
+    -- /admin/settings, qui peut toucher plusieurs clés à la fois) — voir routes/users.js. Aucun
+    -- historique rétroactif possible : ne couvre que les changements survenus après ce déploiement.
+    CREATE TABLE IF NOT EXISTS settings_history (
+      id          SERIAL PRIMARY KEY,
+      setting_key TEXT NOT NULL,
+      old_value   TEXT,
+      new_value   TEXT NOT NULL,
+      changed_by  TEXT NOT NULL REFERENCES users(id),
+      changed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_settings_history_key ON settings_history(setting_key);
+    CREATE INDEX IF NOT EXISTS idx_settings_history_changed_at ON settings_history(changed_at DESC);
   `);
   console.log('✅ PostgreSQL schema ready');
 }
