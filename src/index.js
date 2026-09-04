@@ -1,14 +1,22 @@
 require('dotenv').config();
 
+// Doit être chargé avant express/http/pg/… (voir instrument.js), mais après dotenv.config()
+// ci-dessus pour que SENTRY_DSN soit déjà dans process.env.
+const Sentry = require('./instrument');
+
 // Filet de sécurité de dernier recours — une exception qui arrive jusqu'ici a échappé à
 // toute la gestion d'erreur existante (asyncHandler sur les routes, try/catch de chaque cron
 // et handler socket ci-dessous) : l'état du process n'est plus fiable, donc on log puis on
 // quitte plutôt que de tenter de continuer (Render redémarre le service automatiquement).
-// setImmediate() laisse le temps au console.error de se vider avant l'arrêt.
+// Report Sentry AVANT la sortie du process — un crash process est justement le type de panne
+// silencieuse (cf. G5) que ce chantier vise à rendre visible. flush() attend l'envoi réel (ou le
+// timeout de 2s) avant process.exit ; sans ça, process.exit couperait la requête HTTP sortante
+// vers Sentry en plein vol la plupart du temps.
 function crashAndLog(kind, err) {
   const stack = err instanceof Error ? err.stack : String(err);
   console.error(`[${new Date().toISOString()}] 💥 ${kind}:\n${stack}`);
-  setImmediate(() => process.exit(1));
+  Sentry.captureException(err instanceof Error ? err : new Error(String(err)));
+  Sentry.flush(2000).finally(() => process.exit(1));
 }
 process.on('uncaughtException', (err) => crashAndLog('uncaughtException', err));
 process.on('unhandledRejection', (reason) => crashAndLog('unhandledRejection', reason));
@@ -239,6 +247,13 @@ app.get('/health', async (_, res) => {
 });
 app.get('/api', (_, res) => res.json({ name: 'SHOOFLY API', version: '1.0.0' }));
 app.use((req, res) => res.status(404).json({ error: `Route introuvable: ${req.method} ${req.path}` }));
+
+// Doit être ajouté après toutes les routes mais avant tout autre middleware de gestion
+// d'erreur (doc officielle Sentry) — capture l'exception puis appelle next(err) (vérifié dans
+// node_modules/@sentry/core/.../integrations/express/index.js : jamais de court-circuit), donc
+// le handler juste en dessous continue de répondre exactement comme avant.
+Sentry.setupExpressErrorHandler(app);
+
 app.use((err, req, res, next) => {
   // Ne jamais exposer les détails en production
   const isDev = process.env.NODE_ENV !== 'production';
