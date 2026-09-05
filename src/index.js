@@ -584,6 +584,19 @@ initDb().then(() => {
       for (const m of clientMissionsJ1) {
         // Isolation par itération (RG9) — voir la boucle Œil ci-dessus.
         try {
+        // Groupe 3 point 3.5 (audit exhaustif backend 2026-09-05 §2.4) — garde d'idempotence
+        // posée AVANT les effets (notification + WhatsApp), pas après. Avant : un échec en cours
+        // d'itération (INSERT notif, emitToUser, ou surtout l'envoi WhatsApp externe) faisait
+        // retraiter la même mission au tick suivant → doublon de rappel côté client. Même forme
+        // exacte que candidature_whatsapp_sent_at plus bas (`WHERE ... IS NULL` + rowCount) et
+        // que la boucle Œil J-1 ci-dessus (guard-first). Compromis assumé, déjà retenu ailleurs
+        // dans ce cron : si l'envoi WhatsApp échoue après cette ligne il n'est pas rejoué — mieux
+        // qu'un doublon.
+        const { rowCount } = await db.query(
+          `UPDATE missions SET client_reminder_j1_sent_at = NOW() WHERE id = $1 AND client_reminder_j1_sent_at IS NULL`,
+          [m.id]
+        );
+        if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
         const missionTimeClient = new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
         await db.query(
@@ -608,7 +621,6 @@ initDb().then(() => {
         } else {
           console.warn(`[wasel] Client ${m.client_id} sans téléphone renseigné — envoi ignoré (mission_reminder_j1_client)`);
         }
-        await db.query(`UPDATE missions SET client_reminder_j1_sent_at = NOW() WHERE id = $1`, [m.id]);
         console.log(`📅 Rappel J-1 envoyé au client pour mission ${m.id}`);
         } catch (e) { console.error(`❌ Cron J-1 (client) — mission ${m.id} :`, e.message); }
       }
@@ -1150,6 +1162,16 @@ initDb().then(() => {
       for (const m of clientMissionsH2) {
         // Isolation par itération (RG9) — voir la boucle lateH plus haut.
         try {
+        // Groupe 3 point 3.5 (audit exhaustif backend 2026-09-05 §2.4) — garde d'idempotence
+        // AVANT les effets (même raison et même forme que le rappel J-1 client ci-dessus et que
+        // candidature_whatsapp_sent_at). Un échec d'itération après cette ligne ne fait plus
+        // renvoyer le rappel H-2 au tick suivant (doublon) ; un envoi WhatsApp raté après elle
+        // n'est pas rejoué (compromis assumé, déjà retenu ailleurs dans ce cron).
+        const { rowCount } = await db.query(
+          `UPDATE missions SET client_reminder_h2_sent_at = NOW() WHERE id = $1 AND client_reminder_h2_sent_at IS NULL`,
+          [m.id]
+        );
+        if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
         await db.query(
           `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
            VALUES ($1, $2, $3, 'mission', $4, 'mission_view', $5, $6, $7)`,
@@ -1172,7 +1194,6 @@ initDb().then(() => {
         } else {
           console.warn(`[wasel] Client ${m.client_id} sans téléphone renseigné — envoi ignoré (mission_reminder_h2_client)`);
         }
-        await db.query(`UPDATE missions SET client_reminder_h2_sent_at = NOW() WHERE id = $1`, [m.id]);
         console.log(`📅 Rappel H-2 envoyé au client pour mission ${m.id}`);
         } catch (e) { console.error(`❌ Cron rappel client H-2 — mission ${m.id} :`, e.message); }
       }
@@ -1526,6 +1547,17 @@ initDb().then(() => {
       for (const m of staleMissions) {
         // Isolation par itération (RG9) — voir la boucle lateH plus haut.
         try {
+          // Groupe 3 point 3.5 (audit exhaustif backend 2026-09-05 §2.4) — garde d'idempotence
+          // AVANT les effets (notifications admin + WhatsApp + notification client). Avant : le
+          // UPDATE stale_notified_at était la DERNIÈRE ligne ; un échec au milieu de la boucle
+          // admin (ou sur l'envoi WhatsApp) faisait re-notifier toute la mission au tick suivant.
+          // Même forme que candidature_whatsapp_sent_at et les rappels J-1/H-2. Compromis assumé :
+          // un envoi raté après cette ligne n'est pas rejoué (mieux qu'un doublon d'alerte admin).
+          const { rowCount } = await db.query(
+            `UPDATE missions SET stale_notified_at = NOW() WHERE id = $1 AND stale_notified_at IS NULL`,
+            [m.id]
+          );
+          if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
           for (const admin of admins) {
             await db.query(
               `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
@@ -1559,7 +1591,6 @@ initDb().then(() => {
             type: 'warning'
           });
 
-          await db.query(`UPDATE missions SET stale_notified_at = NOW() WHERE id = $1`, [m.id]);
           console.log(`⏳ Notification mission sans Œil envoyée pour ${m.id}`);
         } catch (e) { console.error(`❌ Cron missions sans Œil — mission ${m.id} :`, e.message); }
         }
