@@ -15,6 +15,7 @@ const { computeAvgResponseMinutes } = require('../utils/responseTime');
 const { getSetting, invalidateSettingsCache, isNumeric } = require('../utils/settings');
 const { isWithinSchedule } = require('../utils/schedule');
 const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
+const { validateSettingValue } = require('../config/settingValidators');
 const asyncHandler = require('../middleware/asyncHandler');
 // Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
 // de dupliquer la logique de sélection de candidat pour le cas "Œil désactivé avec mission active".
@@ -1674,6 +1675,28 @@ const {
     fraud_client_fake_mission_lookback_days, fraud_client_fake_mission_seconds,
     fraud_message_scan_lookback_days,
     fraud_dashboard_recent_days, fraud_dashboard_cancellations_days,
+  }
+
+  // Validation générique type/plage (audit exhaustif backend 2026-09-05, §2.5 majeur #2) —
+  // AVANT toute écriture ET avant la garde croisée C3 ci-dessous. Jusqu'ici PUT écrivait
+  // String(req.body[key]) tel quel : commission="abc" → NaN sur chaque mission ;
+  // client_validation_hours="x" → 'x'::numeric → 500 du cron d'auto-validation à chaque tick ;
+  // five_star_bonus_percent="x" → bonus 5★ coupé sans erreur. Chaque règle est déduite de
+  // l'usage réel de la clé — voir config/settingValidators.js (SETTING_RULES) et le rapport de
+  // chantier. Comportement ATOMIQUE, cohérent avec la transaction ci-dessous : si une seule
+  // valeur du corps est invalide, on renvoie un 400 listant TOUTES les clés fautives et on
+  // n'écrit rien (aucune acceptation partielle). Les 79 valeurs réellement en base au
+  // 2026-09-05 passent toutes (vérif rétroactive : _audit/test_settings_validation.js).
+  const settingErrors = [];
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined) continue; // clé absente du corps — non écrite, non validée
+    const err = validateSettingValue(key, value);
+    if (err) settingErrors.push(`${key} ${err}`);
+  }
+  if (settingErrors.length > 0) {
+    return res.status(400).json({
+      error: `Valeur(s) de réglage invalide(s) — aucune modification enregistrée. ${settingErrors.join(' ; ')}`,
+    });
   }
 
   // C3 (audit valeurs-temps, 2026-09-03) — garde de cohérence inter-réglages :
