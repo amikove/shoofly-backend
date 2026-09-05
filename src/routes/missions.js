@@ -17,6 +17,7 @@ const walletService = require('../services/walletService');
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
+const Sentry = require('@sentry/node');
 const { resolveQuartier, validateCityInput } = require('../constants/villes');
 const { isValidSubcategory, getSubcategoryMinPrice } = require('../constants/missionCategories');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
@@ -173,7 +174,18 @@ async function reassignMissionsOnSuspension(db, io, emitToUser, oeilId, opts = {
         await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
       }
     } catch (e) {
+      // Groupe 3 point 3.4 (audit exhaustif backend 2026-09-05 §2.4) : l'échec de réattribution
+      // d'UNE mission d'un Œil suspendu reste isolé — le lot continue, résilience DÉLIBÉRÉE
+      // (une mission qui ne se réattribue pas ne doit pas bloquer les autres). Ajout Sentry EN
+      // PLUS du console.error : sans ça, une mission restée orpheline (Œil suspendu, mission
+      // toujours 'assigned'/'en_route'/'active' sur lui) n'est visible que dans les logs serveur.
+      // Aucune modification de la structure de résilience par mission.
       console.error(`❌ reassignMissionsOnSuspension: mission ${mission.id} error:`, e.message);
+      Sentry.captureException(e, {
+        level: 'error',
+        tags: { area: 'reassign_on_suspension' },
+        extra: { oeilId, missionId: mission.id, missionStatus: mission.status, actorId },
+      });
     }
   }
   return reassignedCount;

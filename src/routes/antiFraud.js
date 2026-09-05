@@ -7,6 +7,7 @@ const asyncHandler = require('../middleware/asyncHandler');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
+const Sentry = require('@sentry/node');
 // Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
 // de dupliquer la logique de sélection de candidat — même approche que
 // PUT /users/admin/:id/toggle-active (routes/users.js).
@@ -508,7 +509,17 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
       );
       if (emitToUser) emitToUser(mission.client_id, 'notification', { title, body });
     } catch (e) {
+      // Groupe 3 point 3.4 (audit exhaustif backend 2026-09-05 §2.4) : même intention que le
+      // catch par mission de reassignMissionsOnSuspension (routes/missions.js) — l'échec de
+      // réattribution d'UNE mission d'un Œil bloqué reste isolé (le lot continue), mais devient
+      // VISIBLE via Sentry pour ne pas laisser une mission orpheline passer inaperçue. Structure
+      // de résilience par mission inchangée.
       console.error(`❌ POST /anti-fraud/block: réattribution mission ${mission.id} error:`, e.message);
+      Sentry.captureException(e, {
+        level: 'error',
+        tags: { area: 'reassign_on_block' },
+        extra: { blockedUserId: req.params.userId, missionId: mission.id, missionStatus: mission.status },
+      });
     }
   }
 
