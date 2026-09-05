@@ -67,6 +67,14 @@ async function runWalletReconciliation(db, io = null, emitToUser = null) {
     const userNames = new Map(named.map(u => [u.id, `${u.first_name} ${u.last_name}`]));
 
     for (const a of alerts) {
+      // Isolation par itération (RG9 / audit exhaustif 2026-09-05 §2.4 point 3.1) : une exception
+      // pendant le traitement de CETTE alerte (notify, emit, formatage) n'abandonne pas le reste
+      // du lot. Les lignes wallet_reconciliation_alerts sont déjà committées par l'INSERT ci-dessus
+      // et l'anti-doublon SQL (NOT EXISTS sur resolved_at IS NULL) les exclura du prochain tick —
+      // sans cette garde, une seule alerte fautive priverait DÉFINITIVEMENT de notification toutes
+      // les alertes suivantes du même tick. `notify`/`emit` sont hors transaction (règle projet :
+      // jamais de notify() dans une transaction) ; il n'y a d'ailleurs aucune transaction ici.
+      try {
       console.error(`🚨 Écart de réconciliation détecté — user_id=${a.user_id} (${a.user_type}) solde=${a.stored_balance} ledger=${a.ledger_balance} écart=${a.discrepancy}`);
 
       // NUMERIC(10,2) revient en string via pg — toujours passer par Number() avant tout calcul/format.
@@ -84,16 +92,21 @@ async function runWalletReconciliation(db, io = null, emitToUser = null) {
       };
 
       for (const admin of admins) {
+        // Isolation par itération (RG9) — un notify() qui échoue pour un admin ne prive pas les
+        // autres admins de l'alerte, ni l'emit room:admin ci-dessous, ni les alertes suivantes.
+        try {
         await notify(
           db, admin.id, title, body, 'warning', null, emitToUser, 'admin_wallet_reconciliation',
           'walletReconciliationAlertAdminTitle', 'walletReconciliationAlertAdminBody', params
         );
+        } catch (e) { console.error(`❌ Réconciliation wallet — notify admin ${admin.id} (alerte #${a.id}) :`, e.message); }
       }
       if (io) {
         io.to('room:admin').emit('wallet_reconciliation_alert_created', {
           alertId: a.id, userId: a.user_id, userType: a.user_type, discrepancy,
         });
       }
+      } catch (e) { console.error(`❌ Réconciliation wallet — traitement alerte #${a.id} (user_id=${a.user_id}) :`, e.message); }
     }
   }
   return alerts;
