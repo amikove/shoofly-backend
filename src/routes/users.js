@@ -2022,18 +2022,28 @@ router.post('/admin/claims/:missionId/commission', authenticate, requireRole('ad
 
   // Garde d'idempotence posée sur l'UPDATE lui-même — même principe que le reste de cette
   // session : si deux admins décident en concurrence, un seul applique réellement le débit.
-  const { rowCount } = await db.query(
-    `UPDATE claims SET commission_decision=$1, commission_decided_by=$2, commission_decided_at=NOW() WHERE mission_id=$3 AND commission_decision IS NULL`,
-    [decision === 'debit' ? 'debited' : 'released', req.user.id, req.params.missionId]
-  );
-  if (rowCount === 0) return res.status(409).json({ error: 'La commission a déjà été décidée pour cette réclamation.' });
-
+  //
+  // Groupe 3 point 3.2 (audit exhaustif backend 2026-09-05 §2.4) — l'UPDATE claims (pose de la
+  // décision) ET le débit commission sont désormais dans LA MÊME transaction. Avant : l'UPDATE
+  // committait seul, puis settleCashCommission tournait dans sa propre transaction ; un crash
+  // entre les deux laissait commission_decision='debited' SANS aucun débit wallet, et la garde
+  // `commission_decision IS NULL` bloquait alors tout rejeu → commission Shoofly perdue
+  // définitivement. Un ROLLBACK complet rejoue proprement (garde toujours NULL). Les
+  // notifications restent HORS transaction (règle projet : jamais de notify() dans une transaction).
   let cashSettlement = null;
-  if (decision === 'debit') {
-    await walletService.withTransaction(db, async (client) => {
+  let applied = false;
+  await walletService.withTransaction(db, async (client) => {
+    const { rowCount } = await client.query(
+      `UPDATE claims SET commission_decision=$1, commission_decided_by=$2, commission_decided_at=NOW() WHERE mission_id=$3 AND commission_decision IS NULL`,
+      [decision === 'debit' ? 'debited' : 'released', req.user.id, req.params.missionId]
+    );
+    if (rowCount === 0) return; // déjà décidée — applied reste false, 409 renvoyé hors transaction (rien écrit)
+    applied = true;
+    if (decision === 'debit') {
       cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (réclamation "client absent", décision admin différée)');
-    });
-  }
+    }
+  });
+  if (!applied) return res.status(409).json({ error: 'La commission a déjà été décidée pour cette réclamation.' });
 
   const emitToUser = req.app.get('emitToUser');
   if (decision === 'debit') {
@@ -2084,18 +2094,33 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), require
   // pattern que le callback PayZone (payments.js) : rejouer un changement de statut, ou
   // inverser payé/rejeté depuis un état déjà terminal, ne fait plus rien (rowCount=0) au lieu
   // de recréditer en double.
-  const { rows: [w] } = await db.query(
-    `UPDATE withdrawals SET status=$1,processed_by=$2,processed_at=NOW()
-     WHERE id=$3 AND status IN ('pending','approved') RETURNING *`,
-    [status, req.user.id, req.params.id]
-  );
+  //
+  // Groupe 3 point 3.2 (audit exhaustif backend 2026-09-05 §2.4) — le passage à 'rejected' ET le
+  // recrédit du solde de l'Œil sont désormais dans LA MÊME transaction. Avant : l'UPDATE
+  // committait seul, puis walletService.credit ouvrait sa propre transaction ; un crash entre les
+  // deux laissait le retrait 'rejected' (donc hors de la garde `status IN ('pending','approved')`,
+  // aucun rejeu possible) SANS recrédit → perte sèche de w.amount pour l'Œil. Un ROLLBACK complet
+  // remet le retrait dans son statut d'origine et rejoue proprement. Les notifications restent
+  // HORS transaction (règle projet : jamais de notify() dans une transaction).
+  let w;
+  await walletService.withTransaction(db, async (client) => {
+    const { rows: [updated] } = await client.query(
+      `UPDATE withdrawals SET status=$1,processed_by=$2,processed_at=NOW()
+       WHERE id=$3 AND status IN ('pending','approved') RETURNING *`,
+      [status, req.user.id, req.params.id]
+    );
+    w = updated;
+    if (!w) return; // introuvable / déjà traité — 404|409 renvoyé hors transaction (rien écrit)
+    if (status === 'rejected') {
+      await walletService.credit(client, w.oeil_id, 'oeil', w.amount, 'Retrait refusé — solde recrédité', null, { countsAsEarning: false });
+    }
+  });
   if (!w) {
     const { rows: [existing] } = await db.query('SELECT id FROM withdrawals WHERE id=$1', [req.params.id]);
     if (!existing) return res.status(404).json({ error: 'Introuvable' });
     return res.status(409).json({ error: 'Ce virement a déjà été traité' });
   }
   if (status === 'rejected') {
-    await walletService.credit(db, w.oeil_id, 'oeil', w.amount, 'Retrait refusé — solde recrédité', null, { countsAsEarning: false });
     const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Virement refusé','Votre demande a été refusée. Solde recrédité.','info','gains_page',$2,$3,$4) RETURNING *`, [w.oeil_id, 'withdrawalRejectedTitle', 'withdrawalRejectedBody', null]);
     if (emitToUser) emitToUser(w.oeil_id, 'notification', n.rows[0]);
   }
