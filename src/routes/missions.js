@@ -3539,15 +3539,76 @@ async function checkTransferDeadlines(db, io, emitToUser) {
     // le reste du lot — même granularité que jobs/autoValidateMissions.js,
     // jobs/candidatureRelance.js et jobs/whatsappRetry.js.
     try {
-    // Clôturer la mission d'abord, sous garde de statut — si un remplaçant l'a
-    // entre-temps acceptée/embauchée (sortie de pending/is_priority) entre le
-    // SELECT ci-dessus et cette itération, on ne rejoue pas la pénalité et le
-    // remboursement dessus.
+    // Écritures financières / d'état groupées dans UNE transaction PAR MISSION (Groupe 3,
+    // points 3.2/3.3 — audit exhaustif backend 2026-09-05 §2.4) : transition d'état + débit
+    // pénalité plafonné + compteur/cooldown + remboursement client sont désormais tout-ou-rien.
+    // Avant : chacune committait séparément — un crash entre deux laissait un état partiel
+    // (mission annulée sans remboursement, pénalité débitée sans annulation…). Scope PAR MISSION
+    // (une transaction par itération, pas une transaction géante pour le lot) : un échec sur une
+    // mission ne fait pas perdre les autres — la garde par itération (RG9 / O-BE-2) ci-dessus reste.
+    //
+    // Restent HORS transaction, APRÈS commit (voir plus bas) : logReliabilityEvent (il déclenche
+    // via checkAndUpdateSuspension une réattribution EN LOT — reassignMissionsOnSuspension — avec
+    // notify() + WhatsApp, jamais dans une transaction DB : règle projet + point 3.4) et toutes
+    // les notifications / message système / WhatsApp.
+    //
+    // Garde de statut : si un remplaçant a accepté/été embauché entre le SELECT ci-dessus et
+    // cette itération (sortie de pending/is_priority), transitionMission lève MissionTransitionError
+    // dans le callback → ROLLBACK → on passe à la mission suivante sans rejouer pénalité/remboursement.
+    const isDuring = mission.transfer_type === 'during' && !!mission.transferred_from;
+    const isBefore = mission.transfer_type === 'before' && !!mission.transferred_from && !mission.transfer_no_penalty;
+    const applyDuringPenalty = isDuring && !mission.transfer_no_penalty;
+
+    // Réglages lus sur le pool AVANT la transaction (même style que le bloc pénalité d'origine).
+    const transferDuringNoReplacementDebitCapMad = applyDuringPenalty ? await getSetting(db, 'transfer_during_no_replacement_debit_cap_mad', 100) : null;
+    const transferDuringNoReplacementPenaltyPoints = applyDuringPenalty ? await getSetting(db, 'transfer_during_no_replacement_penalty_points', -70) : null;
+    const abandonCooldownHours = isDuring ? await getSetting(db, 'abandon_during_mission_cooldown_hours', 48) : null;
+    const transferBeforeNoReplacementPenaltyPoints = isBefore ? await getSetting(db, 'transfer_before_no_replacement_penalty_points', -10) : null;
+
+    let txResult;
     try {
-      await transitionMission(db, mission.id, 'pending', 'cancelled', null, {
-        extraFields: { cancelled_at: 'NOW()', cancel_reason: 'Aucun remplaçant trouvé avant expiration du délai', is_priority: false, transfer_deadline: null },
-        extraGuards: { is_priority: true },
-        note: 'Expiration du délai de transfert sans remplaçant',
+      txResult = await walletService.withTransaction(db, async (client) => {
+        await transitionMission(client, mission.id, 'pending', 'cancelled', null, {
+          extraFields: { cancelled_at: 'NOW()', cancel_reason: 'Aucun remplaçant trouvé avant expiration du délai', is_priority: false, transfer_deadline: null },
+          extraGuards: { is_priority: true },
+          note: 'Expiration du délai de transfert sans remplaçant',
+        });
+
+        // Pénalité aggravée sur l'Œil 1 si pendant mission — sautée quand la libération d'origine
+        // est marquée transfer_no_penalty (URGENCE, suspension admin, présence non confirmée). Le
+        // cooldown et transfer_no_replacement_count restent posés SANS EXCEPTION (une
+        // indisponibilité réelle rend l'Œil temporairement indisponible, urgence authentique ou non).
+        let deducted = 0;
+        if (isDuring) {
+          if (applyDuringPenalty) {
+            // Débit plafonné au solde réel verrouillé — le montant journalisé ne dépasse jamais ce
+            // qui a réellement été déduit (même pattern que le cron H+30, index.js).
+            const currentBalance = await walletService.lockBalance(client, mission.transferred_from, 'oeil');
+            deducted = Math.min(transferDuringNoReplacementDebitCapMad, currentBalance || 0);
+            if (deducted > 0) {
+              await walletService.debit(client, mission.transferred_from, 'oeil', deducted, 'Pénalité — aucun remplaçant trouvé', mission.id);
+            }
+          }
+          // GREATEST(...) — ne jamais RACCOURCIR un cooldown déjà posé plus lointain (constat G3).
+          // Même transfer_cooldown_until que releaseMissionForReplacement, réglage distinct et plus
+          // long (abandon_during_mission_cooldown_hours). NULL initial géré par GREATEST.
+          await client.query(`
+            UPDATE users SET
+              transfer_no_replacement_count=transfer_no_replacement_count+1,
+              transfer_cooldown_until=GREATEST(transfer_cooldown_until, NOW() + INTERVAL '1 hour' * $2::numeric)
+            WHERE id=$1
+          `, [mission.transferred_from, abandonCooldownHours]);
+        }
+
+        // Remboursement client — annulation par le système (aucun remplaçant), non imputable au
+        // client : intégral. CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone'. Mission
+        // cash (2026-08-13) : refundOnCancellation n'est appelée QUE pour 'payzone' — Shoofly n'a
+        // jamais encaissé le client d'une mission cash.
+        const refund = mission.payment_method !== 'cash'
+          ? await refundOnCancellation(client, mission, false, 'Remboursement — aucun Œil disponible')
+          : 0;
+
+        return { deducted, refund };
       });
     } catch (e) {
       if (e instanceof MissionTransitionError) {
@@ -3556,89 +3617,54 @@ async function checkTransferDeadlines(db, io, emitToUser) {
       }
       throw e;
     }
+    const { deducted, refund } = txResult;
 
-    // CONSTAT 16 (audit-360) : émettre mission_status_changed et poster un message système
-    // AVANT de fermer la room (même pattern que releaseMissionForReplacement) — sinon les
-    // participants encore dans la room mission:<id> à cet instant n'apprennent jamais que la
-    // mission vient d'être annulée faute de remplaçant. content_key réutilise 'missionCancelled'
-    // (déjà traduit FR/AR) : message générique factuellement exact ici. sender_id=client_id,
-    // seul participant garanti non-NULL sur ce chemin (transferred_from peut être NULL —
-    // voir POST /edit-requests/:id/reject, qui le laisse volontairement NULL).
+    // ─────────────────── HORS TRANSACTION (après commit) ───────────────────
+
+    // 1) Journalisation fiabilité — APRÈS commit, HORS transaction. logReliabilityEvent →
+    //    checkAndUpdateSuspension → (si le score passe sous 50) reassignMissionsOnSuspension :
+    //    une réattribution EN LOT des autres missions de l'Œil, avec notify() + WhatsApp +
+    //    cascades, qui ne doit jamais s'exécuter dans une transaction DB (règle projet « jamais
+    //    de notify() dans une transaction » + point 3.4 : sa résilience par mission ne doit pas
+    //    être avalée par un englobage transactionnel). Signature et comportement interne de
+    //    logReliabilityEvent inchangés — aucune régression pour ses autres appelants. Même ordre
+    //    que le jumeau H+30 (index.js) : la transition étant committée, la cascade de suspension
+    //    ne reprend pas cette mission. Compromis résiduel assumé : un crash entre le commit
+    //    ci-dessus et cet appel perd l'événement de fiabilité de CETTE pénalité (l'argent et
+    //    l'état mission restent cohérents, réconciliation intacte ; pas de rejeu) — voir rapport
+    //    Groupe 3 §3.3.
+    if (applyDuringPenalty) {
+      await logReliabilityEvent(db, mission.transferred_from, mission.id, transferDuringNoReplacementPenaltyPoints, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
+    } else if (isBefore) {
+      await logReliabilityEvent(db, mission.transferred_from, mission.id, transferBeforeNoReplacementPenaltyPoints, 'Transfert avant démarrage sans remplaçant trouvé', true);
+    }
+
+    // 2) CONSTAT 16 (audit-360) : émettre mission_status_changed + message système AVANT de fermer
+    //    la room — sinon les participants encore dans mission:<id> n'apprennent jamais l'annulation.
+    //    content_key 'missionCancelled' (déjà traduit FR/AR). sender_id=client_id, seul participant
+    //    garanti non-NULL sur ce chemin (transferred_from peut être NULL).
     io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'cancelled' });
     await db.query(
       `INSERT INTO mission_messages (mission_id,sender_id,content,type,content_key) VALUES ($1,$2,$3,'system',$4)`,
       [mission.id, mission.client_id, 'Mission annulée.', 'missionCancelled']
     );
-
-    // Ce chemin transitionne vers 'cancelled' sans passer par POST /:id/status (voir
-    // RAPPORT_DIAGNOSTIC_RAPPEL_CLIENT_ET_CHAT_MISSION.md §2.3) — fermeture de room répliquée
-    // ici pour cette même raison.
+    // Ce chemin transitionne vers 'cancelled' sans passer par POST /:id/status — fermeture de room
+    // répliquée ici pour cette même raison.
     closeMissionChatRoom(io, mission.id);
 
-    // Pénalité aggravée sur l'Œil 1 si pendant mission — la pénalité (financière + fiabilité)
-    // est sautée quand la libération d'origine est marquée transfer_no_penalty (URGENCE,
-    // suspension admin, confirmation de présence non reçue — voir les 3 sites qui posent ce flag
-    // et RAPPORT_CORRECTIF_PENALITE_DIFFEREE.md). Le cooldown et transfer_no_replacement_count
-    // restent posés SANS EXCEPTION dans tous les cas (même principe que le cooldown de
-    // releaseMissionForReplacement, 2026-07-30 : une indisponibilité réelle rend l'Œil
-    // temporairement indisponible pour de nouvelles missions, urgence authentique ou non — seule
-    // la pénalité financière/fiabilité est conditionnée par transfer_no_penalty).
-if (mission.transfer_type === 'during' && mission.transferred_from) {
-        if (!mission.transfer_no_penalty) {
-          const transferDuringNoReplacementDebitCapMad = await getSetting(db, 'transfer_during_no_replacement_debit_cap_mad', 100);
-          const transferDuringNoReplacementPenaltyPoints = await getSetting(db, 'transfer_during_no_replacement_penalty_points', -70);
-          // Débit plafonné au solde réel (voir même pattern commenté en détail dans le cron H+30,
-          // index.js) : lockBalance + debit() dans la même transaction pour que le montant journalisé
-          // ne dépasse jamais ce qui a réellement été déduit.
-          const deducted = await walletService.withTransaction(db, async (client) => {
-            const currentBalance = await walletService.lockBalance(client, mission.transferred_from, 'oeil');
-            const deducted = Math.min(transferDuringNoReplacementDebitCapMad, currentBalance || 0);
-            if (deducted > 0) {
-              await walletService.debit(client, mission.transferred_from, 'oeil', deducted, 'Pénalité — aucun remplaçant trouvé', mission.id);
-            }
-            return deducted;
-          });
-          await logReliabilityEvent(db, mission.transferred_from, mission.id, transferDuringNoReplacementPenaltyPoints, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
-
-          // Persisté (pas seulement émis en direct) : même pattern que la pénalité H+30 (index.js)
-          // via notify(), sinon un Œil hors-ligne au moment précis du tick perd cette notification
-          // pour toujours (RAPPORT_TEXTES_DYNAMIQUES_HARDCODES.md §7).
-          await notify(db, mission.transferred_from, '⚠️ Pénalité appliquée',
-            `Aucun remplaçant n'a été trouvé pour "${mission.title}". -${deducted} MAD déduits.`,
-            'error', mission.id, emitToUser, 'reliability_page', 'penaltyAppliedTitle', 'penaltyAppliedNoReplacementBody',
-            { missionTitle: mission.title, amount: deducted });
-        }
-        const abandonCooldownHours = await getSetting(db, 'abandon_during_mission_cooldown_hours', 48);
-        // GREATEST(...) — ne jamais RACCOURCIR un cooldown déjà posé plus lointain (constat G3,
-        // rapport-verification-fonctionnelle-prod-2026-09-01). Ce site alimente le même
-        // transfer_cooldown_until que releaseMissionForReplacement, mais avec un réglage distinct
-        // et plus long (abandon_during_mission_cooldown_hours, 48h par défaut) : il n'y a pas de
-        // colonne dédiée abandon_*_until. NULL initial géré par GREATEST (PostgreSQL 18.2 : NULL
-        // ignoré sauf si tous les arguments sont NULL — aucun COALESCE nécessaire).
-        await db.query(`
-          UPDATE users SET
-            transfer_no_replacement_count=transfer_no_replacement_count+1,
-            transfer_cooldown_until=GREATEST(transfer_cooldown_until, NOW() + INTERVAL '1 hour' * $2::numeric)
-          WHERE id=$1
-        `, [mission.transferred_from, abandonCooldownHours]);
-       } else if (mission.transfer_type === 'before' && mission.transferred_from && !mission.transfer_no_penalty) {
-      const transferBeforeNoReplacementPenaltyPoints = await getSetting(db, 'transfer_before_no_replacement_penalty_points', -10);
-      await logReliabilityEvent(db, mission.transferred_from, mission.id, transferBeforeNoReplacementPenaltyPoints, 'Transfert avant démarrage sans remplaçant trouvé', true);
-
+    // 3) Notification de pénalité à l'Œil — persistée via notify() (pas seulement émise en direct),
+    //    sinon un Œil hors-ligne au tick perd cette notification pour toujours.
+    if (applyDuringPenalty) {
+      await notify(db, mission.transferred_from, '⚠️ Pénalité appliquée',
+        `Aucun remplaçant n'a été trouvé pour "${mission.title}". -${deducted} MAD déduits.`,
+        'error', mission.id, emitToUser, 'reliability_page', 'penaltyAppliedTitle', 'penaltyAppliedNoReplacementBody',
+        { missionTitle: mission.title, amount: deducted });
     }
 
-// Remboursement client — annulation par le système (aucun remplaçant trouvé), non imputable au client : intégral
-      // Mission cash (2026-08-13) : refundOnCancellation n'est appelée QUE pour 'payzone' —
-      // Shoofly n'a jamais encaissé le client d'une mission cash. refund.js n'est jamais
-      // modifié ; seul ce point d'appel est conditionné (garde-fou explicite de la session).
-      // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
-      // symétrie NULL que POST /:id/validate ci-dessus (voir son commentaire détaillé).
-      const refund = mission.payment_method !== 'cash'
-        ? await refundOnCancellation(db, mission, false, 'Remboursement — aucun Œil disponible')
-        : 0;
-      const cancelBody = mission.payment_method === 'cash'
-        ? `Aucun Œil disponible pour "${mission.title}".`
-        : `Aucun Œil disponible pour "${mission.title}". Remboursement intégral effectué.`;
+    // 4) Notification d'annulation au client (+ WhatsApp payzone).
+    const cancelBody = mission.payment_method === 'cash'
+      ? `Aucun Œil disponible pour "${mission.title}".`
+      : `Aucun Œil disponible pour "${mission.title}". Remboursement intégral effectué.`;
 
     await emitToUser?.(mission.client_id, 'notification', {
       title: '❌ Mission annulée',
@@ -3651,13 +3677,9 @@ if (mission.transfer_type === 'during' && mission.transferred_from) {
       [mission.client_id, cancelBody, mission.id, 'missionCancelledNoReplacementTitle', 'missionCancelledNoReplacementBody', null]
     );
 
-    // Gabarit WhatsApp approuvé pour cette notification affirme explicitement un montant
-    // remboursé ({{2}}, voir config/waselTemplates.js) — texte figé côté Wasel/Meta, pas
-    // réécrivable ici. Aucun remboursement n'existant pour une mission cash, l'envoyer
-    // reviendrait à affirmer au client un remboursement qui n'a pas eu lieu : sauté pour
-    // 'cash' plutôt qu'envoyé avec un montant trompeur (0 MAD). Nécessiterait un gabarit dédié
-    // approuvé séparément si ce message doit un jour exister pour le cash — hors périmètre de
-    // cette session (voir rapport).
+    // Gabarit WhatsApp approuvé affirme explicitement un montant remboursé ({{2}}) — texte figé
+    // côté Wasel/Meta. Aucun remboursement n'existant pour une mission cash, sauté pour 'cash'
+    // plutôt qu'envoyé avec un montant trompeur (0 MAD).
     if (mission.payment_method === 'payzone') {
       const { rows: [clientContactNoReplacement] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
       if (clientContactNoReplacement?.phone) {
