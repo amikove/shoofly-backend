@@ -260,6 +260,17 @@ app.use((err, req, res, next) => {
   console.error('❌', err.message);
   if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Fichier trop volumineux (max 10MB)' });
   if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Requête trop volumineuse' });
+  // Filet type/plage (audit 06/09, rapport sécurité Constat #2 & #3) — une valeur cliente
+  // incompatible avec la colonne cible qui a malgré tout atteint Postgres : SQLSTATE classe 22
+  // « data exception » — 22P02 (syntaxe invalide, ex. entier « hello »), 22003 (hors limites,
+  // ex. dépassement int4 / NUMERIC). La base est 100 % paramétrée (revue sécurité 06/09 : aucune
+  // concaténation, aucun spread req.*), donc ces codes signalent une entrée non bornée en amont,
+  // jamais une requête serveur mal formée → 400, pas 500. Filet APRÈS la validation en amont
+  // (missionCreateValidators price max, validateDurationEst), pas un remplacement. Sentry a déjà
+  // capté l'exception (setupExpressErrorHandler ci-dessus) : l'observabilité reste intacte.
+  if (err.code === '22P02' || err.code === '22003') {
+    return res.status(400).json({ error: isDev ? err.message : 'Requête invalide : une valeur fournie dépasse les limites acceptées.' });
+  }
   res.status(err.status || 500).json({ error: isDev ? err.message : 'Une erreur est survenue. Veuillez réessayer.' });
 });
 

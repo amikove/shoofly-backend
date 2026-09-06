@@ -244,6 +244,15 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
   const cityCheck = validateCityInput(city);
   if (cityCheck.error) return { error: cityCheck.error };
   const canonicalCity = cityCheck.city;
+
+  // duration_est (audit 06/09, Constat #2) — validé/normalisé ici, exactement comme
+  // validateMissionEditFields le fait pour PUT (parseInt + bornes 0..1440 min). Avant ce
+  // correctif, missionCreateValidators n'avait AUCUN validateur pour ce champ : une durée
+  // négative / absurde était stockée (201), "hello" / 2147483648 provoquaient un 500 pg brut.
+  // La valeur normalisée (entier, ou null) est ce qui part à l'insert — jamais le brut client.
+  const durationCheck = validateDurationEst(duration_est);
+  if (durationCheck.error) return { error: durationCheck.error };
+
   let canonicalQuartier = null;
   if (quartier) {
     canonicalQuartier = resolveQuartier(canonicalCity, quartier);
@@ -349,7 +358,7 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
   return {
     insert: {
       type, title, description, address, city: canonicalCity, quartier: canonicalQuartier, scheduled_at,
-      duration_est, price, commission, oeil_earning, is_urgent, oeil_id,
+      duration_est: durationCheck.value, price, commission, oeil_earning, is_urgent, oeil_id,
       property_type, visit_type, video_call, institution, purpose,
       company_name, audit_type, frequency, criteria, subcategory,
       promo_code, discount, replacement_preference, status, payment_method: paymentMethod,
@@ -953,6 +962,39 @@ function isScheduledAtTooFarInPast(value) {
   return new Date(value).getTime() < Date.now() - SCHEDULED_AT_PAST_TOLERANCE_MS;
 }
 
+// ── Bornes partagées création / édition de mission (audit 06/09, rapport sécurité Constat #2) ──
+// Plafond de prix. Le maximum réellement observé en base = 600 MAD (215 missions, 2026-09-06).
+// missions.price est NUMERIC(10,2) : plafond technique 99 999 999,99 — trop haut pour servir de
+// garde-fou, il laisse justement passer la mission ~100 M MAD du Constat #2 (price=99999999 →
+// 201). Aucun réglage admin "prix maximum" n'existe. 50 000 MAD : valeur ronde, ~83× le maximum
+// jamais facturé, très au-dessus de tout tarif de visite/file/audit plausible et bien en-deçà du
+// plafond NUMERIC — un dépassement est rejeté proprement en 400 par isFloat({max}) au lieu du
+// 500 pg brut (SQLSTATE 22003) constaté avant. Si un jour un champ frontend contraint le prix,
+// répercuter cette borne dans NewMissionModal.jsx.
+const MISSION_PRICE_MAX_MAD = 50000;
+
+// Plafond de durée estimée. missions.duration_est est un INTEGER exprimé en MINUTES (i18n
+// « Durée estimée (minutes) » / placeholder « Ex: 60 » ; users.js : SUM(duration_est + 45) AS
+// time_saved_minutes ; données réelles : 60 / 90 / 180). 24 h = 1440 min : une mission Shoofly
+// est une visite / une file d'attente / un audit unique, jamais plus longue qu'une journée.
+// Au-delà = saisie absurde — Constat #2 : duration_est=999999999 (≈ 1,9 an) était stocké tel
+// quel (201) ; 2147483648 dépasse int4 → 500 pg brut (22003) ; "hello" / 90.5 → 500 pg (22P02).
+// Borne basse 0 conservée (0 = « non précisé », ramené à NULL à l'insert par insertMissionRecord).
+// Règle IDENTIQUE à la création (prepareMissionInsert, via POST /missions ET POST
+// /payments/payzone/init) et à l'édition (validateMissionEditFields → PUT /:id + PUT
+// /:id/admin-edit) : avant ce correctif, PUT laissait passer EXACTEMENT les mêmes valeurs
+// absurdes que POST (vérifié en rejeu 2026-09-06 — le rapport 06/09 n'avait testé sur PUT que
+// -5 et "hello"). Bug partagé → correctif partagé, une seule fonction, jamais de divergence.
+const MISSION_DURATION_EST_MAX_MINUTES = 24 * 60;
+function validateDurationEst(raw) {
+  if (raw === null || raw === undefined || raw === '') return { value: null };
+  const n = parseInt(raw, 10);
+  if (isNaN(n) || n < 0 || n > MISSION_DURATION_EST_MAX_MINUTES) {
+    return { error: 'Durée estimée invalide' };
+  }
+  return { value: n };
+}
+
 // Réutilisé par POST /payments/payzone/init (routes/payments.js — paiement PayZone) :
 // mêmes règles de validation structurelle qu'à la création directe d'une mission.
 const missionCreateValidators = [
@@ -964,7 +1006,11 @@ const missionCreateValidators = [
     if (isScheduledAtTooFarInPast(value)) throw new Error('La date de la mission doit être dans le futur');
     return true;
   }),
-  body('price').isFloat({ min: 0 }),
+  // max : borne haute ajoutée 2026-09-06 (Constat #2). isFloat({max}) est inclusif — price=50000
+  // passe, price=50000.01 est rejeté en 400. duration_est n'est PAS validé ici mais dans
+  // prepareMissionInsert (via validateDurationEst), pour rester sur la MÊME logique impérative
+  // que validateMissionEditFields (PUT) — une seule règle création/édition.
+  body('price').isFloat({ min: 0, max: MISSION_PRICE_MAX_MAD }),
   body('replacement_preference').optional().isIn(['fast','choose']),
 ];
 
@@ -1067,9 +1113,14 @@ function validateMissionEditFields(body, mission) {
     changes.scheduled_at = date;
   }
   if ('duration_est' in body) {
-    const duration = body.duration_est === null || body.duration_est === '' ? null : parseInt(body.duration_est, 10);
-    if (duration !== null && (isNaN(duration) || duration < 0)) return { error: 'Durée estimée invalide' };
-    changes.duration_est = duration;
+    // Règle partagée avec la création (prepareMissionInsert). Inchangée pour tout ce que le
+    // rapport 06/09 avait testé sur PUT (-5 / "hello" → toujours 400 "Durée estimée invalide" ;
+    // null / "" → null ; "90.5" → 90). Ajout : borne haute 1440 min (Constat #2, jumeau POST) —
+    // duration_est=2147483648 passe de 500 pg à 400 propre, duration_est=999999999 de 200
+    // (stocké tel quel) à 400. Voir validateDurationEst / MISSION_DURATION_EST_MAX_MINUTES.
+    const durationCheck = validateDurationEst(body.duration_est);
+    if (durationCheck.error) return { error: durationCheck.error };
+    changes.duration_est = durationCheck.value;
   }
   if ('replacement_preference' in body) {
     if (!['fast', 'choose'].includes(body.replacement_preference)) return { error: 'Préférence de remplacement invalide' };
