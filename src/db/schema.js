@@ -672,6 +672,103 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE users DROP CONSTRAINT IF EXISTS users_balance_check;
     ALTER TABLE users ADD CONSTRAINT users_balance_check CHECK(balance >= 0);
 
+    -- ═══ Contraintes de plage sur les montants + unicité email casse-insensible ═══════════
+    -- Audit BDD 2026-09-06 (rapport-audit-base-de-donnees-contraintes-index-transactions,
+    -- §1 C1-C5 + C20 ; correctif : rapport-groupe1-contraintes-db-argent-doublons-2026-09-06).
+    -- Jusqu'ici AUCUN CHECK ne bornait les colonnes d'argent — la base acceptait price=-100,
+    -- une ligne de ledger amount=-50, un retrait <= 0 (tests §4 du rapport). walletService
+    -- (montant > 0), prepareMissionInsert (body('price').isFloat({min:0})) et pricing() (setting
+    -- 'commission' borné [0,1] par config/settingValidators.js) sont les SEULS remparts, purement
+    -- applicatifs : un INSERT hors de ces chemins (régression, script, route future) corromprait
+    -- directement le SUM(credit)-SUM(debit) que jobs/walletReconciliation.js compare à balance.
+    --
+    -- Patron (exigence du prompt de chantier) : ADD CONSTRAINT … NOT VALID puis VALIDATE
+    -- CONSTRAINT, jamais un ADD direct qui prendrait un ACCESS EXCLUSIVE le temps du scan. Sous
+    -- garde « constraint absente » : le scan de validation ne tourne qu'UNE fois, au déploiement
+    -- qui introduit la contrainte ; les redémarrages suivants sautent le bloc entièrement
+    -- (contrairement au DROP+ADD des *_balance_check ci-dessus, qui revalident à chaque boot —
+    -- toléré sur oeil_profiles/users, pas sur missions/wallet_transactions qui croissent par
+    -- mission / par mouvement). Données revérifiées avant pose (2026-09-06, PG local,
+    -- BEGIN…ROLLBACK) : 0 ligne en violation sur chacune des 6.
+
+    -- C1 — missions.price >= 0 (0 = mission gratuite, cas légitime existant) + NOT NULL. price
+    -- est TOUJOURS renseigné : body('price').isFloat({min:0}) obligatoire (missions.js
+    -- missionCreateValidators, partagé POST /missions + POST /payments/payzone/init), figé dans
+    -- FORBIDDEN_EDIT_FIELDS, jamais écrit par transitionMission/applyMissionEditChanges (tous les
+    -- extraFields tracés — aucun ne touche price/commission/oeil_earning) ; db/seed.js le
+    -- renseigne sur ses 5 missions. NOT NULL posé en contrainte nommée NOT VALID (PG 17+) puis
+    -- VALIDATE — même logique non-bloquante que les CHECK (attnotnull passe à true dès le ADD).
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'missions_price_check') THEN
+        ALTER TABLE missions ADD CONSTRAINT missions_price_check CHECK (price >= 0) NOT VALID;
+        ALTER TABLE missions VALIDATE CONSTRAINT missions_price_check;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'missions_price_not_null') THEN
+        ALTER TABLE missions ADD CONSTRAINT missions_price_not_null NOT NULL price NOT VALID;
+        ALTER TABLE missions VALIDATE CONSTRAINT missions_price_not_null;
+      END IF;
+    END $$;
+
+    -- C2 / C3 — missions.commission / oeil_earning >= 0 (CHECK seul, PAS de NOT NULL). pricing()
+    -- garantit commission ∈ [0, price] et oeil_earning = price - commission ∈ [0, price]. NOT NULL
+    -- VOLONTAIREMENT reporté (ARRÊT signalé dans le rapport) : 1 ligne pré-git (mission
+    -- 931ae019, créée 2026-06-17 — 3 jours avant le commit initial 72621a0 ; 'assigned' jamais
+    -- validée, aucun mouvement wallet déclenché) a commission/oeil_earning NULL, ET db/seed.js
+    -- (mission m5, dev uniquement) crée encore une mission sans ces colonnes. CHECK(>=0) laisse
+    -- passer NULL (logique ternaire SQL) — ces lignes ne le violent pas. Marche à suivre NOT NULL
+    -- (backfill 36.00 / 144.00 au taux 0.20 sur 931ae019 + correctif seed.js m5) dans le rapport.
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'missions_commission_check') THEN
+        ALTER TABLE missions ADD CONSTRAINT missions_commission_check CHECK (commission >= 0) NOT VALID;
+        ALTER TABLE missions VALIDATE CONSTRAINT missions_commission_check;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'missions_oeil_earning_check') THEN
+        ALTER TABLE missions ADD CONSTRAINT missions_oeil_earning_check CHECK (oeil_earning >= 0) NOT VALID;
+        ALTER TABLE missions VALIDATE CONSTRAINT missions_oeil_earning_check;
+      END IF;
+    END $$;
+
+    -- C4 — wallet_transactions.amount >= 0 (PAS > 0). services/walletService.js credit()/debit()
+    -- sont les SEULS writers (grep exhaustif : missions.js / users.js / index.js /
+    -- walletReconciliation.js ne font que du SELECT) et lèvent tous deux sur !(amount > 0) ; les
+    -- 3 sites de pénalité plafonnée (index.js H+30, missions.js checkTransferDeadlines,
+    -- utils/cashCommission.js) gardent en plus un if (montant > 0). Les 20 lignes amount=0 en base
+    -- sont du résidu historique : chemin INSERT direct plafonné-sans-garde (commit 155d0c9,
+    -- 2026-07-17) supprimé le 2026-07-31 (commit 64a8011 — passage des pénalités par
+    -- walletService) ; toutes sur comptes @test.local, fenêtre 17-20/07. Viser > 0 imposerait de
+    -- statuer sur ces 20 lignes (décision produit, hors périmètre) ; >= 0 bloque déjà la vraie
+    -- menace — le négatif (test empirique amount=-50 accepté avant) — sans les rejeter.
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'wallet_transactions_amount_check') THEN
+        ALTER TABLE wallet_transactions ADD CONSTRAINT wallet_transactions_amount_check CHECK (amount >= 0) NOT VALID;
+        ALTER TABLE wallet_transactions VALIDATE CONSTRAINT wallet_transactions_amount_check;
+      END IF;
+    END $$;
+
+    -- C5 — withdrawals.amount > 0. POST /oeil/withdraw (routes/users.js) est le seul writer hors
+    -- db/seed.js : garde (!amount || amount < 100) en amont + walletService.debit (montant > 0)
+    -- dans la même transaction avant l'INSERT — un retrait <= 0 est déjà triplement impossible.
+    -- Filet DB en plus (le garde applicatif < 100 pourrait régresser ; une route future pourrait
+    -- écrire ailleurs). UPDATE withdrawals ne touche jamais amount (status / processed_* seulement).
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'withdrawals_amount_check') THEN
+        ALTER TABLE withdrawals ADD CONSTRAINT withdrawals_amount_check CHECK (amount > 0) NOT VALID;
+        ALTER TABLE withdrawals VALIDATE CONSTRAINT withdrawals_amount_check;
+      END IF;
+    END $$;
+
+    -- C20 — users.email unicité insensible à la casse. users_email_key (UNIQUE btree) est
+    -- sensible à la casse : KARIM@GMAIL.COM peut coexister avec karim@gmail.com (test §3 du
+    -- rapport). register / login / forgot-password (routes/auth.js) normalisent tous via
+    -- express-validator .normalizeEmail() — lowercase complet local + domaine (vérifié
+    -- validator@13.15.35), écriture ET lecture cohérentes : cet index ne casse aucun login
+    -- existant. Filet contre un chemin qui contournerait cette normalisation : POST
+    -- /super-admin/admins (routes/superAdmin.js) stocke l'email BRUT et fait un dup-check
+    -- sensible à la casse — signalé dans le rapport comme correctif applicatif séparé (ne bloque
+    -- pas cet index : 0 collision lower(email) en base à ce jour). users_email_key est conservé
+    -- (filet sur l'égalité exacte ; aucun code ne dépend de sa suppression).
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (lower(email));
+
     -- Paiement client réel via PayZone (sandbox) — la mission n'est créée qu'à la confirmation
     -- du paiement (callback webhook), jamais au moment du formulaire. mission_payload contient
     -- les données du formulaire déjà validées/tarifées au moment de l'init (voir POST
