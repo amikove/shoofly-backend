@@ -1275,6 +1275,90 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
     CREATE INDEX IF NOT EXISTS idx_settings_history_key ON settings_history(setting_key);
     CREATE INDEX IF NOT EXISTS idx_settings_history_changed_at ON settings_history(changed_at DESC);
+
+    -- ═══ Index de performance — audit BDD 2026-09-06 §2 (I1 à I9) ════════════════════════════
+    -- Source : rapport-audit-base-de-donnees-contraintes-index-transactions-2026-09-06, §2
+    -- (Seq Scan confirmés par EXPLAIN ANALYZE). Correctif : rapport-groupe2-index-performance-
+    -- 2026-09-06. Lancé APRÈS le Groupe 1 (contraintes C1-C5/C20, commit 63a79e6, même fichier).
+    --
+    -- Ajout PUREMENT ADDITIF. Chaque CREATE INDEX IF NOT EXISTS est idempotent (les redémarrages
+    -- suivants sautent la ligne) et NE CHANGE PAS la sémantique d'une seule requête — seul le
+    -- plan change. Aucun de ces 14 index ne double ni n'entre en conflit avec un index existant
+    -- (vérifié nom par nom contre les ~30 CREATE INDEX ci-dessus + la liste « déjà bien placés »
+    -- du §2). Pas de CONCURRENTLY (interdit dans le bloc implicite de initDb, et inutile : tables
+    -- pré-lancement de quelques centaines de lignes, création en millisecondes au boot) — même
+    -- convention que tous les index de ce fichier. Preuve fraîche EXPLAIN ANALYZE avant/après,
+    -- base locale (volume réel) + jeu synthétique 100k lignes, dans le rapport : à 100k lignes,
+    -- Seq Scan → Index/Bitmap Scan pour les 14, gain ×20 à ×475. À volume actuel (~200-500
+    -- lignes) le planificateur en adopte déjà une partie ; les autres restent en Seq Scan tant
+    -- que la table est petite (comportement correct — le §2 le dit : « volumétrie faible → cer-
+    -- tains plans restent rapides aujourd'hui »), l'index prend le relais automatiquement à la
+    -- montée en charge. Les tables visées croissent toutes de façon monotone avec l'activité :
+    -- une ligne d'historique par transition, de ledger par mouvement, d'événement par pénalité.
+
+    -- I1-I3 (HAUT) — colonne FK sans index, Seq Scan confirmé, chemin chaud.
+    -- I1 : lecture à CHAQUE ouverture de fiche mission (GET /:id/history, missions.js:687) ;
+    --      écriture 2-6×/mission (logStatus). Table = somme de toutes les transitions.
+    CREATE INDEX IF NOT EXISTS idx_mission_status_history_mission_id ON mission_status_history(mission_id);
+    -- I2 : historique wallet admin (users.js:370), liste des virements (users.js:2423), dernier
+    --      mouvement (users.js:2494), reprise pénalité H+30 (missions.js:3305) — tous en
+    --      WHERE user_id=$1. NB : la requête que le §2 cite pour I2 (walletReconciliation.js,
+    --      « SUM par type WHERE user_id ») n'existe plus telle quelle — le job fait désormais un
+    --      balayage complet GROUP BY user_id SANS WHERE, que cet index n'accélère pas et ne doit
+    --      pas accélérer (vérifié : Seq Scan conservé après création). L'index reste justifié par
+    --      les 4 appelants ci-dessus.
+    CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user_id ON wallet_transactions(user_id);
+    -- I3 : computeReliabilityScore (reliabilityScore.js:71 — requête principale + sous-requête
+    --      corrélée sur la même table), checkAndUpdateSuspension, tout affichage de score
+    --      (profil Œil, écrans admin fiabilité, reliabilityRoutes.js, users.js:419/936).
+    CREATE INDEX IF NOT EXISTS idx_reliability_events_oeil_id ON reliability_events(oeil_id);
+
+    -- I4-I7 (MOYEN) — Seq Scan confirmé, FK non couverte, fréquence moyenne.
+    -- I4 : détail financier mission / idempotence remboursement (missions.js:3305). Couvre aussi
+    --      la validation de la FK wallet_transactions_mission_id_fkey (DELETE mission).
+    CREATE INDEX IF NOT EXISTS idx_wallet_transactions_mission_id ON wallet_transactions(mission_id);
+    -- I5 : GET /oeil/availability (users.js:179) + le DELETE global de PUT /oeil/availability
+    --      (users.js:187), tous deux WHERE user_id=$1.
+    CREATE INDEX IF NOT EXISTS idx_oeil_availability_user_id ON oeil_availability(user_id);
+    -- I6 : clôture mission — COUNT photos de l'Œil (missions.js:1886, reports.js:43) ; liste
+    --      média (missions.js:1656) ; media_count (missions.js:849, reliabilityRoutes.js:133).
+    CREATE INDEX IF NOT EXISTS idx_mission_media_mission_id ON mission_media(mission_id);
+    -- I7 : plafond max_uses_per_user à chaque rédemption promo (missions.js:298, promo.js:25),
+    --      exactement WHERE promo_id=$1 AND user_id=$2. NON unique : max_uses_per_user peut
+    --      valoir > 1 (un même couple (promo, user) a alors plusieurs lignes légitimes).
+    CREATE INDEX IF NOT EXISTS idx_promo_uses_promo_id_user_id ON promo_uses(promo_id, user_id);
+
+    -- I8 (MOYEN) — colonnes de deadline balayées par les crons toutes les 2-5 min. Index
+    -- PARTIELS (WHERE col IS NOT NULL) : à un instant donné une poignée de missions seulement
+    -- portent une de ces échéances → index de ~2 pages, coût d'écriture quasi nul sur les 99,9 %
+    -- de lignes où la colonne est NULL. Un index par colonne, prédicat calé sur l'usage réel
+    -- (toujours « col IS NOT NULL AND col <= NOW() »). idx_missions_status n'aide pas ces
+    -- requêtes (status='pending' = quasi tout le backlog).
+    CREATE INDEX IF NOT EXISTS idx_missions_batch_tiebreak_ends_at ON missions(batch_tiebreak_ends_at) WHERE batch_tiebreak_ends_at IS NOT NULL;                             -- index.js:1306, cron */2
+    CREATE INDEX IF NOT EXISTS idx_missions_candidate_window_ends_at ON missions(candidate_window_ends_at) WHERE candidate_window_ends_at IS NOT NULL;                       -- index.js:1370, cron */2
+    CREATE INDEX IF NOT EXISTS idx_missions_urgent_whatsapp_next_wave_at ON missions(urgent_whatsapp_next_wave_at) WHERE urgent_whatsapp_next_wave_at IS NOT NULL;           -- index.js:1405, cron 1-59/5
+    CREATE INDEX IF NOT EXISTS idx_missions_presence_confirmation_deadline_at ON missions(presence_confirmation_deadline_at) WHERE presence_confirmation_deadline_at IS NOT NULL; -- missions.js:3720, cron */5
+    CREATE INDEX IF NOT EXISTS idx_missions_transfer_deadline ON missions(transfer_deadline) WHERE transfer_deadline IS NOT NULL;                                             -- missions.js:3542, cron */5
+    CREATE INDEX IF NOT EXISTS idx_missions_activity_photo_next_due_at ON missions(activity_photo_next_due_at) WHERE activity_photo_next_due_at IS NOT NULL;                   -- missions.js:3833, cron */5
+    -- I8g stale_notified_at — VOLONTAIREMENT PAS D'INDEX. Le §2 le liste avec les 6 ci-dessus,
+    -- mais son unique consommateur (cron missions périmées, index.js:1541) filtre « stale_
+    -- notified_at IS NULL » — sentinelle « pas encore notifié », même motif que candidature_
+    -- whatsapp_sent_at. C'est l'exact opposé d'un index partiel WHERE … IS NOT NULL, qui
+    -- indexerait précisément les lignes que la requête EXCLUT. Un partiel WHERE … IS NULL serait
+    -- lui non sélectif (quasi tout le backlog pending est à NULL). Polarité inversée dans le
+    -- rapport source : signalée, non implémentée (aucun consommateur ne lit cette colonne en
+    -- IS NOT NULL).
+
+    -- I9 (MOYEN) — filtre fonctionnel DATE(scheduled_at AT TIME ZONE 'Africa/Casablanca') des
+    -- crons J-1 : présence Œil 20h (index.js:520), rappel client 20h (index.js:580), récap admin
+    -- 22h (index.js:652) — les 3 prédicats sont mot pour mot « DATE(m.scheduled_at AT TIME ZONE
+    -- 'Africa/Casablanca') = $1 ». L'expression de l'index est donc écrite à l'identique.
+    -- Index d'expression VIABLE (le prompt demandait de le vérifier avant pose) : scheduled_at
+    -- est TIMESTAMPTZ → « AT TIME ZONE 'Africa/Casablanca' » se lie à timezone(text, timestamptz),
+    -- IMMUTABLE depuis PG 8.0 (provolatile='i' vérifié sur le PG 18.2 local) — pas de cast STABLE
+    -- dans la chaîne, contrairement à DATE(timestamptz) direct. CREATE INDEX accepté, planifi-
+    -- cateur confirmé sur base réelle ET synthétique (Index/Bitmap Scan, 117 ms → 1,5 ms à 100k).
+    CREATE INDEX IF NOT EXISTS idx_missions_scheduled_at_casablanca_date ON missions ((DATE(scheduled_at AT TIME ZONE 'Africa/Casablanca')));
   `);
   console.log('✅ PostgreSQL schema ready');
 }
