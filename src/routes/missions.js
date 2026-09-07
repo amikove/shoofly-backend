@@ -23,6 +23,7 @@ const { isValidSubcategory, getSubcategoryMinPrice } = require('../constants/mis
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
 const { checkCashCommissionBalance, settleCashCommission } = require('../utils/cashCommission');
 const { generateUniqueReference } = require('../utils/ticketReference');
+const { parsePagination } = require('../utils/pagination');
 
 
 async function getCommissionRate(db) {
@@ -767,8 +768,8 @@ router.post('/:id/seen', authenticate, asyncHandler(async (req, res) => {
 // ── GET /missions ──────────────────────────────────────────
 router.get('/', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
-  const { status, type, mode, search, page = 1, limit = 20, sort = 'created_desc' } = req.query;
-  const offset = (page - 1) * limit;
+  const { status, type, mode, search, sort = 'created_desc' } = req.query;
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
   const ORDER = {
       created_desc:   'm.created_at DESC',
@@ -4450,8 +4451,8 @@ router.post('/:id/report-problem', authenticate, asyncHandler(async (req, res) =
 // ── GET /missions/admin/problems — admin liste les tickets ──
 router.get('/admin/problems', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
       const db = getDb();
-      const { status = 'open', page = 1, limit = 20, type, city, reporter_role, sort } = req.query;
-      const offset = (page - 1) * limit;
+      const { status = 'open', type, city, reporter_role, sort } = req.query;
+      const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
       let where = ['r.status=$1'], params = [status];
       let p = 2;

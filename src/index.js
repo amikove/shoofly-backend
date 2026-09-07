@@ -260,6 +260,13 @@ app.use((err, req, res, next) => {
   console.error('❌', err.message);
   if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Fichier trop volumineux (max 10MB)' });
   if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Requête trop volumineuse' });
+  // Pagination invalide (`page`/`limit` non entiers/négatifs/hors bornes) — root cause du
+  // Constat #3, corrigée à la source par utils/pagination.js. Message fixe rédigé côté
+  // serveur (aucune entrée cliente réinjectée), sûr à renvoyer tel quel en production —
+  // d'où le court-circuit ici plutôt que le repli générique « Une erreur est survenue ».
+  if (err.name === 'PaginationError') {
+    return res.status(400).json({ error: err.message });
+  }
   // Filet type/plage (audit 06/09, rapport sécurité Constat #2 & #3) — une valeur cliente
   // incompatible avec la colonne cible qui a malgré tout atteint Postgres : SQLSTATE classe 22
   // « data exception » — 22P02 (syntaxe invalide, ex. entier « hello »), 22003 (hors limites,

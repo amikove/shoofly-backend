@@ -7,6 +7,7 @@ const { VALID_CATEGORIES, URGENT_CATEGORY, SURVEILLANCE_CATEGORIES } = require('
 const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
 const { generateUniqueReference } = require('../utils/ticketReference');
+const { parsePagination } = require('../utils/pagination');
 
 async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null) {
   const r = await db.query(
@@ -85,8 +86,7 @@ router.post('/', authenticate, requireRole('client', 'oeil'), asyncHandler(async
 // ── GET /tickets/mine — liste des tickets de l'utilisateur connecté ──
 router.get('/mine', authenticate, requireRole('client', 'oeil'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { page = 1, limit = 20 } = req.query;
-  const offset = (page - 1) * limit;
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
   const { rows } = await db.query(
     `SELECT * FROM support_tickets WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
@@ -103,8 +103,8 @@ router.get('/mine', authenticate, requireRole('client', 'oeil'), asyncHandler(as
 // Déclarée avant /:id pour éviter que "admin" soit interprété comme un id de ticket.
 router.get('/admin/all', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { status, category, is_urgent, page = 1, limit = 20 } = req.query;
-  const offset = (page - 1) * limit;
+  const { status, category, is_urgent } = req.query;
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
   const where = [];
   const params = [];
