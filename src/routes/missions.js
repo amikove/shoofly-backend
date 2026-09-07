@@ -1660,9 +1660,11 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   // Délai de grâce dépassé : la mission continue de se charger normalement (titre/statut/
   // prix/note/rapport...) mais messages/media sont renvoyés vides pour client/Œil — admin
   // (MessagesSuspects.jsx, via ce même ChatModal.jsx partagé) toujours exempté, accès
-  // illimité. report/rating restent hors de cette règle : ce ne sont pas des artefacts du
-  // CHAT (mission_reports = rapport d'audit de l'Œil, ratings = note du client), aucun
-  // rapport avec la conversation ou les photos qu'elle contient.
+  // illimité. report/rating restent hors de CETTE règle-ci (le délai de grâce) : ce ne sont
+  // pas des artefacts du CHAT (mission_reports = rapport d'audit de l'Œil, ratings = note du
+  // client), aucun rapport avec la conversation ou les photos — un membre dont la grâce chat
+  // a expiré garde donc l'accès au rapport. Ils restent en revanche soumis au contrôle
+  // d'APPARTENANCE (canSeeChat, plus bas) : cf. leur récupération conditionnelle.
   const isAdmin = req.user.role === 'admin';
   const chatGraceExpired = !isAdmin && mission.chat_access_expires_at !== null
     && Date.now() > new Date(mission.chat_access_expires_at).getTime();
@@ -1695,10 +1697,24 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
     mission.address = null;
   }
 
-  const [{ rows: [report] }, { rows: [rating] }] = await Promise.all([
-    db.query('SELECT * FROM mission_reports WHERE mission_id=$1', [req.params.id]),
-    db.query('SELECT * FROM ratings WHERE mission_id=$1', [req.params.id]),
-  ]);
+  // report = livrable d'audit de l'Œil (summary/score/notes/risk_points), rating = note libre
+  // du client : même cercle d'appartenance que le chat (client-propriétaire, Œil ACTUELLEMENT
+  // assigné, admin), PAS le délai de grâce — un membre dont la grâce a expiré garde l'accès.
+  // Une mission repassée en 'pending' (urgence, refus, expiration de présence, suspension,
+  // blocage anti-fraude) met TOUJOURS oeil_id à NULL sans purger le mission_reports du
+  // collègue précédent : sans ce garde, tout Œil énumérant le pool 'pending' via GET /:id
+  // (non filtré par ville) lisait ce rapport (Constat #1, rapport robustesse & sécurité API
+  // 2026-09-06). Aligne cette route sur GET /api/reports/:id, déjà gardé de la même façon.
+  let report = null;
+  let rating = null;
+  if (canSeeChat) {
+    const [reportRes, ratingRes] = await Promise.all([
+      db.query('SELECT * FROM mission_reports WHERE mission_id=$1', [req.params.id]),
+      db.query('SELECT * FROM ratings WHERE mission_id=$1', [req.params.id]),
+    ]);
+    report = reportRes.rows[0] || null;
+    rating = ratingRes.rows[0] || null;
+  }
 
   let media = [];
   let messages = [];
