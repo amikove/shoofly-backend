@@ -3277,6 +3277,14 @@ router.post('/:id/confirm-presence', authenticate, requireRole('oeil'), asyncHan
      WHERE id=$1 AND oeil_id=$2 RETURNING presence_confirmed_at`,
     [mission.id, req.user.id]
   );
+  // Le contrôle oeil_id ci-dessus est un snapshot : checkPresenceConfirmationDeadlines peut
+  // avoir réattribué la mission (oeil_id → NULL) entre ce SELECT et cet UPDATE → 0 ligne
+  // touchée, `updated` undefined. Avant : TypeError 500 sur la ligne suivante. Désormais 409
+  // propre — versant « échec propre du perdant » de l'audit CHAOS F2 (le versant « le cron ne
+  // retire plus une mission déjà confirmée » est géré dans le cron lui-même, plus haut).
+  if (!updated) {
+    return res.status(409).json({ error: "Vous n'êtes plus l'Œil assigné à cette mission." });
+  }
 
   if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, presence_confirmed_at: updated.presence_confirmed_at });
 
@@ -3612,7 +3620,14 @@ async function checkTransferDeadlines(db, io, emitToUser) {
     WHERE status='pending' AND is_priority=true
     AND transfer_deadline IS NOT NULL
     AND transfer_deadline < NOW()
+    AND batch_tiebreak_ends_at IS NULL
   `);
+  // batch_tiebreak_ends_at IS NULL : un candidat a confirmé sa disponibilité (POST /:id/
+  // candidate-confirm a ouvert la fenêtre de départage) → cette mission appartient désormais au
+  // cron cascade */2min (index.js), qui l'assignera au meilleur confirmé ou remettra
+  // batch_tiebreak_ends_at à NULL si aucun ne l'est plus (auquel cas ce SELECT la reprendra).
+  // OPTIMISATION seulement (réduit les tentatives inutiles) — la vraie protection anti-course
+  // est la garde atomique dans l'UPDATE ci-dessous, pas ce filtre de snapshot (audit CHAOS F1).
 
   for (const mission of expired) {
     // Isolation par itération (O-BE-2) : un crash sur CETTE mission ne doit jamais abandonner
@@ -3648,6 +3663,26 @@ async function checkTransferDeadlines(db, io, emitToUser) {
     let txResult;
     try {
       txResult = await walletService.withTransaction(db, async (client) => {
+        // Garde atomique de l'invariant "aucun candidat n'a confirmé" (batch_tiebreak_ends_at
+        // IS NULL), reportée ICI sur un UPDATE verrouillant tenu jusqu'au commit — même patron
+        // que POST /:id/claim (CONSTAT 11) : transitionMission.extraGuards ne sait pas exprimer
+        // une garde IS NULL (col=NULL ne matche jamais en SQL, voir missionStateMachine.js), et
+        // ce module générique à ~15 appelants n'est délibérément pas étendu pour ça. Le filtre
+        // batch_tiebreak_ends_at IS NULL du SELECT plus haut ne suffit pas : POST /:id/candidate-
+        // confirm (qui ne touche NI status NI is_priority NI transfer_deadline) peut tomber entre
+        // ce SELECT et cet UPDATE → sans cette garde, la mission était annulée + le client
+        // remboursé alors qu'un remplaçant venait de se porter volontaire (audit CHAOS F1, 15/15).
+        // updated_at réécrit juste après par transitionMission : cet UPDATE ne sert qu'à
+        // (re)tester l'invariant atomiquement ET poser le row-lock le temps de la transition.
+        const { rowCount: stillEligible } = await client.query(
+          `UPDATE missions SET updated_at=NOW()
+           WHERE id=$1 AND status='pending' AND is_priority=true AND batch_tiebreak_ends_at IS NULL`,
+          [mission.id]
+        );
+        if (stillEligible === 0) {
+          throw new MissionTransitionError('STALE_STATE', 'Un candidat a confirmé sa disponibilité entre-temps — annulation abandonnée.');
+        }
+
         await transitionMission(client, mission.id, 'pending', 'cancelled', null, {
           extraFields: { cancelled_at: 'NOW()', cancel_reason: 'Aucun remplaçant trouvé avant expiration du délai', is_priority: false, transfer_deadline: null },
           extraGuards: { is_priority: true },
@@ -3814,27 +3849,48 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
 
     let updated;
     try {
-      updated = await transitionMission(db, mission.id, 'assigned', 'pending', null, {
-        extraFields: {
-          is_priority: true,
-          transfer_type: 'before',
-          transferred_from: oeilId,
-          transfer_reason: 'Confirmation de présence non reçue avant expiration du délai',
-          transfer_deadline: deadline,
-          transfer_no_penalty: true,
-          oeil_id: null,
-          presence_confirmed_at: null,
-          presence_confirmation_requested_at: null,
-          presence_confirmation_deadline_at: null,
-          batch_wave_count: 0,
-          transfer_h30_no_show: false,
-        },
-        extraGuards: { oeil_id: oeilId },
-        note: 'Réattribution automatique — confirmation de présence non reçue à temps',
+      // Pré-verrou + garde atomique de l'invariant que le SELECT amont a vérifié
+      // (presence_confirmed_at IS NULL), reportée ICI sur un UPDATE tenu jusqu'au commit — même
+      // patron que POST /:id/claim (CONSTAT 11). transitionMission.extraGuards ne sait pas
+      // exprimer une garde IS NULL (col=NULL ne matche jamais en SQL, voir missionStateMachine.js)
+      // et ce module générique n'est délibérément pas étendu pour ça. Sans cette garde, une
+      // confirmation tombant entre le SELECT et l'UPDATE de la transition (POST /:id/confirm-
+      // presence, qui ne change NI status NI oeil_id) passait inaperçue → l'Œil « confirmait à
+      // temps » (200) et perdait quand même la mission, avec une notif qui le contredit (CHAOS F2).
+      // Transaction courte {pré-verrou + transition} uniquement : cascade / notify / WhatsApp
+      // restent APRÈS commit, hors transaction (règle projet). updated_at est de toute façon
+      // réécrit par transitionMission.
+      updated = await walletService.withTransaction(db, async (client) => {
+        const { rowCount: stillUnconfirmed } = await client.query(
+          `UPDATE missions SET updated_at=NOW()
+           WHERE id=$1 AND status='assigned' AND oeil_id=$2 AND presence_confirmed_at IS NULL`,
+          [mission.id, oeilId]
+        );
+        if (stillUnconfirmed === 0) {
+          throw new MissionTransitionError('STALE_STATE', 'Présence confirmée entre-temps — réattribution abandonnée.');
+        }
+        return await transitionMission(client, mission.id, 'assigned', 'pending', null, {
+          extraFields: {
+            is_priority: true,
+            transfer_type: 'before',
+            transferred_from: oeilId,
+            transfer_reason: 'Confirmation de présence non reçue avant expiration du délai',
+            transfer_deadline: deadline,
+            transfer_no_penalty: true,
+            oeil_id: null,
+            presence_confirmed_at: null,
+            presence_confirmation_requested_at: null,
+            presence_confirmation_deadline_at: null,
+            batch_wave_count: 0,
+            transfer_h30_no_show: false,
+          },
+          extraGuards: { oeil_id: oeilId },
+          note: 'Réattribution automatique — confirmation de présence non reçue à temps',
+        });
       });
     } catch (e) {
       if (e instanceof MissionTransitionError) {
-        console.log(`ℹ️ checkPresenceConfirmationDeadlines: mission ${mission.id} ignorée, statut déjà changé entre-temps`);
+        console.log(`ℹ️ checkPresenceConfirmationDeadlines: mission ${mission.id} ignorée, statut ou présence déjà changé entre-temps`);
         continue;
       }
       throw e;
@@ -4310,7 +4366,28 @@ router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), asyncHa
   // Les deux écritures (confirmation + éventuelle ouverture de la fenêtre de départage)
   // forment un seul événement logique — transaction pour éviter qu'un crash entre les deux
   // laisse une confirmation enregistrée sans jamais ouvrir la fenêtre qui la traite.
-  const { confirmedAt, batchTiebreakEndsAt } = await walletService.withTransaction(db, async (client) => {
+  let confirmedAt, batchTiebreakEndsAt;
+  try {
+    ({ confirmedAt, batchTiebreakEndsAt } = await walletService.withTransaction(db, async (client) => {
+    // Verrou + re-vérification atomique : les `if` sur mission.status ci-dessus ne sont qu'un
+    // snapshot. Autre versant de l'audit CHAOS F1 (checkTransferDeadlines gardé côté cron) : le
+    // cron peut annuler la mission entre ce SELECT snapshot et les UPDATE ci-dessous — sans ce
+    // FOR UPDATE, la confirmation + batch_tiebreak_ends_at étaient écrits sur une mission déjà
+    // 'cancelled' (candidat crédité d'un 200 trompeur, batch_tiebreak_ends_at orphelin). Le
+    // verrou sérialise avec le pré-verrou de checkTransferDeadlines : soit ce bloc gagne (le
+    // cron voit ensuite batch_tiebreak_ends_at NOT NULL et saute), soit le cron gagne (ce SELECT
+    // voit alors 'cancelled'/réassignée et on sort en 409).
+    const { rows: [mLock] } = await client.query(
+      `SELECT status, oeil_id FROM missions WHERE id=$1 FOR UPDATE`,
+      [mission.id]
+    );
+    if (!mLock || mLock.status !== 'pending' || mLock.oeil_id) {
+      const err = new Error(mLock && mLock.status === 'cancelled'
+        ? 'Cette mission a été annulée.'
+        : 'Cette mission a déjà été attribuée à un autre Œil.');
+      err.code = 'MISSION_UNAVAILABLE';
+      throw err;
+    }
     const { rows: [ci] } = await client.query(
       `UPDATE mission_interests SET confirmed_at=NOW() WHERE mission_id=$1 AND oeil_id=$2 RETURNING confirmed_at`,
       [mission.id, req.user.id]
@@ -4327,7 +4404,11 @@ router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), asyncHa
       batchTiebreakEndsAt = m2.batch_tiebreak_ends_at;
     }
     return { confirmedAt: ci.confirmed_at, batchTiebreakEndsAt };
-  });
+    }));
+  } catch (e) {
+    if (e.code === 'MISSION_UNAVAILABLE') return res.status(409).json({ error: e.message });
+    throw e;
+  }
 
   if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, batch_tiebreak_ends_at: batchTiebreakEndsAt });
 
