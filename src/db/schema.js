@@ -17,7 +17,27 @@ function getDb() {
       // coïncident (contre ~22 à la minute :00 auparavant), en plus du trafic HTTP/WebSocket qui
       // partage le même pool (audit perf 2026-07-26). max laissé à 15 : l'étalement a réduit la
       // demande de pointe des crons, 15 reste confortable, aucun re-dimensionnement requis.
+      // NB perf 2026-09-07 (P2) : le rapport Performance recommande de RÉÉVALUER `max` en fonction
+      // de la limite de connexions du plan Postgres Render réel (dashboard Render → Metrics),
+      // information hors de portée d'une session Claude Code — laissé à 15, à ajuster côté opérateur.
       max: 15,
+      // P2 (audit Performance 2026-09-07) — garde-fou contre la saturation du pool. Sans limite,
+      // une requête « folle » (plan qui dérape, attente de verrou, réplica coincé) monopolise sa
+      // connexion indéfiniment ; quelques-unes suffisent à remplir le pool (max 15) et TOUTE autre
+      // requête, même triviale, tombe alors en 500 après connectionTimeoutMillis (564 timeouts
+      // observés sous charge dans l'audit). 15 s = le timeout que le frontend s'impose déjà (axios
+      // `timeout: 15000`, shoofly-react/src/api/client.js) : au-delà, la requête HTTP est de toute
+      // façon abandonnée côté navigateur — Postgres cesse alors de brûler une connexion pour une
+      // réponse que plus personne n'attend. Marge vérifiée EXPLAIN sur jeu 100k APRÈS les index
+      // P1/P4 de ce chantier : requête légitime la plus lourde ≈ 640 ms (admin ?search=), dashboards
+      // admin < 200 ms/requête → ~4× à 75× de marge même avec la pénalité CPU « ×2-5 » d'un plan
+      // Render partagé (rapport §6). IMPORTANT : ce timeout et les index P1/P4 doivent partir dans
+      // LE MÊME déploiement — sur le schéma actuel (sans index) l'audit a mesuré un ordre à 5058 ms
+      // sous contention, qu'une pénalité Render ×3 pousserait vers 15 s. statement_timeout (côté
+      // serveur : Postgres annule et rend la main, SQLSTATE 57014) et non query_timeout (minuteur
+      // client qui n'annule pas la requête serveur). Aucun statement_timeout n'existait avant
+      // (tracé : seul `SET LOCAL app.wallet_write_allowed` dans walletService, sans rapport).
+      statement_timeout: 15000,
     });
     // pg émet 'error' sur le POOL quand un client INACTIF (au repos dans le pool, hors de toute
     // requête) tombe : coupure réseau, redémarrage ou timeout côté Postgres, RST TCP. Sans
@@ -49,6 +69,14 @@ async function checkDbConnection(db = getDb(), timeoutMs = 5000) {
 async function initDb() {
   const db = getDb();
   await db.query(`
+    -- Le pool impose statement_timeout=15s (P2, voir getDb ci-dessus). Ce bloc DDL est UNE seule
+    -- requête simple multi-instructions → Postgres l'exécute dans une transaction implicite, donc
+    -- SET LOCAL y a un effet et se réinitialise seul au COMMIT implicite (vérifié). On le neutralise
+    -- ici : au démarrage sur une base déjà volumineuse, créer/valider un index ou une contrainte
+    -- NOT VALID→VALIDATE peut légitimement dépasser 15 s, et un boot qui n'arrive pas à poser son
+    -- schéma est bien pire qu'une requête runtime lente. Runtime : inchangé (SET LOCAL ne fuit pas).
+    SET LOCAL statement_timeout = 0;
+
     CREATE TABLE IF NOT EXISTS users (
       id          TEXT PRIMARY KEY,
       email       TEXT UNIQUE NOT NULL,
@@ -1359,6 +1387,81 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- dans la chaîne, contrairement à DATE(timestamptz) direct. CREATE INDEX accepté, planifi-
     -- cateur confirmé sur base réelle ET synthétique (Index/Bitmap Scan, 117 ms → 1,5 ms à 100k).
     CREATE INDEX IF NOT EXISTS idx_missions_scheduled_at_casablanca_date ON missions ((DATE(scheduled_at AT TIME ZONE 'Africa/Casablanca')));
+
+    -- ═══ Index de performance — audit Performance 2026-09-07 (P1 GET /missions, P4 dashboards) ══
+    -- Source : rapport-audit-performance-2026-09-07, §2.3 (P1) et §5 (P4). Correctif : rapport-
+    -- prompt-A-performance-backend-2026-09-07. Lancé APRÈS Prompt C (F1/F2 TOCTOU, commit 8ec8451,
+    -- routes/missions.js). Même méthodologie que le Groupe 2 (06/09) : EXPLAIN ANALYZE avant/après
+    -- sur jeu synthétique 100k lignes (mêmes volumes que le rapport Perf §1), adoption planificateur
+    -- confirmée requête par requête. AJOUT PUREMENT ADDITIF — CREATE INDEX IF NOT EXISTS idempotent,
+    -- aucune requête ne change de sémantique, seul le plan change. 8 noms vérifiés contre les ~48
+    -- index déjà déclarés ci-dessus (0 doublon, 0 recouvrement). Pas de CONCURRENTLY (interdit dans
+    -- le bloc implicite de initDb, inutile au volume pré-lancement — même convention que tout le
+    -- fichier ; sur une table déjà volumineuse, un CREATE INDEX CONCURRENTLY manuel hors-bande rend
+    -- la ligne no-op grâce au IF NOT EXISTS).
+
+    -- ── P4 — colonnes date filtrées par BETWEEN dans les dashboards admin (routes/users.js) ──
+    -- dashboard/oeils : délai moyen d'assignation (missions.created_at, users.js:868), classement
+    -- (missions.completed_at, users.js:911), trop d'annulations (missions.updated_at, users.js:924),
+    -- taux d'acceptation (mission_interests.created_at, users.js:863), retards fréquents
+    -- (reliability_events.created_at, users.js:938). Gain fonction de l'étroitesse de la plage :
+    -- le filtre par défaut du frontend est « Ce mois » (components/dashboard/DateRangeFilter.jsx,
+    -- getPresetRange('month') ; presets = aujourd'hui/hier/semaine/mois/personnalisé — aucun preset
+    -- « année ») → au plus ~31 jours, souvent bien moins → l'index est adopté et fait chuter le
+    -- temps (mesuré 100k, plage « ce mois » : P4.2 130→4,6 ms ; P4.3 165→17 ms ; P4.5 66→3,3 ms).
+    -- Sur une plage ≈ 1 an (≈ toute la table) le planificateur garde un Seq Scan : c'est correct,
+    -- l'index n'est simplement pas rentable à ce moment-là (aucune régression mesurée sur ce cas).
+    -- Index simples (pas de partiel) : created_at/updated_at sont NOT NULL ; completed_at est
+    -- nullable mais un partiel WHERE … IS NOT NULL n'économise ~rien (58 % des missions sont
+    -- complétées) et dévierait de la forme « colonne date simple » du rapport. idx_missions_
+    -- created_at sert AUSSI le tri par défaut created_desc/created_asc de GET /api/missions.
+    -- (reliability_events.reason ILIKE '%heure%' de P4.5 : NON transformé en flag — voir le
+    --  rapport §P4 ; l'index date seul suffit, une refonte de la taxonomie reason est un chantier
+    --  dédié avec migration de données.)
+    CREATE INDEX IF NOT EXISTS idx_missions_created_at           ON missions(created_at);
+    CREATE INDEX IF NOT EXISTS idx_missions_completed_at         ON missions(completed_at);
+    CREATE INDEX IF NOT EXISTS idx_missions_updated_at           ON missions(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_mission_interests_created_at  ON mission_interests(created_at);
+    CREATE INDEX IF NOT EXISTS idx_reliability_events_created_at ON reliability_events(created_at);
+
+    -- ── P1 (c) — colonnes de tri de GET /api/missions sans index (routes/missions.js:774-791) ──
+    -- ORDER BY réellement proposé par l'UI : admin/Missions.jsx (sortBy ∈ title|client|oeil|price|
+    -- status|scheduled|deadline × asc|desc) ; oeil/Missions.jsx onglet « disponibles » + oeil/
+    -- Dashboard.jsx : sort=scheduled_asc fixe. Déjà couverts : created_at (idx_missions_created_at
+    -- ci-dessus), status (idx_missions_status). Ajout de price, scheduled_at, title — adoption
+    -- vérifiée EXPLAIN (admin, LIMIT 20, sans WHERE) : Index Scan → Limit, ~1-3 ms contre 500-700 ms
+    -- de Seq Scan+Sort avant (G admin par défaut 580→5 ms ; L tri titre 714→8 ms).
+    --   • scheduled_at : btree = ASC NULLS LAST → sert scheduled_asc directement (2,6 ms). Le cas
+    --     scheduled_desc (DESC NULLS LAST) NE peut pas utiliser ce btree en parcours arrière
+    --     (NULLS FIRST) → reste un top-N heapsort (~386 ms, LIMIT 20, admin, clic rare) : résiduel
+    --     accepté, PAS de 2ᵉ index miroir DESC pour un tri de confort admin peu fréquent.
+    --   • price : sert price_asc ET price_desc (Index Scan / Index Scan Backward, ~1,5 ms).
+    --   • title : cap API 200 caractères (missions.js:1003) ≪ limite btree. Sert title_asc/desc.
+    --   • deadline_asc : l'onglet admin « priorité » envoie toujours status=pending → le plan
+    --     utilise idx_missions_status puis top-N (~76 ms, inchangé) ; pas d'index dédié.
+    --   • client_*/oeil_* : tri sur users joint — un index users(first_name,last_name) n'éviterait
+    --     pas le Sort du plan dominant (admin non filtré = jointure 100k avant tri). Non ajouté.
+    CREATE INDEX IF NOT EXISTS idx_missions_price        ON missions(price);
+    CREATE INDEX IF NOT EXISTS idx_missions_scheduled_at ON missions(scheduled_at);
+    CREATE INDEX IF NOT EXISTS idx_missions_title        ON missions(title);
+
+    -- ── P1 (d) — recherche texte libre de GET /api/missions (admin ?search=) : PAS D'INDEX ──────
+    -- ARRÊT SIGNALÉ (règle commune : ne pas forcer un correctif qui ne tient pas). Le WHERE de
+    -- recherche (missions.js:840-850) est un OR sur 4 cibles réparties sur 3 tables :
+    --   m.id::text ILIKE $ OR m.title ILIKE $ OR (c.first_name||' '||c.last_name) ILIKE $
+    --   OR (o.first_name||' '||o.last_name) ILIKE $        (c, o = users joints)
+    -- PostgreSQL ne peut PAS faire de BitmapOr d'index quand les disjonctions portent sur des
+    -- relations différentes → l'évaluation se fait forcément en filtre post-jointure, donc Seq Scan
+    -- de la jointure, quel que soit l'index posé. Vérifié EXPLAIN : des index GIN pg_trgm sur
+    -- missions(title), missions(id) et users((first_name||' '||last_name)) NE SONT JAMAIS retenus
+    -- pour cette requête (0 changement de plan, ni sur terme fréquent ni sur terme rare). Les
+    -- accélérer exigerait soit une réécriture de la LOGIQUE de recherche (décomposer le OR
+    -- inter-tables en sous-requêtes/UNION par table — hors périmètre : « sans changer la logique »),
+    -- soit une dénormalisation de client_name/oeil_name sur missions (schéma + write-path —
+    -- chantier dédié). Mitigation indirecte réellement obtenue : idx_missions_price ci-dessus
+    -- ramène le pire cas documenté (?search=X&sort=price_desc) de ~760 ms à ~5 ms QUAND le terme
+    -- ramène assez de lignes (Index Scan Backward price + arrêt anticipé au LIMIT) ; un terme rare
+    -- ou sans résultat reste un Seq Scan ~300-400 ms. Détail et options dans le rapport §P1(d).
   `);
   console.log('✅ PostgreSQL schema ready');
 }
