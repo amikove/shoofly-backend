@@ -5,6 +5,7 @@ const { requirePermission } = require('../middleware/permissions');
 const { getReliabilityLevel, reactivateWithCorrectiveEvent } = require('../utils/reliabilityScore');
 const { getSetting } = require('../utils/settings');
 const asyncHandler = require('../middleware/asyncHandler');
+const { parsePagination } = require('../utils/pagination');
 
 const DEFAULT_REACTIVATION_SCORE = 70; // score appliqué à une réintégration si l'admin n'en précise pas un autre (repli si settings.reactivation_default_score absent)
 
@@ -201,8 +202,8 @@ router.get('/admin/suspended', authenticate, requireRole('admin'), requirePermis
 // ── GET /reliability/admin/all-scores — tous les Œils avec leur score, triable + paginé ──
 router.get('/admin/all-scores', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { city, quartier, page = 1, limit = 20, sort = 'score_asc' } = req.query;
-  const offset = (page - 1) * limit;
+  const { city, quartier, sort = 'score_asc' } = req.query;
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
   const SORT_MAP = {
     score_asc:  'reliability_score ASC',

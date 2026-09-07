@@ -17,6 +17,7 @@ const { isWithinSchedule } = require('../utils/schedule');
 const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
 const { validateSettingValue } = require('../config/settingValidators');
 const asyncHandler = require('../middleware/asyncHandler');
+const { parsePagination } = require('../utils/pagination');
 // Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
 // de dupliquer la logique de sélection de candidat pour le cas "Œil désactivé avec mission active".
 const missionRoutes = require('./missions');
@@ -75,8 +76,8 @@ const uploadAvatar = multer({
 // ── Oeils publics ──────────────────────────────────────────
 router.get('/oeils', authenticate, asyncHandler(async (req, res) => {
     const db = getDb();
-    const { city, available, search, page = 1, limit = 100 } = req.query;
-    const offset = (page - 1) * limit;
+    const { city, available, search } = req.query;
+    const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 100 });
     let where = ["u.role='oeil'", "p.is_verified=true"], params = [], p = 1;
     if (city)          { where.push(`u.city ILIKE $${p++}`); params.push(`%${city}%`); }
     if (search) { where.push(`(u.first_name ILIKE $${p} OR u.last_name ILIKE $${p} OR u.city ILIKE $${p})`); params.push(`%${search}%`); p++; }
@@ -307,8 +308,8 @@ router.get('/admin/all', authenticate, requireRole('admin'), asyncHandler(async 
 router.get('/admin/profile/:userId', authenticate, requireRole('admin'), requirePermission('users'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { userId } = req.params;
-  const { page = 1, limit = 20, date_from, date_to } = req.query;
-  const offset = (page - 1) * limit;
+  const { date_from, date_to } = req.query;
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
   const { rows: [user] } = await db.query(`
     SELECT id, role, first_name, last_name, email, phone, city, quartier, birth_date,
@@ -1769,8 +1770,8 @@ const {
 // aucune permission distincte à inventer pour une simple lecture de son historique.
 router.get('/admin/settings/history', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { setting_key, page = 1, limit = 20 } = req.query;
-  const offset = (page - 1) * limit;
+  const { setting_key } = req.query;
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
   let where = [], params = [], p = 1;
   if (setting_key) { where.push(`sh.setting_key=$${p++}`); params.push(setting_key); }
@@ -2136,8 +2137,8 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), require
 // que GET /tickets/admin/all ──
 router.get('/admin/whatsapp-failures', authenticate, requireRole('admin'), requirePermission('audit'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { status = 'unresolved', page = 1, limit = 20 } = req.query;
-  const offset = (page - 1) * limit;
+  const { status = 'unresolved' } = req.query;
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
   let wc = '';
   if (status === 'unresolved') wc = 'WHERE resolved_at IS NULL';
@@ -2160,8 +2161,8 @@ router.get('/admin/whatsapp-failures', authenticate, requireRole('admin'), requi
 // PUT /admin/claims/:missionId/resolve ──
 router.get('/admin/wallet-reconciliation-alerts', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { status = 'unresolved', page = 1, limit = 20 } = req.query;
-  const offset = (page - 1) * limit;
+  const { status = 'unresolved' } = req.query;
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
   let wc = '';
   if (status === 'unresolved') wc = 'WHERE resolved_at IS NULL';
@@ -2202,8 +2203,8 @@ router.put('/admin/wallet-reconciliation-alerts/:id/resolve', authenticate, requ
 // 'finance' (même bucket que la réconciliation wallet et les réclamations) : donnée financière.
 router.get('/admin/commission-shortfalls', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { status = 'unresolved', page = 1, limit = 20 } = req.query;
-  const offset = (page - 1) * limit;
+  const { status = 'unresolved' } = req.query;
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20 });
 
   let wc = '';
   if (status === 'unresolved') wc = 'WHERE s.resolved_at IS NULL';
