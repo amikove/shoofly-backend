@@ -1,5 +1,7 @@
 require('dotenv').config();
-const bcrypt = require('bcryptjs');
+// Aligné sur src/routes/auth.js : même librairie de hachage pour que les comptes seedés se
+// connectent via /login. Script CLI hors serveur → hashSync accepté (aucune boucle à bloquer).
+const bcrypt = require('@node-rs/bcrypt');
 const { v4: uuidv4 } = require('uuid');
 const { initDb, getDb } = require('./schema');
 

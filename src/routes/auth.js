@@ -1,5 +1,11 @@
 const router = require('express').Router();
-const bcrypt = require('bcryptjs');
+// @node-rs/bcrypt (Rust + N-API, binaires précompilés) remplace bcryptjs : threadpool natif,
+// donc `await bcrypt.hash` / `await bcrypt.compare` libèrent réellement la boucle d'événements
+// pendant le hachage (bcryptjs, 100 % JS, la bloquait quel que soit sync/async — cf. rapport
+// chantier bcrypt P3). API identique ici : mêmes noms `hash(pw, rounds)` / `compare(pw, hash)`,
+// même ordre d'arguments. Vérifie sans surcoût les hachages `$2a$` déjà en base (compat croisée
+// prouvée) ; écrit désormais du `$2b$`.
+const bcrypt = require('@node-rs/bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
@@ -70,12 +76,13 @@ router.post('/register', [
     }
 
     const id = uuidv4();
+    const passwordHash = await bcrypt.hash(password, 10);
     const { rows: [user] } = await db.query(
     `INSERT INTO users (id,email,password,role,first_name,last_name,phone,city,quartier,
       birth_date,profil,usage_reason,usage_frequency,villes_cibles,situation,disponibilite,motivation,
       acquisition_source,acquisition_medium,acquisition_campaign)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`,
-    [id, email, bcrypt.hashSync(password, 10), role, first_name, last_name,
+    [id, email, passwordHash, role, first_name, last_name,
      phone||null, canonicalCity, canonicalQuartier, birth_date||null,
      profil||null, usage_reason||null, usage_frequency||null, villes_cibles||null,
      situation||null, disponibilite||null, motivation||null,
@@ -103,7 +110,7 @@ router.post('/login', [
 
       const db = getDb();
       const { rows: [user] } = await db.query('SELECT * FROM users WHERE email=$1', [req.body.email]);
-      if (!user || !bcrypt.compareSync(req.body.password, user.password))
+      if (!user || !(await bcrypt.compare(req.body.password, user.password)))
         return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
       if (!user.is_active) return res.status(403).json({ error: 'Compte suspendu' });
 
@@ -205,7 +212,7 @@ router.put('/password', authenticate, [
   // Aligné sur /register et /reset-password (mêmes contraintes sur un mot de passe) : sans ce
   // garde, new_password:"" produisait un hash de chaîne vide écrit en base (compte verrouillé,
   // /login exigeant password.notEmpty()), et new_password absent/non-string faisait lever
-  // bcrypt.hashSync(undefined, 10) → 500 au lieu d'un 400 propre. isString() d'abord pour que
+  // bcrypt.hash(undefined, 10) → 500 au lieu d'un 400 propre. isString() d'abord pour que
   // l'absence/le mauvais type soit rejetée par le validateur, pas par bcrypt.
   body('new_password').isString().isLength({ min: 6 }),
 ], asyncHandler(async (req, res) => {
@@ -214,9 +221,10 @@ router.put('/password', authenticate, [
 
   const db = getDb();
   const { rows: [user] } = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
-  if (!bcrypt.compareSync(req.body.current_password, user.password))
+  if (!(await bcrypt.compare(req.body.current_password, user.password)))
     return res.status(400).json({ error: 'Mot de passe actuel incorrect' });
-  await db.query('UPDATE users SET password=$1, password_changed_at=NOW() WHERE id=$2', [bcrypt.hashSync(req.body.new_password, 10), req.user.id]);
+  const newPasswordHash = await bcrypt.hash(req.body.new_password, 10);
+  await db.query('UPDATE users SET password=$1, password_changed_at=NOW() WHERE id=$2', [newPasswordHash, req.user.id]);
   res.json({ message: 'Mot de passe modifié' });
 }));
 
@@ -270,6 +278,7 @@ router.post('/reset-password', [
 
   const db = getDb();
   const tokenHash = hashResetToken(req.body.token);
+  const newPasswordHash = await bcrypt.hash(req.body.newPassword, 10);
 
   // UPDATE atomique unique plutôt que SELECT puis UPDATE séparés : le WHERE porte à la fois sur
   // le hash ET l'expiration, et RETURNING id dit si une ligne a réellement matché. Ceci rend la
@@ -285,7 +294,7 @@ router.post('/reset-password', [
        password_reset_expires_at=NULL
      WHERE password_reset_token_hash=$2 AND password_reset_expires_at > NOW()
      RETURNING id`,
-    [bcrypt.hashSync(req.body.newPassword, 10), tokenHash]
+    [newPasswordHash, tokenHash]
   );
 
   if (!user) return res.status(400).json({ error: 'Lien invalide ou expiré. Veuillez refaire une demande de réinitialisation.' });
