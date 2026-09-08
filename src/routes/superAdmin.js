@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const bcrypt = require('bcryptjs');
+const bcrypt = require('@node-rs/bcrypt');
 const { getDb } = require('../db/schema');
 const { authenticate } = require('../middleware/auth');
 const { requireSuperAdmin, ALL_PERMISSIONS, PROFILES } = require('../middleware/permissions');
@@ -37,7 +37,7 @@ router.post('/admins', authenticate, requireSuperAdmin, asyncHandler(async (req,
     finalPermissions = permissions.filter(p => ALL_PERMISSIONS.includes(p));
   }
 
-  const hash = bcrypt.hashSync(password, 12);
+  const hash = await bcrypt.hash(password, 12);
   const { rows: [admin] } = await db.query(
     `INSERT INTO users (id, first_name, last_name, email, password, role, phone, permissions, is_active)
      VALUES (gen_random_uuid(), $1, $2, $3, $4, 'admin', $5, $6, true) RETURNING id, first_name, last_name, email, permissions`,
