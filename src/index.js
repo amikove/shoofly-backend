@@ -78,6 +78,8 @@ const reportRoutes = require('./routes/reports');
 const ticketRoutes = require('./routes/tickets');
 const paymentRoutes = require('./routes/payments');
 const blockAppealRoutes = require('./routes/blockAppeals');
+const pushRoutes = require('./routes/push');
+const { checkPushHealth } = require('./services/push');
 
 // ── CORS — liste blanche unique, source de vérité partagée par Express et Socket.IO ──
 const productionOrigins = ['https://shoofly.ma', 'https://www.shoofly.ma', 'https://shoofly-react.vercel.app'];
@@ -237,6 +239,7 @@ app.use('/api/reports', reportRoutes);
 app.use('/api/tickets', ticketRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/block-appeals', blockAppealRoutes);
+app.use('/api/push', pushRoutes);
 
 app.get('/health', async (_, res) => {
   try {
@@ -509,6 +512,7 @@ initDb().then(() => {
   let cronAssistanceReminderRunning = false;
   let cronCandidatureRelanceRunning = false;
   let cronUnreadEmailFallbackRunning = false;
+  let cronPushHealthRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
   // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
@@ -555,23 +559,17 @@ initDb().then(() => {
         const missionTime = new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
         const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, $2, $3, 'warning', $4, 'mission_view', $5, $6, $7)`,
-          [m.oeil_id,
-           '✅ Confirmez votre présence — mission demain',
-           `Confirmez votre présence pour "${m.title}" prévue demain à ${missionTime}. Vous avez jusqu'à ${deadlineTime} ce soir pour confirmer, sinon nous chercherons un remplaçant.`,
-           m.id,
-           'presenceConfirmationRequestJ1Title',
-           'presenceConfirmationRequestJ1Body',
-           JSON.stringify({ missionTitle: m.title, time: missionTime, deadlineTime })]
+        // Migré vers notify() (chantier push, Phase 1.1) : in-app + socket live (l'emit partiel
+        // devient la ligne complète, deep-link + marquage lu possibles) + canal push. P1 —
+        // l'Œil perd la mission à la deadline s'il ne voit rien (matrice L2). WA inchangé.
+        await notify(
+          db, m.oeil_id,
+          '✅ Confirmez votre présence — mission demain',
+          `Confirmez votre présence pour "${m.title}" prévue demain à ${missionTime}. Vous avez jusqu'à ${deadlineTime} ce soir pour confirmer, sinon nous chercherons un remplaçant.`,
+          'warning', m.id, emitToUser, 'mission_view',
+          'presenceConfirmationRequestJ1Title', 'presenceConfirmationRequestJ1Body',
+          { missionTitle: m.title, time: missionTime, deadlineTime }
         );
-        if (emitToUser) emitToUser(m.oeil_id, 'notification', {
-          title: '✅ Confirmez votre présence — mission demain',
-          body: `"${m.title}" — confirmez avant ${deadlineTime}`,
-          missionId: m.id,
-          type: 'warning'
-        });
         if (m.phone) {
           await sendWhatsAppTemplate(waselTemplates.presence_confirmation_request_j1.template_name, m.phone, [m.title, deadlineTime]);
         } else {
@@ -619,23 +617,18 @@ initDb().then(() => {
         if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
         const missionTimeClient = new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, $2, $3, 'mission', $4, 'mission_view', $5, $6, $7)`,
-          [m.client_id,
-           '📅 Rappel — mission demain',
-           `Votre mission "${m.title}" est prévue demain à ${missionTimeClient}.`,
-           m.id,
-           'clientReminderJ1Title',
-           'clientReminderJ1Body',
-           JSON.stringify({ missionTitle: m.title, time: missionTimeClient })]
+        // Migré vers notify() (chantier push, Phase 1.1) : in-app + socket live (ligne complète)
+        // + canal push. P3 informatif (aucune confirmation attendue du client). Inclus par
+        // cohérence avec C7 (rappel client H-2) et parce qu'il partage ce tick avec C1.
+        // type='mission' conservé tel quel. WA inchangé.
+        await notify(
+          db, m.client_id,
+          '📅 Rappel — mission demain',
+          `Votre mission "${m.title}" est prévue demain à ${missionTimeClient}.`,
+          'mission', m.id, emitToUser, 'mission_view',
+          'clientReminderJ1Title', 'clientReminderJ1Body',
+          { missionTitle: m.title, time: missionTimeClient }
         );
-        if (emitToUser) emitToUser(m.client_id, 'notification', {
-          title: '📅 Rappel — mission demain',
-          body: `"${m.title}" — demain à ${missionTimeClient}`,
-          missionId: m.id,
-          type: 'mission'
-        });
         if (m.phone) {
           await sendWhatsAppTemplate(waselTemplates.mission_reminder_j1_client.template_name, m.phone, [m.title, missionTimeClient]);
         } else {
@@ -703,15 +696,15 @@ initDb().then(() => {
         // pas les autres du récap. La boucle de construction du corps de l'email ci-dessus
         // (pur concat de chaînes) n'a aucun mode d'échec et reste hors garde.
         try {
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-           VALUES ($1, $2, $3, 'warning', 'admin_missions', $4, $5, $6)`,
-          [admin.id,
-           `📋 ${missions.length} mission(s) non confirmées demain`,
-           body,
-           'adminMissionsRecapTitle',
-           null,
-           JSON.stringify({ count: missions.length })]
+        // Migré vers notify() (chantier push) — même ligne in-app qu'avant + canal push.
+        // Pas de socket live ici (emitToUser hors scope de ce cron) : inchangé sur cet axe.
+        await notify(
+          db, admin.id,
+          `📋 ${missions.length} mission(s) non confirmées demain`,
+          body,
+          'warning', null, null, 'admin_missions',
+          'adminMissionsRecapTitle', null,
+          { count: missions.length }
         );
         } catch (e) { console.error(`❌ Cron récap admin — admin ${admin.id} :`, e.message); }
       }
@@ -765,32 +758,34 @@ initDb().then(() => {
         // garde, une exception ici était rattrapée par le catch de tick et empêchait TOUTE la
         // boucle de transferts automatiques H+30 de s'exécuter au même passage.
         try {
-        // Alerte Œil
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, '🚨 Votre mission a commencé !', $2, 'error', $3, 'mission_view', $4, $5, $6)
-           ON CONFLICT DO NOTHING`,
-          [m.oeil_id, `La mission "${m.title}" devait commencer maintenant. Mettez à jour votre statut immédiatement.`, m.id,
-           'missionStartedAlertTitle', 'missionStartedAlertBody', JSON.stringify({ missionTitle: m.title })]
+        // Alerte Œil — migré vers notify() (chantier push, Phase 1.1). P1. Corrige au passage
+        // l'emit qui envoyait à l'Œil le texte de l'alerte ADMIN (« Mission non démarrée » +
+        // nom de l'Œil) au lieu du sien (« Votre mission a commencé ») — la ligne DB de l'Œil
+        // était déjà correcte, seul le payload socket live était le mauvais. Le
+        // `ON CONFLICT DO NOTHING` d'origine était inopérant (notifications n'a aucune
+        // contrainte unique). WA inchangé.
+        await notify(
+          db, m.oeil_id,
+          '🚨 Votre mission a commencé !',
+          `La mission "${m.title}" devait commencer maintenant. Mettez à jour votre statut immédiatement.`,
+          'error', m.id, emitToUser, 'mission_view',
+          'missionStartedAlertTitle', 'missionStartedAlertBody', { missionTitle: m.title }
         );
         if (m.phone) {
           await sendWhatsAppTemplate(waselTemplates.mission_late_alert_oeil.template_name, m.phone, [m.title]);
         }
-        // Alerte admin (liste récupérée une seule fois par tick, voir plus haut)
+        // Alerte admin (liste récupérée une seule fois par tick) — migré vers notify() : passe
+        // en socket live (emitToUser en scope, corrige L13) + canal push.
         for (const admin of admins) {
-          await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-             VALUES ($1, '🚨 Mission non démarrée', $2, 'error', $3, 'admin_missions', $4, $5, $6)`,
-            [admin.id, `L'Œil ${m.first_name} ${m.last_name} n'a pas démarré "${m.title}" à l'heure prévue.`, m.id,
-             'missionNotStartedAdminTitle', 'missionNotStartedAdminBody', JSON.stringify({ oeilName: `${m.first_name} ${m.last_name}`, missionTitle: m.title })]
+          await notify(
+            db, admin.id,
+            '🚨 Mission non démarrée',
+            `L'Œil ${m.first_name} ${m.last_name} n'a pas démarré "${m.title}" à l'heure prévue.`,
+            'error', m.id, emitToUser, 'admin_missions',
+            'missionNotStartedAdminTitle', 'missionNotStartedAdminBody',
+            { oeilName: `${m.first_name} ${m.last_name}`, missionTitle: m.title }
           );
         }
-        if (emitToUser) emitToUser(m.oeil_id, 'notification', {
-          title: '🚨 Mission non démarrée',
-          body: `"${m.title}" devait commencer maintenant !`,
-          missionId: m.id,
-          type: 'error'
-        });
         console.log(`🚨 Alerte H pour mission ${m.id}`);
         } catch (e) { console.error(`❌ Cron H — mission ${m.id} :`, e.message); }
       }
@@ -906,27 +901,34 @@ initDb().then(() => {
             [m.id, m.oeil_id, "L'Œil n'a pas démarré la mission à l'heure. Recherche d'un remplaçant en cours.", 'autoTransferH30SystemMessage']
           );
 
-          // Remboursement client si pas de remplaçant (géré par cron deadline)
-          await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-             VALUES ($1, '⚠️ Mission transférée automatiquement', $2, 'warning', $3, 'mission_view', $4, $5, $6)`,
-            [m.client_id, `Votre Œil n'a pas démarré "${m.title}" à l'heure. Nous recherchons un remplaçant en urgence.`, m.id,
-             'missionAutoTransferredClientTitle', 'missionAutoTransferredClientBody', JSON.stringify({ missionTitle: m.title })]
+          // Migrés vers notify() (chantier push, Phase 1.1) : ces 3 notifs (client, Œil, admins)
+          // étaient IA(no-live). Elles passent en socket live (emitToUser en scope, corrige
+          // L13/L14) + canal push. La pénalité Œil est P1 (matrice L16 : -20 fiabilité + débit
+          // jusqu'à 100 MAD + cooldown — une des sanctions les plus lourdes, jusqu'ici sans
+          // relance ni accusé de lecture).
+          await notify(
+            db, m.client_id,
+            '⚠️ Mission transférée automatiquement',
+            `Votre Œil n'a pas démarré "${m.title}" à l'heure. Nous recherchons un remplaçant en urgence.`,
+            'warning', m.id, emitToUser, 'mission_view',
+            'missionAutoTransferredClientTitle', 'missionAutoTransferredClientBody', { missionTitle: m.title }
           );
-          await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-             VALUES ($1, '⚠️ Pénalité appliquée', $2, 'error', $3, 'reliability_page', $4, $5, $6)`,
-            [m.oeil_id, `Vous n'avez pas démarré "${m.title}" à l'heure. -${deducted} MAD déduits et cooldown ${transferCooldownBeforeHours}h appliqué.`, m.id,
-             'penaltyAppliedTitle', 'penaltyAppliedBody', JSON.stringify({ missionTitle: m.title, amount: deducted, cooldownHours: transferCooldownBeforeHours })]
+          await notify(
+            db, m.oeil_id,
+            '⚠️ Pénalité appliquée',
+            `Vous n'avez pas démarré "${m.title}" à l'heure. -${deducted} MAD déduits et cooldown ${transferCooldownBeforeHours}h appliqué.`,
+            'error', m.id, emitToUser, 'reliability_page',
+            'penaltyAppliedTitle', 'penaltyAppliedBody', { missionTitle: m.title, amount: deducted, cooldownHours: transferCooldownBeforeHours }
           );
 
           // Liste admins récupérée une seule fois par tick (voir plus haut)
           for (const admin of admins) {
-            await db.query(
-              `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-               VALUES ($1, '🔄 Transfert automatique H+30', $2, 'warning', $3, 'admin_missions', $4, $5, $6)`,
-              [admin.id, `Mission "${m.title}" transférée automatiquement — Œil ${m.first_name} ${m.last_name} n'a pas démarré.`, m.id,
-               'autoTransferAdminTitle', 'autoTransferAdminBody', JSON.stringify({ missionTitle: m.title, oeilName: `${m.first_name} ${m.last_name}` })]
+            await notify(
+              db, admin.id,
+              '🔄 Transfert automatique H+30',
+              `Mission "${m.title}" transférée automatiquement — Œil ${m.first_name} ${m.last_name} n'a pas démarré.`,
+              'warning', m.id, emitToUser, 'admin_missions',
+              'autoTransferAdminTitle', 'autoTransferAdminBody', { missionTitle: m.title, oeilName: `${m.first_name} ${m.last_name}` }
             );
           }
           console.log(`🔄 Transfert auto H+30 pour mission ${m.id}`);
@@ -965,12 +967,16 @@ initDb().then(() => {
         // Isolation par itération (RG9) — voir la boucle lateH plus haut.
         try {
         for (const admin of admins) {
-          await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-             VALUES ($1, '🔍 Mission à vérifier', $2, 'warning', $3, 'admin_missions', $4, $5, $6)
-             ON CONFLICT DO NOTHING`,
-            [admin.id, `La mission "${m.title}" de ${m.first_name} ${m.last_name} est en cours depuis plus de 24h. Vérification requise.`, m.id,
-             'missionToVerifyAdminTitle', 'missionToVerifyAdminBody', JSON.stringify({ missionTitle: m.title, oeilName: `${m.first_name} ${m.last_name}` })]
+          // Migré vers notify() (chantier push) — in-app + socket live (emitToUser en scope,
+          // corrige L13) + push. Le `ON CONFLICT DO NOTHING` d'origine était inopérant
+          // (notifications n'a aucune contrainte unique) : rien perdu.
+          await notify(
+            db, admin.id,
+            '🔍 Mission à vérifier',
+            `La mission "${m.title}" de ${m.first_name} ${m.last_name} est en cours depuis plus de 24h. Vérification requise.`,
+            'warning', m.id, emitToUser, 'admin_missions',
+            'missionToVerifyAdminTitle', 'missionToVerifyAdminBody',
+            { missionTitle: m.title, oeilName: `${m.first_name} ${m.last_name}` }
           );
         }
         console.log(`🔍 Alerte mission expirée ${m.id}`);
@@ -1037,23 +1043,16 @@ initDb().then(() => {
         );
         const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, $2, $3, 'warning', $4, 'mission_view', $5, $6, $7)`,
-          [m.oeil_id,
-           '✅ Confirmez votre présence — mission bientôt',
-           `Confirmez votre présence pour "${m.title}" prévue dans ~2 heures. Vous avez jusqu'à ${deadlineTime} pour confirmer, sinon nous chercherons un remplaçant en urgence.`,
-           m.id,
-           'presenceConfirmationRequestSamedayTitle',
-           'presenceConfirmationRequestSamedayBody',
-           JSON.stringify({ missionTitle: m.title, deadlineTime })]
+        // Migré vers notify() (chantier push, Phase 1.1) : + socket live (emit partiel → ligne
+        // complète) + canal push. P1 (matrice L2/L6 : l'Œil perd la mission à la deadline). WA inchangé.
+        await notify(
+          db, m.oeil_id,
+          '✅ Confirmez votre présence — mission bientôt',
+          `Confirmez votre présence pour "${m.title}" prévue dans ~2 heures. Vous avez jusqu'à ${deadlineTime} pour confirmer, sinon nous chercherons un remplaçant en urgence.`,
+          'warning', m.id, emitToUser, 'mission_view',
+          'presenceConfirmationRequestSamedayTitle', 'presenceConfirmationRequestSamedayBody',
+          { missionTitle: m.title, deadlineTime }
         );
-        if (emitToUser) emitToUser(m.oeil_id, 'notification', {
-          title: '✅ Confirmez votre présence — mission bientôt',
-          body: `"${m.title}" — confirmez avant ${deadlineTime}`,
-          missionId: m.id,
-          type: 'warning'
-        });
         if (m.phone) {
           await sendWhatsAppTemplate(waselTemplates.presence_confirmation_request_sameday.template_name, m.phone, [m.title, deadlineTime]);
         } else {
@@ -1101,23 +1100,17 @@ initDb().then(() => {
         );
         const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, $2, $3, 'warning', $4, 'mission_view', $5, $6, $7)`,
-          [m.oeil_id,
-           '✅ Confirmez votre présence — mission imminente',
-           `Confirmez votre présence pour "${m.title}" prévue dans environ ${reminderLateMinutes} minutes. Vous avez jusqu'à ${deadlineTime} pour confirmer, sinon nous chercherons un remplaçant en urgence.`,
-           m.id,
-           'presenceConfirmationRequestH45Title',
-           'presenceConfirmationRequestH45Body',
-           JSON.stringify({ missionTitle: m.title, lateMinutes: reminderLateMinutes, deadlineTime })]
+        // Migré vers notify() (chantier push, Phase 1.1) : + socket live (emit partiel → ligne
+        // complète) + canal push. P1. Le repli email (C17, presence_confirmation_h45_email_sent_at)
+        // reste le filet — inchangé, il lit is_read sur cette même ligne. WA inchangé.
+        await notify(
+          db, m.oeil_id,
+          '✅ Confirmez votre présence — mission imminente',
+          `Confirmez votre présence pour "${m.title}" prévue dans environ ${reminderLateMinutes} minutes. Vous avez jusqu'à ${deadlineTime} pour confirmer, sinon nous chercherons un remplaçant en urgence.`,
+          'warning', m.id, emitToUser, 'mission_view',
+          'presenceConfirmationRequestH45Title', 'presenceConfirmationRequestH45Body',
+          { missionTitle: m.title, lateMinutes: reminderLateMinutes, deadlineTime }
         );
-        if (emitToUser) emitToUser(m.oeil_id, 'notification', {
-          title: '✅ Confirmez votre présence — mission imminente',
-          body: `"${m.title}" — confirmez avant ${deadlineTime}`,
-          missionId: m.id,
-          type: 'warning'
-        });
         if (m.phone) {
           await sendWhatsAppTemplate(waselTemplates.presence_confirmation_request_h45.template_name, m.phone, [m.title, deadlineTime]);
         } else {
@@ -1131,15 +1124,15 @@ initDb().then(() => {
         // checkPresenceConfirmationDeadlines (routes/missions.js) — pas dupliqué ici. Liste
         // admins récupérée une seule fois par tick (voir plus haut).
         for (const admin of admins) {
-          await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-             VALUES ($1, $2, $3, 'warning', $4, 'admin_missions', $5, $6, $7)`,
-            [admin.id,
-             '⚠️ Mission bientôt — présence non confirmée',
-             `Mission "${m.title}" dans ~${reminderLateMinutes} min — l'Œil n'a pas encore confirmé sa présence.`,
-             m.id,
-             'missionNotConfirmedAdminTitle', 'missionNotConfirmedAdminBody',
-             JSON.stringify({ missionTitle: m.title, lateMinutes: reminderLateMinutes })]
+          // Migré vers notify() (chantier push, Phase 1.1) : alerte admin passive — passe en
+          // live (emitToUser en scope, corrige L13) + canal push.
+          await notify(
+            db, admin.id,
+            '⚠️ Mission bientôt — présence non confirmée',
+            `Mission "${m.title}" dans ~${reminderLateMinutes} min — l'Œil n'a pas encore confirmé sa présence.`,
+            'warning', m.id, emitToUser, 'admin_missions',
+            'missionNotConfirmedAdminTitle', 'missionNotConfirmedAdminBody',
+            { missionTitle: m.title, lateMinutes: reminderLateMinutes }
           );
         }
         } catch (e) { console.error(`❌ Cron H-45 — mission ${m.id} :`, e.message); }
@@ -1192,23 +1185,16 @@ initDb().then(() => {
           [m.id]
         );
         if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
-        await db.query(
-          `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-           VALUES ($1, $2, $3, 'mission', $4, 'mission_view', $5, $6, $7)`,
-          [m.client_id,
-           '📅 Rappel — mission bientôt',
-           `Votre mission "${m.title}" est prévue dans environ ${reminderEarlyMinutes} minutes.`,
-           m.id,
-           'clientReminderH2Title',
-           'clientReminderH2Body',
-           JSON.stringify({ missionTitle: m.title, minutes: reminderEarlyMinutes })]
+        // Migré vers notify() (chantier push, Phase 1.1) : + socket live (ligne complète) +
+        // canal push. P3 informatif. type='mission' conservé tel quel. WA inchangé.
+        await notify(
+          db, m.client_id,
+          '📅 Rappel — mission bientôt',
+          `Votre mission "${m.title}" est prévue dans environ ${reminderEarlyMinutes} minutes.`,
+          'mission', m.id, emitToUser, 'mission_view',
+          'clientReminderH2Title', 'clientReminderH2Body',
+          { missionTitle: m.title, minutes: reminderEarlyMinutes }
         );
-        if (emitToUser) emitToUser(m.client_id, 'notification', {
-          title: '📅 Rappel — mission bientôt',
-          body: `"${m.title}" — dans environ ${reminderEarlyMinutes} minutes`,
-          missionId: m.id,
-          type: 'mission'
-        });
         if (m.phone) {
           await sendWhatsAppTemplate(waselTemplates.mission_reminder_h2_client.template_name, m.phone, [m.title, String(reminderEarlyMinutes)]);
         } else {
@@ -1579,11 +1565,14 @@ initDb().then(() => {
           );
           if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
           for (const admin of admins) {
-            await db.query(
-              `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-               VALUES ($1, $2, $3, 'warning', $4, 'admin_missions', $5, $6, $7)`,
-              [admin.id, '⏳ Mission sans Œil depuis 12h', `Aucun Œil n'a encore été trouvé pour "${m.title}", en attente depuis plus de 12h.`, m.id,
-               'staleMissionAdminTitle', 'staleMissionAdminBody', JSON.stringify({ missionTitle: m.title })]
+            // Migré vers notify() (chantier push) — in-app + socket live (emitToUser en scope,
+            // corrige L13) + push. Idempotence garantie en amont par stale_notified_at.
+            await notify(
+              db, admin.id,
+              '⏳ Mission sans Œil depuis 12h',
+              `Aucun Œil n'a encore été trouvé pour "${m.title}", en attente depuis plus de 12h.`,
+              'warning', m.id, emitToUser, 'admin_missions',
+              'staleMissionAdminTitle', 'staleMissionAdminBody', { missionTitle: m.title }
             );
             if (admin.phone) {
               await sendWhatsAppTemplate(waselTemplates.mission_without_oeil_admin.template_name, admin.phone, [m.title]);
@@ -1598,18 +1587,16 @@ initDb().then(() => {
           // FORBIDDEN_EDIT_FIELDS (verrouillé pour le client, PROMPT 1 anti-fraude) — pas de
           // gabarit WhatsApp dédié côté client (créer un template Wasel est hors périmètre de ce
           // chantier, voir constat 03) : notification in-app uniquement, pas d'envoi WhatsApp ici.
-          await db.query(
-            `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-             VALUES ($1, $2, $3, 'warning', $4, 'mission_view', $5, $6, $7)`,
-            [m.client_id, '💡 Toujours aucun Œil pour votre mission', `Votre mission "${m.title}" n'a pas encore trouvé d'Œil après 12h. Augmenter le budget peut attirer plus de candidats. Consultez votre mission pour l'ajuster.`, m.id,
-             'staleMissionClientTitle', 'staleMissionClientBody', JSON.stringify({ missionTitle: m.title })]
+          // Migré vers notify() (chantier push) : l'emit partiel { title, body, missionId, type }
+          // devient la ligne complète (id, action_type, title_key, params…) comme partout
+          // ailleurs — le clic in-app peut désormais deep-linker et se marquer lu. + push.
+          await notify(
+            db, m.client_id,
+            '💡 Toujours aucun Œil pour votre mission',
+            `Votre mission "${m.title}" n'a pas encore trouvé d'Œil après 12h. Augmenter le budget peut attirer plus de candidats. Consultez votre mission pour l'ajuster.`,
+            'warning', m.id, emitToUser, 'mission_view',
+            'staleMissionClientTitle', 'staleMissionClientBody', { missionTitle: m.title }
           );
-          if (emitToUser) emitToUser(m.client_id, 'notification', {
-            title: '💡 Toujours aucun Œil pour votre mission',
-            body: `"${m.title}" — toujours sans Œil après 12h`,
-            missionId: m.id,
-            type: 'warning'
-          });
 
           console.log(`⏳ Notification mission sans Œil envoyée pour ${m.id}`);
         } catch (e) { console.error(`❌ Cron missions sans Œil — mission ${m.id} :`, e.message); }
@@ -1685,6 +1672,19 @@ initDb().then(() => {
       await runWhatsAppRetry(getDb());
     } catch (e) { console.error('❌ Cron retry WhatsApp error:', e.message); }
     finally { cronWhatsappRetryRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron toutes les heures — Santé du canal push ──
+  // Pas de "retry" pour le push (un endpoint est vivant, ou mort → disabled_at ; rien à
+  // réessayer). Seulement une vérification de santé : ≥ PUSH_HEALTH_ALERT_THRESHOLD échecs
+  // provider sur la dernière heure → Sentry (fingerprint fixe). Miroir de checkWhatsAppHealth.
+  cron.schedule('35 * * * *', async () => {
+    if (cronPushHealthRunning) { console.warn('⏭️ Cron santé push déjà en cours, tick ignoré'); return; }
+    cronPushHealthRunning = true;
+    try {
+      await checkPushHealth(getDb());
+    } catch (e) { console.error('❌ Cron santé push error:', e.message); }
+    finally { cronPushHealthRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les heures — Réconciliation solde vs ledger ──

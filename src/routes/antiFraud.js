@@ -12,6 +12,8 @@ const Sentry = require('@sentry/node');
 // de dupliquer la logique de sélection de candidat — même approche que
 // PUT /users/admin/:id/toggle-active (routes/users.js).
 const missionRoutes = require('./missions');
+// notify() — point d'insertion unique in-app + socket live + push (utils/notify.js).
+const { notify } = require('../utils/notify');
 
 // ══ RÈGLES ANTI-FRAUDE ════════════════════════════════════════
 // Score de risque : 0-100. Au-delà de 70 → alerte. Au-delà de 90 → blocage auto.
@@ -381,18 +383,16 @@ router.post('/warn/:userId', authenticate, requireRole('admin'), asyncHandler(as
   const { rows: [target] } = await db.query('SELECT id FROM users WHERE id=$1', [userId]);
   if (!target) return res.status(404).json({ error: 'Utilisateur introuvable' });
 
-  // 1. Logger dans la base
-  await db.query(
-    `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-     VALUES ($1, $2, $3, 'warning', 'none', $4, $5, $6)`,
-[
-      userId,
-      '⚠️ Activité inhabituelle détectée sur votre compte',
-      reason || `Une activité suspecte a été détectée sur votre compte (${rule_label || rule_code}). Merci de vous assurer que vos actions respectent les conditions d'utilisation de Shoofly. En cas de récidive, votre compte pourra être suspendu.`,
-      'suspiciousActivityTitle',
-      reason ? null : 'suspiciousActivityDefaultBody',
-      reason ? null : JSON.stringify({ ruleLabel: rule_label || rule_code })
-    ]
+  // 1. Logger dans la base (+ canal push via notify() — chantier push ; pas d'emitToUser dans
+  //    cette route, l'axe no-live est inchangé).
+  await notify(
+    db, userId,
+    '⚠️ Activité inhabituelle détectée sur votre compte',
+    reason || `Une activité suspecte a été détectée sur votre compte (${rule_label || rule_code}). Merci de vous assurer que vos actions respectent les conditions d'utilisation de Shoofly. En cas de récidive, votre compte pourra être suspendu.`,
+    'warning', null, null, 'none',
+    'suspiciousActivityTitle',
+    reason ? null : 'suspiciousActivityDefaultBody',
+    reason ? null : { ruleLabel: rule_label || rule_code }
   );
 
   // 2. Envoyer un message dans la messagerie admin → utilisateur
@@ -444,6 +444,12 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
     // punitive (cf. commentaire ci-dessous : aucun message "aucune pénalité").
     await db.query(`UPDATE users SET is_active=false, deactivation_context='fraud_block' WHERE id=$1`, [req.params.userId]);
   const suspensionReason = reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.';
+  // NOTE (chantier push, 2026-09-09) — ce site est DÉLIBÉRÉMENT laissé en db.query brut, PAS
+  // migré vers notify(). notify() déclenche le canal push, et un abonnement push vit dans le
+  // navigateur indépendamment de is_active/JWT : le router via notify() ici enverrait un push à
+  // un compte qu'on vient de bloquer (is_active=false). C'est exactement la « piste L4 » à
+  // arbitrer avec l'utilisateur (recoupe la décision produit du Prompt 1 « recours compte
+  // bloqué ») — voir le rapport de Phase 1. Ne pas migrer sans validation explicite.
   await db.query(
     `INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Compte suspendu',$2,'info','none',$3,$4,$5)`,
     [req.params.userId, suspensionReason, 'accountSuspendedTitle', reason ? null : 'accountSuspendedDefaultBody', null]
@@ -509,11 +515,14 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
       // Formulation neutre côté client : ne mentionne ni blocage ni fraude.
       const title = '⚠️ Changement sur votre mission';
       const body = `Votre mission "${mission.title}" est en cours de réattribution suite à un changement côté prestataire. Nous recherchons un remplaçant en urgence.`;
-      await db.query(
-        `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'info',$4,'mission_view',$5,$6,$7)`,
-        [mission.client_id, title, body, mission.id, 'missionChangeAlertTitle', 'missionChangeAlertBody', JSON.stringify({ missionTitle: mission.title })]
+      // Migré vers notify() (chantier push) : l'emit partiel { title, body } devient la ligne
+      // complète (deep-link + marquage lu possibles) + push. Cible = le CLIENT de la mission,
+      // jamais l'Œil bloqué — aucun lien avec le point L4 (push vers compte is_active=false).
+      await notify(
+        db, mission.client_id, title, body,
+        'info', mission.id, emitToUser, 'mission_view',
+        'missionChangeAlertTitle', 'missionChangeAlertBody', { missionTitle: mission.title }
       );
-      if (emitToUser) emitToUser(mission.client_id, 'notification', { title, body });
     } catch (e) {
       // Groupe 3 point 3.4 (audit exhaustif backend 2026-09-05 §2.4) : même intention que le
       // catch par mission de reassignMissionsOnSuspension (routes/missions.js) — l'échec de

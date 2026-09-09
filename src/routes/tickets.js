@@ -8,14 +8,9 @@ const { sendWhatsAppTemplate } = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
 const { generateUniqueReference } = require('../utils/ticketReference');
 const { parsePagination } = require('../utils/pagination');
-
-async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null) {
-  const r = await db.query(
-    `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-    [userId, title, body, type, missionId, actionType, titleKey, bodyKey, params ? JSON.stringify(params) : null]
-  );
-  if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
-}
+// notify() — même point d'insertion unique que routes/missions.js (copie locale à l'identique
+// supprimée ici). in-app + socket live + push, voir utils/notify.js.
+const { notify } = require('../utils/notify');
 
 // ── POST /tickets — création d'un ticket ────────────────────
 router.post('/', authenticate, requireRole('client', 'oeil'), asyncHandler(async (req, res) => {

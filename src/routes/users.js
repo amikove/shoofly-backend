@@ -17,6 +17,9 @@ const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
 const { validateSettingValue } = require('../config/settingValidators');
 const asyncHandler = require('../middleware/asyncHandler');
 const { parsePagination } = require('../utils/pagination');
+// notify() — point d'insertion unique in-app + socket live + push (utils/notify.js). Alias
+// `notifyUser` pour ne pas masquer la closure locale `notify` de PUT /admin/claims/:id/resolve.
+const { notify: notifyUser } = require('../utils/notify');
 // Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
 // de dupliquer la logique de sélection de candidat pour le cas "Œil désactivé avec mission active".
 const missionRoutes = require('./missions');
@@ -1403,8 +1406,13 @@ router.put('/admin/:id/verify-oeil', authenticate, requireRole('admin'), require
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   await db.query(`UPDATE oeil_profiles SET is_verified=true, id_verified_at=NOW() WHERE user_id=$1`, [req.params.id]);
-  const notif = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'✅ Profil vérifié !','Vous pouvez maintenant accepter des missions.','info','none',$2,$3,$4) RETURNING *`, [req.params.id, 'profileVerifiedTitle', 'profileVerifiedBody', null]);
-  if (emitToUser) emitToUser(req.params.id, 'notification', notif.rows[0]);
+  // Migré vers notify() (chantier push) — même ligne + même emit (ligne complète) + canal push.
+  await notifyUser(
+    db, req.params.id,
+    '✅ Profil vérifié !', 'Vous pouvez maintenant accepter des missions.',
+    'info', null, emitToUser, 'none',
+    'profileVerifiedTitle', 'profileVerifiedBody', null
+  );
   res.json({ message: 'Œil vérifié' });
 }));
 
@@ -1939,13 +1947,12 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
   // pas d'appel réseau/lent pendant qu'une connexion DB est retenue).
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
-  const notify = async (userId, title, body, titleKey = null, bodyKey = null, params = null) => {
-    await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'info',$4,'mission_view',$5,$6,$7)`,
-      [userId, title, body, mission.id, titleKey, bodyKey, params ? JSON.stringify(params) : null]
-    );
-    if (emitToUser) emitToUser(userId, 'notification', { title, body });
-  }
+  // Délègue au point unique notify() (chantier push) : l'emit partiel { title, body } devient
+  // la ligne complète (deep-link + marquage lu) + canal push. Signature de la closure inchangée
+  // → aucun des ~10 appels ci-dessous ne bouge. type/mission_id/action_type restaient constants
+  // ('info' / mission.id / 'mission_view') — passés tels quels.
+  const notify = (userId, title, body, titleKey = null, bodyKey = null, params = null) =>
+    notifyUser(db, userId, title, body, 'info', mission.id, emitToUser, 'mission_view', titleKey, bodyKey, params);
 
   if (decision === 'oeil') {
     if (cashSettlement) {
@@ -2130,13 +2137,14 @@ router.put('/admin/withdrawals/:id', authenticate, requireRole('admin'), require
     if (!existing) return res.status(404).json({ error: 'Introuvable' });
     return res.status(409).json({ error: 'Ce virement a déjà été traité' });
   }
+  // Migrés vers notify() (chantier push) — même ligne + même emit (ligne complète) + canal push.
   if (status === 'rejected') {
-    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Virement refusé','Votre demande a été refusée. Solde recrédité.','info','gains_page',$2,$3,$4) RETURNING *`, [w.oeil_id, 'withdrawalRejectedTitle', 'withdrawalRejectedBody', null]);
-    if (emitToUser) emitToUser(w.oeil_id, 'notification', n.rows[0]);
+    await notifyUser(db, w.oeil_id, 'Virement refusé', 'Votre demande a été refusée. Solde recrédité.',
+      'info', null, emitToUser, 'gains_page', 'withdrawalRejectedTitle', 'withdrawalRejectedBody', null);
   }
   if (status === 'paid') {
-    const n = await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'💸 Virement effectué',$2,'info','gains_page',$3,$4,$5) RETURNING *`, [w.oeil_id, `${w.amount} MAD virés sur votre compte.`, 'withdrawalPaidTitle', 'withdrawalPaidBody', JSON.stringify({ amount: w.amount })]);
-    if (emitToUser) emitToUser(w.oeil_id, 'notification', n.rows[0]);
+    await notifyUser(db, w.oeil_id, '💸 Virement effectué', `${w.amount} MAD virés sur votre compte.`,
+      'info', null, emitToUser, 'gains_page', 'withdrawalPaidTitle', 'withdrawalPaidBody', { amount: w.amount });
   }
   res.json({ message: `Virement ${status}` });
 }));
@@ -2354,11 +2362,14 @@ router.post('/admin/identity-requests/:id/approve', authenticate, requireRole('a
     [doc.user_id]
   );
 
- // Notification in-app
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-       VALUES ($1, '✅ Identité vérifiée', 'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.', 'success', 'none', $2, $3, $4)`,
-      [doc.user_id, 'identityVerifiedTitle', 'identityVerifiedBody', null]
+ // Notification in-app — migrée vers notify() (chantier push). Pas d'emitToUser dans cette
+ // route → null (no-live inchangé) ; gain = canal push.
+    await notifyUser(
+      db, doc.user_id,
+      '✅ Identité vérifiée',
+      'Félicitations ! Votre identité a été vérifiée avec succès. Vous pouvez maintenant accepter des missions sur Shoofly.',
+      'success', null, null, 'none',
+      'identityVerifiedTitle', 'identityVerifiedBody', null
     );
     // Pas de WhatsApp ici — aucune action rapide n'est attendue de l'Œil suite à cette
     // notification (filtrage WhatsApp 2026-07-25). Auparavant détourné via le template
@@ -2387,11 +2398,13 @@ router.post('/admin/identity-requests/:id/reject', authenticate, requireRole('ad
     [reason || 'Documents non conformes', doc.user_id]
   );
 
-  // Notification in-app
-  await db.query(
-    `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-     VALUES ($1, '❌ Vérification refusée', $2, 'error', 'verification_page', $3, $4, $5)`,
-    [doc.user_id, `Votre demande de vérification a été refusée. Raison : ${reason || 'Documents non conformes'}. Vous pouvez soumettre de nouveaux documents.`, 'identityRejectedTitle', 'identityRejectedBody', JSON.stringify({ reason: reason || 'Documents non conformes' })]
+  // Notification in-app — migrée vers notify() (chantier push). Pas d'emitToUser ici → null.
+  await notifyUser(
+    db, doc.user_id,
+    '❌ Vérification refusée',
+    `Votre demande de vérification a été refusée. Raison : ${reason || 'Documents non conformes'}. Vous pouvez soumettre de nouveaux documents.`,
+    'error', null, null, 'verification_page',
+    'identityRejectedTitle', 'identityRejectedBody', { reason: reason || 'Documents non conformes' }
   );
 
   res.json({ message: 'Identité rejetée', user_id: doc.user_id });
@@ -2512,11 +2525,14 @@ router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('a
     throw e;
   }
 
-  // Notification APRÈS le commit (règle de périmètre des transactions).
-  await db.query(
-    `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-     VALUES ($1, '💰 Virement effectué', $2, 'success', 'gains_page', $3, $4, $5)`,
-    [req.params.oeilId, `Un virement de ${amount} MAD a été enregistré vers votre compte bancaire.`, 'withdrawalRegisteredTitle', 'withdrawalRegisteredBody', JSON.stringify({ amount })]
+  // Notification APRÈS le commit (règle de périmètre des transactions) — migrée vers notify()
+  // (chantier push). Pas d'emitToUser dans cette route → null ; gain = canal push.
+  await notifyUser(
+    db, req.params.oeilId,
+    '💰 Virement effectué',
+    `Un virement de ${amount} MAD a été enregistré vers votre compte bancaire.`,
+    'success', null, null, 'gains_page',
+    'withdrawalRegisteredTitle', 'withdrawalRegisteredBody', { amount }
   );
 
   res.json({ ok: true, transaction });

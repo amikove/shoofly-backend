@@ -16,6 +16,11 @@ const { authenticate } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const { sendPasswordResetEmail } = require('../services/email');
+// notify() — in-app + socket live + push (utils/notify.js). Inscription : pas d'emitToUser en
+// scope → null. Le push sera quasi toujours skipped_no_sub ici (abonnement pas encore créé au
+// moment du 1er rendu) ; migré malgré tout pour que 100 % des écritures notifications passent
+// par le point unique.
+const { notify } = require('../utils/notify');
 const {
   PROFIL_OPTIONS, SITUATION_OPTIONS, MOTIVATION_OPTIONS,
   USAGE_REASON_OPTIONS, USAGE_FREQUENCY_OPTIONS, DISPONIBILITE_OPTIONS,
@@ -90,13 +95,15 @@ router.post('/register', [
   );
   if (role === 'oeil') await db.query(`INSERT INTO oeil_profiles (user_id) VALUES ($1)`, [id]);
 
-  await db.query(`INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'info','none',$4,$5,$6)`, [
-    id, 'Bienvenue sur SHOOFLY 👁️',
+  await notify(
+    db, id,
+    'Bienvenue sur SHOOFLY 👁️',
     role === 'oeil' ? 'Votre profil sera vérifié sous 24h.' : 'Vous pouvez commander votre première mission.',
+    'info', null, null, 'none',
     'welcomeTitle',
     role === 'oeil' ? 'welcomeBodyOeil' : 'welcomeBodyClient',
     null
-  ]);
+  );
 
   res.status(201).json({ token: makeToken(user), user: safe(user) });
 }));
