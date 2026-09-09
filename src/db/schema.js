@@ -1513,9 +1513,9 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- logique d'escalade n'y vit (elle reste dans utils/notify.js, les crons, settings).
     --
     -- push_subscriptions : un abonnement = un couple (utilisateur, appareil/navigateur).
-    -- `provider`/`platform` par défaut 'webpush'/'web' — colonnes présentes pour un éventuel
-    -- FCM/APNs natif plus tard, sans migration. `keys` = {p256dh, auth} du PushSubscription du
-    -- navigateur. `disabled_at` posé (pas de DELETE) quand le provider renvoie 404/410 (endpoint
+    -- provider / platform par défaut 'webpush' / 'web' — colonnes présentes pour un éventuel
+    -- FCM/APNs natif plus tard, sans migration. keys = {p256dh, auth} du PushSubscription du
+    -- navigateur. disabled_at posé (pas de DELETE) quand le provider renvoie 404/410 (endpoint
     -- révoqué) — même philosophie que whatsapp_send_failures.resolved_at : visibilité.
     CREATE TABLE IF NOT EXISTS push_subscriptions (
       id              BIGSERIAL PRIMARY KEY,
