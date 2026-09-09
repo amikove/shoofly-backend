@@ -436,7 +436,13 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
     if (target.role === 'admin' && !req.user.is_super_admin) {
       return res.status(403).json({ error: 'Seul le Super Admin peut bloquer un compte administrateur.' });
     }
-    await db.query(`UPDATE users SET is_active=false WHERE id=$1`, [req.params.userId]);
+    // deactivation_context='fraud_block' (chantier L4, 2026-09-09) : marque CE blocage comme
+    // anti-fraude → l'utilisateur bloqué obtient un accès restreint MINIMAL (voir le motif +
+    // UNE contestation jamais rouvrable, pas de fil de tickets) via isDeactivatedAccountAllowed
+    // (middleware/auth.js). Volontairement plus étroit que le canal COMPLET d'une désactivation
+    // client (admin_toggle / noshow_strikes) — un blocage pour fraude avérée reste une mesure
+    // punitive (cf. commentaire ci-dessous : aucun message "aucune pénalité").
+    await db.query(`UPDATE users SET is_active=false, deactivation_context='fraud_block' WHERE id=$1`, [req.params.userId]);
   const suspensionReason = reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.';
   await db.query(
     `INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Compte suspendu',$2,'info','none',$3,$4,$5)`,

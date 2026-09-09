@@ -1304,6 +1304,48 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     CREATE INDEX IF NOT EXISTS idx_settings_history_key ON settings_history(setting_key);
     CREATE INDEX IF NOT EXISTS idx_settings_history_changed_at ON settings_history(changed_at DESC);
 
+    -- ── Recours d'un compte bloqué (is_active=false) — chantier L4, 2026-09-09 ─────────────
+    -- Avant : un compte is_active=false (blocage anti-fraude, POST /anti-fraud/block ; ou
+    -- désactivation client via PUT /users/admin/:id/toggle-active / 2e strike no-show,
+    -- utils/clientStrikes.js) était en verrou TOTAL — login 403 sans token, 401 sur toutes les
+    -- routes, aucun canal in-app pour comprendre ou contester (le seul canal théorique,
+    -- WhatsApp, est cassé — G5). Ce chantier ouvre un accès restreint calqué sur le patron
+    -- déjà en place pour is_suspended (middleware/auth.js isSuspendedOeilAllowed +
+    -- CompteSuspendu.jsx + POST /reliability/review-request).
+    --
+    -- deactivation_context : POURQUOI le compte est is_active=false — discrimine le niveau de
+    -- recours accordé (voir isDeactivatedAccountAllowed, middleware/auth.js) :
+    --   'fraud_block'     → blocage anti-fraude : canal MINIMAL (voir le motif + UNE
+    --                       contestation jamais rouvrable ; pas de fil de support).
+    --   'admin_toggle'    → désactivation admin générique (toggle-active branche non-Œil).
+    --   'noshow_strikes'  → 2e strike no-show client (clientStrikes.js).
+    --   'admin_toggle' / 'noshow_strikes' → canal COMPLET (contestation re-soumissible après
+    --                       décision + fil de tickets), aligné sur is_suspended.
+    -- NULL = compte actif, OU compte bloqué AVANT ce déploiement (aucun rétro-remplissage) —
+    -- traité comme le cas le plus restrictif (canal minimal). Posé par les 3 sites d'écriture
+    -- de is_active=false, remis à NULL à toute réactivation (decide 'approved',
+    -- /admin/clients/:id/unblock, toggle-active réactivation).
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivation_context TEXT;
+
+    -- account_block_appeals : structure calquée à l'identique sur reliability_review_requests
+    -- (schema.js:513) — même colonnes, mêmes sémantiques (status pending/approved/rejected,
+    -- admin_response, reviewed_by/reviewed_at). Seule différence : user_id (tout rôle) au lieu
+    -- de oeil_id, car un blocage anti-fraude peut viser un client comme un Œil. Re-soumission :
+    -- gérée en amont dans POST /api/block-appeals (une seule 'pending' à la fois pour le canal
+    -- complet ; une seule ligne TOUTES statuts confondus pour le canal minimal 'fraud_block').
+    CREATE TABLE IF NOT EXISTS account_block_appeals (
+      id             SERIAL PRIMARY KEY,
+      user_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      message        TEXT NOT NULL,
+      status         TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+      admin_response TEXT,
+      reviewed_by    TEXT REFERENCES users(id),
+      reviewed_at    TIMESTAMPTZ,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_account_block_appeals_user ON account_block_appeals(user_id);
+    CREATE INDEX IF NOT EXISTS idx_account_block_appeals_status ON account_block_appeals(status);
+
     -- ═══ Index de performance — audit BDD 2026-09-06 §2 (I1 à I9) ════════════════════════════
     -- Source : rapport-audit-base-de-donnees-contraintes-index-transactions-2026-09-06, §2
     -- (Seq Scan confirmés par EXPLAIN ANALYZE). Correctif : rapport-groupe2-index-performance-
@@ -1462,6 +1504,60 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- ramène le pire cas documenté (?search=X&sort=price_desc) de ~760 ms à ~5 ms QUAND le terme
     -- ramène assez de lignes (Index Scan Backward price + arrêt anticipé au LIMIT) ; un terme rare
     -- ou sans résultat reste un Seq Scan ~300-400 ms. Détail et options dans le rapport §P1(d).
+
+    -- ═══ Canal de notification push — Web Push / VAPID — chantier push, 2026-09-09 ═══════════
+    -- Source : rapport-chantier-audit-notifications-matrice-2026-09-08.md §6.1. Vérifié avant
+    -- pose : aucune structure device/subscription/push/token préexistante (grep schema.js).
+    -- AJOUT PUREMENT ADDITIF — 2 tables neuves + 3 index, CREATE ... IF NOT EXISTS idempotent,
+    -- aucune requête existante ne change. Ces tables sont un ANNUAIRE + un JOURNAL : aucune
+    -- logique d'escalade n'y vit (elle reste dans utils/notify.js, les crons, settings).
+    --
+    -- push_subscriptions : un abonnement = un couple (utilisateur, appareil/navigateur).
+    -- `provider`/`platform` par défaut 'webpush'/'web' — colonnes présentes pour un éventuel
+    -- FCM/APNs natif plus tard, sans migration. `keys` = {p256dh, auth} du PushSubscription du
+    -- navigateur. `disabled_at` posé (pas de DELETE) quand le provider renvoie 404/410 (endpoint
+    -- révoqué) — même philosophie que whatsapp_send_failures.resolved_at : visibilité.
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id              BIGSERIAL PRIMARY KEY,
+      user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      platform        TEXT NOT NULL DEFAULT 'web',
+      provider        TEXT NOT NULL DEFAULT 'webpush',
+      endpoint        TEXT NOT NULL,
+      keys            JSONB,
+      user_agent      TEXT,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_push_at    TIMESTAMPTZ,
+      last_success_at TIMESTAMPTZ,
+      last_failure_at TIMESTAMPTZ,
+      failure_count   INT NOT NULL DEFAULT 0,
+      disabled_at     TIMESTAMPTZ,
+      UNIQUE (user_id, endpoint)
+    );
+    -- Lookup chaud de services/push.js sendWebPush (par user, abonnements vivants seulement).
+    CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user_active ON push_subscriptions(user_id) WHERE disabled_at IS NULL;
+
+    -- push_send_log : journal d'envoi (succès ET échec), miroir de whatsapp_send_failures mais
+    -- symétrique. C'est ici que naît le seul « délivré » réaliste : status='sent' = « le provider
+    -- a accepté le POST chiffré » (équivalent response.ok Wasel/Resend — aucun accusé de
+    -- livraison/lecture réel n'existe en Web Push standard). status ∈
+    -- 'sent' | 'provider_error' | 'expired_endpoint' | 'skipped_no_sub'.
+    CREATE TABLE IF NOT EXISTS push_send_log (
+      id              BIGSERIAL PRIMARY KEY,
+      subscription_id BIGINT REFERENCES push_subscriptions(id) ON DELETE SET NULL,
+      user_id         TEXT NOT NULL,
+      notification_id INTEGER REFERENCES notifications(id) ON DELETE SET NULL,
+      event_key       TEXT,
+      provider        TEXT,
+      status          TEXT NOT NULL,
+      provider_status INTEGER,
+      error_message   TEXT,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    -- Requête de santé (checkPushHealth) : WHERE status='provider_error' AND created_at > NOW()-1h.
+    CREATE INDEX IF NOT EXISTS idx_push_send_log_status_created ON push_send_log(status, created_at);
+    -- Analytics par type d'événement / lien vers la ligne in-app source.
+    CREATE INDEX IF NOT EXISTS idx_push_send_log_notification ON push_send_log(notification_id) WHERE notification_id IS NOT NULL;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

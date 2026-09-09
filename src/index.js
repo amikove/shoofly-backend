@@ -77,6 +77,7 @@ const userRoutes    = require('./routes/users');
 const reportRoutes = require('./routes/reports');
 const ticketRoutes = require('./routes/tickets');
 const paymentRoutes = require('./routes/payments');
+const blockAppealRoutes = require('./routes/blockAppeals');
 
 // ── CORS — liste blanche unique, source de vérité partagée par Express et Socket.IO ──
 const productionOrigins = ['https://shoofly.ma', 'https://www.shoofly.ma', 'https://shoofly-react.vercel.app'];
@@ -235,6 +236,7 @@ app.use('/api/promo', promoRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/tickets', ticketRoutes);
 app.use('/api/payments', paymentRoutes);
+app.use('/api/block-appeals', blockAppealRoutes);
 
 app.get('/health', async (_, res) => {
   try {

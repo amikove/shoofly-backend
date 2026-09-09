@@ -32,7 +32,11 @@ async function applyClientStrike(db, clientId, missionId, reason, createdBy) {
 
   let justBlocked = false;
   if (count >= 2 && before?.is_active) {
-    await db.query(`UPDATE users SET is_active=false WHERE id=$1`, [clientId]);
+    // deactivation_context='noshow_strikes' (chantier L4, 2026-09-09) : ce blocage ouvre le
+    // canal de contestation COMPLET (re-soumissible + fil de tickets), aligné sur is_suspended —
+    // voir isDeactivatedAccountAllowed (middleware/auth.js). Remis à NULL à la réactivation
+    // (decide 'approved' de account_block_appeals, ou POST /admin/clients/:id/unblock).
+    await db.query(`UPDATE users SET is_active=false, deactivation_context='noshow_strikes' WHERE id=$1`, [clientId]);
     justBlocked = true;
   }
 
