@@ -24,6 +24,10 @@ const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBul
 const { checkCashCommissionBalance, settleCashCommission } = require('../utils/cashCommission');
 const { generateUniqueReference } = require('../utils/ticketReference');
 const { parsePagination } = require('../utils/pagination');
+// notify() — point d'insertion unique in-app + socket live + push (voir utils/notify.js).
+// Extrait ici (il y vivait, dupliqué à l'identique dans routes/tickets.js) sans changer sa
+// signature ni ses appelants ; router.notify = notify plus bas reste l'export lu par index.js.
+const { notify } = require('../utils/notify');
 
 
 async function getCommissionRate(db) {
@@ -35,14 +39,6 @@ async function pricing(price, db) {
   const rate = await getCommissionRate(db)
   const commission = Math.round(price * rate * 100) / 100;
   return { commission, oeil_earning: price - commission };
-}
-
-async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null) {
-  const r = await db.query(
-    `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-    [userId, title, body, type, missionId, actionType, titleKey, bodyKey, params ? JSON.stringify(params) : null]
-  );
-  if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 }
 
 // Évince tous les sockets actuellement dans la room mission:<id> — appelé à chaque transition

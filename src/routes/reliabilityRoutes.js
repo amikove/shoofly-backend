@@ -6,6 +6,10 @@ const { getReliabilityLevel, reactivateWithCorrectiveEvent } = require('../utils
 const { getSetting } = require('../utils/settings');
 const asyncHandler = require('../middleware/asyncHandler');
 const { parsePagination } = require('../utils/pagination');
+// notify() — point d'insertion unique in-app + socket live + push (utils/notify.js).
+// Ces routes n'ont pas emitToUser en scope → on passe null (in-app identique à aujourd'hui,
+// no-live) ; le gain de ce chantier ici est le canal push. Passage en live = suivi séparé (L13/L14).
+const { notify } = require('../utils/notify');
 
 const DEFAULT_REACTIVATION_SCORE = 70; // score appliqué à une réintégration si l'admin n'en précise pas un autre (repli si settings.reactivation_default_score absent)
 
@@ -79,10 +83,12 @@ router.post('/review-request', authenticate, requireRole('oeil'), asyncHandler(a
 
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
   for (const admin of admins) {
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-       VALUES ($1, $2, $3, 'warning', 'admin_fiabilite', $4, $5, $6)`,
-      [admin.id, '📨 Demande d\'examen reçue', `Un Œil a demandé un examen de son dossier suite à suspension.`, 'reviewRequestReceivedAdminTitle', 'reviewRequestReceivedAdminBody', null]
+    await notify(
+      db, admin.id,
+      '📨 Demande d\'examen reçue',
+      `Un Œil a demandé un examen de son dossier suite à suspension.`,
+      'warning', null, null, 'admin_fiabilite',
+      'reviewRequestReceivedAdminTitle', 'reviewRequestReceivedAdminBody', null
     );
   }
 
@@ -170,16 +176,20 @@ router.post('/admin/requests/:id/decide', authenticate, requireRole('admin'), re
       const resolved = validateResetScore(reset_score);
       const newScore = resolved.provided ? resolved.value : await getSetting(db, 'reactivation_default_score', DEFAULT_REACTIVATION_SCORE);
       await reactivateWithCorrectiveEvent(db, request.oeil_id, newScore, req.user.id);
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-       VALUES ($1, '✅ Compte réactivé', $2, 'success', 'none', $3, $4, $5)`,
-      [request.oeil_id, `Votre dossier a été examiné et votre compte est réactivé. ${response || ''}`, 'accountReactivatedTitle', 'accountReactivatedBody', JSON.stringify({ response: response || '' })]
+    await notify(
+      db, request.oeil_id,
+      '✅ Compte réactivé',
+      `Votre dossier a été examiné et votre compte est réactivé. ${response || ''}`,
+      'success', null, null, 'none',
+      'accountReactivatedTitle', 'accountReactivatedBody', { response: response || '' }
     );
   } else {
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-       VALUES ($1, '❌ Demande refusée', $2, 'error', 'none', $3, $4, $5)`,
-      [request.oeil_id, `Votre demande d'examen a été refusée. ${response || ''}`, 'reviewRequestRejectedTitle', 'reviewRequestRejectedBody', JSON.stringify({ response: response || '' })]
+    await notify(
+      db, request.oeil_id,
+      '❌ Demande refusée',
+      `Votre demande d'examen a été refusée. ${response || ''}`,
+      'error', null, null, 'none',
+      'reviewRequestRejectedTitle', 'reviewRequestRejectedBody', { response: response || '' }
     );
   }
 
@@ -249,10 +259,12 @@ router.post('/admin/:oeilId/reactivate', authenticate, requireRole('admin'), req
     await reactivateWithCorrectiveEvent(db, req.params.oeilId, newScore, req.user.id);
     const oeil = oeilCheck;
 
-  await db.query(
-    `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-     VALUES ($1, '✅ Compte réactivé', $2, 'success', 'none', $3, $4, $5)`,
-    [oeil.id, `Votre compte a été réactivé par un administrateur. Score de réintégration : ${newScore}%.`, 'accountReactivatedTitle', 'accountReactivatedAdminBody', JSON.stringify({ score: newScore })]
+  await notify(
+    db, oeil.id,
+    '✅ Compte réactivé',
+    `Votre compte a été réactivé par un administrateur. Score de réintégration : ${newScore}%.`,
+    'success', null, null, 'none',
+    'accountReactivatedTitle', 'accountReactivatedAdminBody', { score: newScore }
   );
 
   res.json({ ok: true, oeil });

@@ -1,5 +1,8 @@
 const { getDb } = require('../db/schema');
 const { getSetting } = require('./settings');
+// notify() — in-app + socket live + push (utils/notify.js). Pas d'emitToUser dans ce module
+// (util appelé hors requête) → null : in-app identique (no-live) ; le gain ici est le push.
+const { notify } = require('./notify');
 
 // ── Pénalité proportionnelle au délai avant la mission ────
 // Plus l'action (refus, annulation...) est tardive, plus elle désorganise
@@ -141,10 +144,12 @@ async function checkAndUpdateSuspension(db, oeilId) {
     // suspension manuelle (users.js) — depuis le constat 09 ci-dessous, les deux voies
     // retirent réellement les missions en cours, donc les deux méritent la même précision sur
     // ce qui reste accessible (connexion, demande d'examen).
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-       VALUES ($1, '🔴 Compte suspendu', 'Votre score de fiabilité est tombé en dessous de 50%. Vous conservez l''accès à votre compte : vous pouvez toujours vous connecter et demander un examen de votre dossier.', 'error', 'none', $2, $3, $4)`,
-      [oeilId, 'accountAutoSuspendedTitle', 'accountAutoSuspendedBody', null]
+    await notify(
+      db, oeilId,
+      '🔴 Compte suspendu',
+      "Votre score de fiabilité est tombé en dessous de 50%. Vous conservez l'accès à votre compte : vous pouvez toujours vous connecter et demander un examen de votre dossier.",
+      'error', null, null, 'none',
+      'accountAutoSuspendedTitle', 'accountAutoSuspendedBody', null
     );
 
     // BE-4 constat 09 (2026-08-21) : aligne la suspension automatique par score sur la

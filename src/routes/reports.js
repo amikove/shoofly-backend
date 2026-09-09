@@ -2,6 +2,8 @@ const router = require('express').Router();
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
+// notify() — point d'insertion unique in-app + socket live + push (utils/notify.js).
+const { notify } = require('../utils/notify');
 
 // ── GET /api/reports/:missionId ───────────────────────────
 router.get('/:missionId', authenticate, asyncHandler(async (req, res) => {
@@ -60,19 +62,17 @@ router.post('/:missionId', authenticate, requireRole('oeil'), asyncHandler(async
     [req.params.missionId, req.user.id, JSON.stringify(data), score, submitted || false]
   );
 
-  // Si soumis, notifier le client
+  // Si soumis, notifier le client — migré vers notify() (chantier push) : emit ligne complète
+  // (deep-link + marquage lu) + canal push.
   if (submitted) {
     const emitToUser = req.app.get('emitToUser');
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-       VALUES ($1, '📋 Rapport de visite disponible', $2, 'info', $3, 'mission_view', $4, $5, $6)`,
-      [mission.client_id, `Le rapport de visite pour "${mission.title}" est prêt.`, req.params.missionId, 'visitReportAvailableTitle', 'visitReportAvailableBody', JSON.stringify({ missionTitle: mission.title })]
+    await notify(
+      db, mission.client_id,
+      '📋 Rapport de visite disponible',
+      `Le rapport de visite pour "${mission.title}" est prêt.`,
+      'info', req.params.missionId, emitToUser, 'mission_view',
+      'visitReportAvailableTitle', 'visitReportAvailableBody', { missionTitle: mission.title }
     );
-    if (emitToUser) emitToUser(mission.client_id, 'notification', {
-      title: '📋 Rapport de visite disponible',
-      body: `Le rapport pour "${mission.title}" est prêt.`,
-      missionId: req.params.missionId
-    });
   }
 
   res.json({ report });

@@ -6,6 +6,8 @@ const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { chatAccessExpiresAt } = require('./missions');
+// notify() — point d'insertion unique in-app + socket live + push (utils/notify.js).
+const { notify } = require('../utils/notify');
 const { getSetting } = require('../utils/settings');
 
 // ── Config Cloudinary ─────────────────────────────────────
@@ -100,19 +102,17 @@ router.post('/:missionId', authenticate, asyncHandler(checkMissionUploadAuthoriz
   if (inserted.length > 0 && req.user.role === 'oeil') {
     const emitToUser = req.app.get('emitToUser');
     const notifBody = `Votre Œil a envoyé ${inserted.length} ${inserted[0]?.type === 'video' ? 'vidéo(s)' : 'photo(s)'} pour "${mission.title}"`
-    await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'media',$4,'mission_view',$5,$6,$7)`,
-      [mission.client_id, '📸 Médias reçus', notifBody, mission.id, 'mediaReceivedTitle', 'mediaReceivedBody', JSON.stringify({ count: inserted.length, mediaType: inserted[0]?.type === 'video' ? 'vidéo(s)' : 'photo(s)', missionTitle: mission.title })]
+    // Migré vers notify() (chantier push) : l'emit partiel devient la ligne complète (le clic
+    // in-app peut deep-linker/se marquer lu) + canal push. Destinataire = mission.client_id,
+    // identique à l'ancien `recipientId` (la route est gardée req.user.role==='oeil', donc
+    // req.user.id ≠ client_id). Le foreground navigateur (useNotifications.js) reste déclenché
+    // via le titre '📸 Médias reçus'.
+    await notify(
+      db, mission.client_id, '📸 Médias reçus', notifBody,
+      'media', mission.id, emitToUser, 'mission_view',
+      'mediaReceivedTitle', 'mediaReceivedBody',
+      { count: inserted.length, mediaType: inserted[0]?.type === 'video' ? 'vidéo(s)' : 'photo(s)', missionTitle: mission.title }
     );
-
-    const recipientId = req.user.id === mission.client_id ? mission.oeil_id : mission.client_id;
-      if (emitToUser) emitToUser(recipientId, 'notification', {
-        title: '📸 Médias reçus',
-        body: notifBody,
-        missionId: mission.id,
-        type: 'message'
-      });
-
   }
 
   res.status(201).json({ media: inserted, count: inserted.length });
