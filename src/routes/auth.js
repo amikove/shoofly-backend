@@ -112,7 +112,19 @@ router.post('/login', [
       const { rows: [user] } = await db.query('SELECT * FROM users WHERE email=$1', [req.body.email]);
       if (!user || !(await bcrypt.compare(req.body.password, user.password)))
         return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
-      if (!user.is_active) return res.status(403).json({ error: 'Compte suspendu' });
+
+      // Compte bloqué (is_active=false — blocage anti-fraude, désactivation admin, 2e strike
+      // no-show) : chantier L4 (2026-09-09). Avant : 403 sec, aucun token, aucun recours in-app.
+      // Désormais : on émet un token normal (le middleware authenticate restreint ensuite l'accès
+      // au strict nécessaire pour consulter le motif et déposer une contestation — voir
+      // isDeactivatedAccountAllowed, middleware/auth.js). Même principe qu'un Œil is_suspended
+      // (accès conservé, routes filtrées). `profile` non chargé : l'écran de contestation
+      // (CompteBloque.jsx) n'en a pas besoin, et le rôle Œil bloqué n'a de toute façon plus
+      // accès à son espace. `user.is_active===false` + `deactivation_context` (renvoyés par
+      // safe()) pilotent la redirection front vers /compte-bloque.
+      if (!user.is_active) {
+        return res.json({ token: makeToken(user), user: safe(user), profile: null });
+      }
 
       let profile = null;
       if (user.role === 'oeil') {

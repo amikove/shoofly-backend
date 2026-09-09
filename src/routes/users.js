@@ -1446,7 +1446,17 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
       u = row;
     } else {
       const { rows: [before] } = await db.query('SELECT is_active FROM users WHERE id=$1', [req.params.id]);
-      const { rows: [row] } = await db.query(`UPDATE users SET is_active = NOT is_active WHERE id=$1 RETURNING is_active`, [req.params.id]);
+      // deactivation_context (chantier L4, 2026-09-09) : posé à 'admin_toggle' quand ce toggle
+      // DÉSACTIVE, remis à NULL quand il RÉACTIVE — pilote le canal de recours COMPLET
+      // (isDeactivatedAccountAllowed, middleware/auth.js). CASE dans le même UPDATE atomique
+      // que le flip is_active, pas de 2e requête.
+      const { rows: [row] } = await db.query(
+        `UPDATE users
+           SET is_active = NOT is_active,
+               deactivation_context = CASE WHEN is_active THEN 'admin_toggle' ELSE NULL END
+         WHERE id=$1 RETURNING is_active`,
+        [req.params.id]
+      );
       u = row;
       // Client désactivé avec une mission en cours (PROMPT 6, 2026-08-18) : l'Œil assigné devient
       // décisionnaire (honorer/annuler sans pénalité) — voir handleClientDisabled, routes/missions.js.
@@ -1549,7 +1559,7 @@ router.post('/admin/clients/:id/unblock', authenticate, requireRole('admin'), re
   if (target.role !== 'client') return res.status(400).json({ error: 'Réservé aux comptes client.' });
 
   const { rows: [updated] } = await db.query(
-    `UPDATE users SET is_active=true, client_noshow_strikes=0 WHERE id=$1 RETURNING is_active, client_noshow_strikes`,
+    `UPDATE users SET is_active=true, client_noshow_strikes=0, deactivation_context=NULL WHERE id=$1 RETURNING is_active, client_noshow_strikes`,
     [req.params.id]
   );
 
