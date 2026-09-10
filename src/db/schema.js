@@ -1,6 +1,7 @@
 const { Pool } = require('pg');
 require('dotenv').config();
 const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
+const SUBCATEGORY_MIN_PRICES_SEED = require('../config/subcategoryMinPricesSeed');
 
 let pool;
 
@@ -1558,6 +1559,31 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     CREATE INDEX IF NOT EXISTS idx_push_send_log_status_created ON push_send_log(status, created_at);
     -- Analytics par type d'événement / lien vers la ligne in-app source.
     CREATE INDEX IF NOT EXISTS idx_push_send_log_notification ON push_send_log(notification_id) WHERE notification_id IS NOT NULL;
+
+    -- ═══ Planchers tarifaires par sous-catégorie — chantier « planchers éditables », 2026-09-10 ═══
+    -- Remplace la table en dur SUBCATEGORY_MIN_PRICES (constants/missionCategories.js, chantier D1)
+    -- ET son jumeau MIN_PRICES côté frontend (NewMissionModal.jsx), qui étaient maintenus synchro
+    -- à la main. Source de vérité UNIQUE désormais : cette table. Lue en runtime via
+    -- utils/subcategoryMinPrices.js (cache 60 s + invalidation à l'écriture), éditée depuis
+    -- Paramètres › 💰 Tarification (PUT /api/users/admin/subcategory-min-prices).
+    --
+    -- subcategory = clé nue ('Consulat étranger', pas 'Consulats et visas — Consulat étranger') ;
+    -- OU une des 4 sentinelles de défaut par type ('_immobilier' / '_file_attente' / '_audit' /
+    -- '_personnalisee') appliquées quand la sous-catégorie choisie n'a pas de plancher nommé.
+    -- Aucune vraie sous-catégorie ne commence par '_' → pas de collision. Voir
+    -- config/subcategoryMinPricesSeed.js pour le détail des 49 valeurs initiales et l'historique.
+    --
+    -- Seed idempotent (ON CONFLICT DO NOTHING) : les 49 valeurs = COPIE EXACTE des planchers D1
+    -- déjà en production. Zéro changement de comportement au déploiement. Sur une base déjà
+    -- initialisée, l'admin peut avoir personnalisé une valeur → jamais réécrasée.
+    CREATE TABLE IF NOT EXISTS subcategory_min_prices (
+      subcategory TEXT PRIMARY KEY,
+      category    TEXT NOT NULL,
+      min_price   NUMERIC NOT NULL CHECK (min_price > 0)
+    );
+    INSERT INTO subcategory_min_prices (subcategory, category, min_price) VALUES
+      ${SUBCATEGORY_MIN_PRICES_SEED.map(r => `('${r.subcategory.replace(/'/g, "''")}', '${r.category}', ${r.min_price})`).join(',\n      ')}
+    ON CONFLICT (subcategory) DO NOTHING;
   `);
   console.log('✅ PostgreSQL schema ready');
 }

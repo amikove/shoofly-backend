@@ -19,7 +19,8 @@ const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
 const Sentry = require('@sentry/node');
 const { resolveQuartier, validateCityInput } = require('../constants/villes');
-const { isValidSubcategory, getSubcategoryMinPrice } = require('../constants/missionCategories');
+const { isValidSubcategory } = require('../constants/missionCategories');
+const { getSubcategoryMinPrice, loadSubcategoryMinPricesMap } = require('../utils/subcategoryMinPrices');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
 const { checkCashCommissionBalance, settleCashCommission } = require('../utils/cashCommission');
 const { generateUniqueReference } = require('../utils/ticketReference');
@@ -324,16 +325,27 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
   // D1 (audit régression 360° v4, 2026-08-31) — jusqu'ici SEUL le plancher global de 80 MAD
   // était appliqué, quelle que soit la sous-catégorie : un appel API direct pouvait réserver
   // n'importe quelle sous-catégorie file_attente (« Consulat étranger » = 169 MAD attendus,
-  // etc.) à 80 MAD, le frontend n'appliquant ces planchers spécifiques que dans le formulaire
-  // (NewMissionModal.jsx, getMinPrice). On porte la table (constants/missionCategories.js,
-  // SUBCATEGORY_MIN_PRICES) et on prend le MAX du plancher global et du plancher spécifique —
-  // max, pas simple remplacement, pour ne jamais AFFAIBLIR le plancher global si un admin
-  // remontait `min_price` au-dessus d'une valeur de la table. Sous-catégorie absente de la
-  // table (« Autre », « À préciser », ou catégorie hors file_attente non listée) : seul le
-  // plancher global s'applique, comportement inchangé.
+  // etc.) à 80 MAD, le frontend n'appliquant ces planchers spécifiques que dans le formulaire.
+  //
+  // Chantier « planchers éditables » (2026-09-10) — la table de prix D1 (jadis en dur dans
+  // constants/missionCategories.js ET NewMissionModal.jsx) est passée en base
+  // (subcategory_min_prices), lue ici via utils/subcategoryMinPrices.js (cache 60 s). La formule
+  // est INCHANGÉE : MAX du plancher global et du plancher spécifique — max, pas simple
+  // remplacement, pour ne jamais AFFAIBLIR le plancher global si un admin remontait `min_price`
+  // au-dessus d'une valeur de la table.
+  //
+  // Nouveauté de comportement serveur (décision de session, Option C) : getSubcategoryMinPrice
+  // retombe désormais sur un « défaut par type » (_immobilier=129 / _file_attente=85 / _audit=209
+  // / _personnalisee=85, en table, éditables) quand la sous-catégorie n'a pas de plancher nommé
+  // (immobilier/personnalisée sans sous-catégorie, « … — Autre », « Autre — À préciser »). Avant,
+  // ces cas ne connaissaient QUE le plancher global (80) côté serveur — le frontend, lui,
+  // appliquait déjà ces défauts. Le formulaire est donc inchangé ; seul un appel API direct qui
+  // le contournait avec un prix entre le global et le défaut par type est désormais refusé
+  // (aligne le serveur sur l'intention de D1 : ne jamais compter sur le frontend seul pour une
+  // règle financière). null (garde-fou : type inattendu) → plancher global, comme avant.
   if (!freePromo) {
     const globalMin = await getSetting(db, 'min_price', 80);
-    const subMin = getSubcategoryMinPrice(subcategory); // null si pas de plancher spécifique
+    const subMin = await getSubcategoryMinPrice(db, type, subcategory); // null si aucun plancher (nommé ni défaut de type)
     const minPrice = subMin !== null ? Math.max(globalMin, subMin) : globalMin;
     if (+price < minPrice) return { error: `Le prix minimum est de ${minPrice} MAD` };
   }
@@ -1622,6 +1634,25 @@ router.get('/pending-h30-resume', authenticate, requireRole('oeil'), asyncHandle
     ORDER BY m.transfer_deadline ASC
   `, [req.user.id]);
   res.json({ pending_h30_resume: rows });
+}));
+
+// ── GET /missions/subcategory-min-prices ───────────────────────────────────────────────────
+// Planchers tarifaires par sous-catégorie + plancher global, pour l'affichage « Budget minimum
+// pour cette mission : XX MAD » du formulaire de création (NewMissionModal.jsx), AVANT qu'une
+// mission existe — donc distinct du mécanisme C9 qui expose des réglages via le payload d'une
+// mission DÉJÀ créée. `authenticate` seul (le client crée les missions ; donnée non sensible,
+// déjà affichée dans le formulaire). MÊME source que la validation serveur (prepareMissionInsert
+// lit la même table via le même helper) → aucune désynchronisation possible, c'est l'objet du
+// chantier. Le client applique `Math.max(global_min, floor)` à l'identique — voir getMinPrice
+// (NewMissionModal.jsx), commentaire jumeau.
+// Doit rester AVANT `router.get('/:id')` (sinon capturé comme :id).
+router.get('/subcategory-min-prices', authenticate, asyncHandler(async (req, res) => {
+  const db = getDb();
+  const [globalMin, floors] = await Promise.all([
+    getSetting(db, 'min_price', 80),
+    loadSubcategoryMinPricesMap(db),
+  ]);
+  res.json({ global_min: Number(globalMin), floors });
 }));
 
 // ── GET /missions/:id ──────────────────────────────────
