@@ -12,6 +12,7 @@ const cashplusService = require('../services/cashplus');
 const { isNewOeil } = require('../utils/reliabilityScore');
 const { computeAvgResponseMinutes } = require('../utils/responseTime');
 const { getSetting, invalidateSettingsCache, isNumeric } = require('../utils/settings');
+const { loadSubcategoryMinPricesMap, invalidateSubcategoryMinPricesCache } = require('../utils/subcategoryMinPrices');
 const { isWithinSchedule } = require('../utils/schedule');
 const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
 const { validateSettingValue } = require('../config/settingValidators');
@@ -1809,6 +1810,61 @@ router.get('/admin/settings/history', authenticate, requireRole('admin'), requir
 
   res.json({ history: rows, total, page: +page, pages: Math.ceil(total / limit) });
 }))
+
+// ── Admin : planchers tarifaires par sous-catégorie ─────────────────────────────────────────
+// Chantier « planchers éditables » (2026-09-10). Table dédiée `subcategory_min_prices` (49
+// lignes tabulaires) plutôt que 49 clés de plus dans `settings` — la validation générique
+// SETTING_RULES (Groupe 1) est faite pour des réglages clé→valeur simples, pas pour une table.
+// Même permission que le reste de la catégorie Tarification (GET/PUT /admin/settings) :
+// requireRole('admin') + requirePermission('finance').
+router.get('/admin/subcategory-min-prices', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows } = await db.query(
+    `SELECT subcategory, category, min_price FROM subcategory_min_prices ORDER BY category, subcategory`
+  );
+  // min_price en Number (la colonne NUMERIC revient en string via node-pg) — cohérent avec ce
+  // que loadSubcategoryMinPricesMap renvoie au runtime et avec l'input numérique côté admin.
+  res.json({ rows: rows.map(r => ({ ...r, min_price: Number(r.min_price) })) });
+}));
+
+// Écriture partielle clé→valeur, même contrat que PUT /admin/settings : le corps est un objet
+// { [subcategory]: min_price, ... }, seules les clés présentes sont touchées. ATOMIQUE — une
+// seule valeur invalide OU une clé inconnue ⇒ 400 listant tout, aucune écriture. La liste des
+// sous-catégories est FIGÉE par le seed (schema.js) : cette route ne fait qu'UPDATE, jamais
+// INSERT/DELETE (on n'invente pas de sous-catégorie depuis l'API). Validation de la valeur :
+// nombre fini > 0, aucune borne haute arbitraire (même principe que settingValidators / Groupe 1
+// — les bornes hautes ne sont posées que là où le domaine est intrinsèquement borné).
+router.put('/admin/subcategory-min-prices', authenticate, requireRole('admin'), requirePermission('finance'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const entries = Object.entries(body).filter(([, v]) => v !== undefined);
+  if (entries.length === 0) return res.status(400).json({ error: 'Aucun plancher à modifier.' });
+
+  const known = await loadSubcategoryMinPricesMap(db); // { subcategory: number } — l'allowlist
+  const errors = [];
+  const clean = [];
+  for (const [subcategory, rawValue] of entries) {
+    if (!Object.prototype.hasOwnProperty.call(known, subcategory)) {
+      errors.push(`${subcategory} : sous-catégorie inconnue`);
+      continue;
+    }
+    const n = Number(String(rawValue).trim());
+    if (!Number.isFinite(n)) { errors.push(`${subcategory} : doit être un nombre (reçu : ${JSON.stringify(String(rawValue))})`); continue; }
+    if (n <= 0) { errors.push(`${subcategory} : doit être strictement positif (reçu : ${n})`); continue; }
+    clean.push([subcategory, n]);
+  }
+  if (errors.length > 0) {
+    return res.status(400).json({ error: `Plancher(s) invalide(s) — aucune modification enregistrée. ${errors.join(' ; ')}` });
+  }
+
+  await walletService.withTransaction(db, async (client) => {
+    for (const [subcategory, n] of clean) {
+      await client.query(`UPDATE subcategory_min_prices SET min_price=$1 WHERE subcategory=$2`, [n, subcategory]);
+    }
+  });
+  invalidateSubcategoryMinPricesCache();
+  res.json({ ok: true, updated: clean.length });
+}));
 
 // ── Admin : messages suspects ───────────────────────────────
 router.get('/admin/flagged-messages', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
