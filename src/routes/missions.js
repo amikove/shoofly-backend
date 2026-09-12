@@ -3079,22 +3079,51 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
 // ── POST /missions/:id/force-reassign ── Admin force une réattribution (mission active/en_route) ──
 // (PROMPT 2 point 4, 2026-08-17). Même mécanique que POST /:id/assistance{urgence} ci-dessus —
 // réutilise releaseMissionForReplacement telle quelle (transitionMission/cooldown/cascade
-// identiques), SANS pénalité de fiabilité au déclenchement (skipReliabilityPenalty:true) : un
-// admin qui force une réattribution ne peut pas juger en temps réel s'il s'agit d'un abandon ou
-// d'une situation légitime (perte de contact, doute...). Insère une ligne
-// mission_assistance_requests (category='urgence', triggered_by_admin_id posé) pour rester
-// requalifiable a posteriori via POST /missions/assistance-requests/:id/requalify (PROMPT 1
-// point 5, totalement inchangée — elle ne distingue pas l'origine de la ligne) : même parcours
-// que si l'Œil avait lui-même déclaré une urgence, cohérence explicitement demandée avec le
-// prompt 1. Réservée à 'active'/'en_route' (pas 'assigned', scope explicite de la demande) —
-// pour une mission encore 'assigned', l'admin dispose déjà de PUT /:id/admin-edit et de
-// l'affectation directe.
+// identiques). Insère une ligne mission_assistance_requests (category='urgence',
+// triggered_by_admin_id posé) — même parcours que si l'Œil avait lui-même déclaré une urgence,
+// cohérence explicitement demandée avec le prompt 1. Réservée à 'active'/'en_route' (pas
+// 'assigned', scope explicite de la demande) — pour une mission encore 'assigned', l'admin
+// dispose déjà de PUT /:id/admin-edit et de l'affectation directe. Comme mission.status est
+// forcément 'active'/'en_route' ici, releaseMissionForReplacement calcule toujours
+// transferType='during' — jamais 'before' — donc cette route ne peut déclencher que la pénalité
+// -70 (transfer_during_no_replacement_penalty_points), jamais la -10 "before".
+//
+// Correctif 2026-09-12 (RAPPORT_PENALITES_FIABILITE.md) — PÉNALITÉ APPLIQUÉE PAR DÉFAUT
+// (skipReliabilityPenalty désormais conditionnel, plus jamais true inconditionnel). Avant ce
+// correctif, ce chemin était — avec /:id/assistance{urgence} — l'un des 2 SEULS déclencheurs
+// HTTP de releaseMissionForReplacement, et passait systématiquement skipReliabilityPenalty:true
+// : la pénalité -70 (la plus sévère du barème, réglages Parametres) n'était alors JAMAIS
+// atteignable par aucune route — code mort, constat de la session doc-visuelle Phase 2
+// (2026-09-11). Audit d'usage réel avant correctif (RAPPORT_PENALITES_FIABILITE.md §A) :
+// mission_assistance_requests est vide en local (0 ligne, plateforme pré-lancement, aucun
+// triggered_by_admin_id historique) — aucune trace d'usage réel disponible pour trancher
+// empiriquement. Décision produit (confirmée dans le prompt de session) : la clémence par
+// défaut reste réservée à l'urgence AUTO-DÉCLARÉE par l'Œil (assistance{urgence}, ci-dessus,
+// intégralement inchangée) ; un abandon/no-show CONSTATÉ PAR L'ADMIN doit désormais coûter des
+// points par défaut, avec une exemption possible au cas par cas (voir exempt_penalty ci-dessous)
+// pour les cas de doute réel (perte de contact, situation à vérifier...) — même patron que
+// override_warning/override_reason (POST /:id/assign-admin) : confirmation explicite requise,
+// jamais un bypass silencieux ou une case cochée par défaut.
+// La pénalité elle-même reste DIFFÉRÉE à checkTransferDeadlines (ci-dessous) — elle ne
+// s'applique que si aucun remplaçant n'est trouvé avant transfer_deadline (45/60min), jamais
+// immédiatement au déclenchement : un remplaçant trouvé rapidement ne coûte toujours rien à
+// l'Œil, exempté ou non. Zéro changement sur le cooldown (posé sans condition dans
+// releaseMissionForReplacement, jamais gouverné par skipReliabilityPenalty) ni sur le
+// remboursement client (refundOnCancellation, checkTransferDeadlines — inconditionnel lui
+// aussi) : seule la pénalité de fiabilité est concernée par ce correctif.
 router.post('/:id/force-reassign', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
-  const { reason } = req.body;
+  const { reason, exempt_penalty, exempt_reason } = req.body;
   if (!reason || !reason.trim()) return res.status(400).json({ error: 'Le motif est obligatoire' });
+  // exempt_penalty : jamais une case cochée par défaut côté frontend — même exigence que
+  // override_warning. Raison obligatoire dès que l'exemption est demandée, pour laisser une
+  // trace consultable (mission_status_history.note + mission_assistance_requests.reason
+  // ci-dessous) de POURQUOI cet abandon constaté n'a pas été sanctionné.
+  if (exempt_penalty && (!exempt_reason || !exempt_reason.trim())) {
+    return res.status(400).json({ error: "Raison de l'exemption obligatoire pour exempter cette réattribution de la pénalité de fiabilité." });
+  }
 
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
@@ -3105,7 +3134,9 @@ router.post('/:id/force-reassign', authenticate, requireRole('admin'), asyncHand
 
   const trimmedReason = reason.trim();
   const oeilId = mission.oeil_id;
-  const fullReason = `Réattribution forcée par un administrateur : ${trimmedReason}`;
+  const isExempt = exempt_penalty === true;
+  let fullReason = `Réattribution forcée par un administrateur : ${trimmedReason}`;
+  if (isExempt) fullReason += ` — pénalité de fiabilité exemptée par l'admin : ${exempt_reason.trim()}`;
 
   const result = await releaseMissionForReplacement(db, io, emitToUser, mission, oeilId, fullReason, {
     historyNoteVerb: 'Réattribution forcée par un administrateur',
@@ -3115,7 +3146,7 @@ router.post('/:id/force-reassign', authenticate, requireRole('admin'), asyncHand
     clientAlertBodyKey: 'forceReassignClientBody',
     systemMessageText: 'Un administrateur a lancé une recherche de remplaçant pour cette mission.',
     systemMessageKey: 'forceReassignSystemMessage',
-    skipReliabilityPenalty: true,
+    skipReliabilityPenalty: isExempt,
   });
   if (!result.ok) return res.status(result.status).json({ error: result.error });
 
@@ -3125,11 +3156,20 @@ router.post('/:id/force-reassign', authenticate, requireRole('admin'), asyncHand
     [mission.id, oeilId, fullReason, result.transferType, req.user.id]
   );
 
-  await notify(db, oeilId, 'Mission réattribuée par un administrateur',
-    `Un administrateur a lancé une recherche de remplaçant pour "${mission.title}". Aucune pénalité ne vous a été appliquée pour le moment.`,
-    'mission', mission.id, emitToUser, null, 'forceReassignOeilTitle', 'forceReassignOeilBody', { missionTitle: mission.title });
+  // Message Œil conditionnel — mensonger sinon : avant ce correctif, ce texte affirmait
+  // "aucune pénalité" de façon inconditionnelle. Ce n'est plus vrai par défaut (isExempt=false)
+  // — le sort réel de la pénalité (-70) dépend de la suite (remplaçant trouvé à temps ou non),
+  // décidée plus tard par checkTransferDeadlines, jamais connue à cet instant.
+  await notify(db, oeilId,
+    'Mission réattribuée par un administrateur',
+    isExempt
+      ? `Un administrateur a lancé une recherche de remplaçant pour "${mission.title}". Aucune pénalité ne vous a été appliquée pour cette mission.`
+      : `Un administrateur a lancé une recherche de remplaçant pour "${mission.title}". Si aucun remplaçant n'est trouvé avant l'expiration du délai, une pénalité de fiabilité pourra être appliquée.`,
+    'mission', mission.id, emitToUser, null, 'forceReassignOeilTitle',
+    isExempt ? 'forceReassignOeilBody' : 'forceReassignOeilBodyPenaltyPending',
+    { missionTitle: mission.title });
 
-  res.json({ ok: true, assistance_request_id: assistanceRequest.id, transfer_type: result.transferType, deadline: result.deadline });
+  res.json({ ok: true, assistance_request_id: assistanceRequest.id, transfer_type: result.transferType, deadline: result.deadline, penalty_exempted: isExempt });
 }));
 
 // ── POST /missions/assistance-requests/:id/requalify ── Admin requalifie une urgence a posteriori ──
@@ -3149,6 +3189,20 @@ router.post('/:id/force-reassign', authenticate, requireRole('admin'), asyncHand
 // /admin/users/:userId (UserProfile.jsx), page gardée requiredPermission="users" côté écran — un
 // admin « users » sans « identity » verra donc le bouton et recevra un 403 (suivi frontend à
 // prévoir : masquer le bouton hors permission identity).
+//
+// Correctif 2026-09-12 (RAPPORT_PENALITES_FIABILITE.md) — depuis que POST /:id/force-reassign
+// applique par défaut la pénalité -70 (voir son commentaire ci-dessus), une ligne category=
+// 'urgence' avec triggered_by_admin_id posé peut désormais DÉJÀ porter une pénalité automatique
+// (journalisée par checkTransferDeadlines si aucun remplaçant n'a été trouvé à temps) au moment
+// où un admin tente de la requalifier — cas impossible avant ce correctif (skipReliabilityPenalty
+// était systématique, donc jamais de pénalité automatique préexistante à requalifier). Sans garde,
+// requalifier une telle ligne ajouterait une 2ᵉ pénalité (barème computeLatePenalty, jusqu'à -50)
+// PAR-DESSUS le -70 déjà appliqué — double sanction non voulue pour le même abandon. Garde ajoutée
+// juste en dessous, avant la mutation. N'affecte PAS les déclarations Œil auto-déclarées
+// (assistance{urgence} reste inconditionnellement skipReliabilityPenalty:true, jamais de pénalité
+// automatique préexistante possible pour ces lignes) ni un force-reassign exempté ou dont un
+// remplaçant a été trouvé à temps (aucune pénalité automatique dans ces deux cas non plus) :
+// requalify reste pleinement utilisable pour ces 3 situations, inchangé.
 router.post('/assistance-requests/:id/requalify', authenticate, requireRole('admin'), requirePermission('identity'), asyncHandler(async (req, res) => {
   const db = getDb();
   const emitToUser = req.app.get('emitToUser');
@@ -3164,6 +3218,20 @@ router.post('/assistance-requests/:id/requalify', authenticate, requireRole('adm
 
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [assistanceRequest.mission_id]);
   if (!mission) return res.status(404).json({ error: 'Mission introuvable' });
+
+  // Double-pénalité (voir commentaire de la route ci-dessus) : cette ligne a-t-elle déjà reçu la
+  // pénalité automatique -70 "pendant mission, sans remplaçant" ? Comparaison par (oeil_id,
+  // mission_id, reason) faute de lien direct reliability_events → mission_assistance_requests
+  // (même limite déjà documentée pour transfer_h30_no_show/transfer_no_penalty, schema.js) —
+  // reason partagée via la constante TRANSFER_DURING_NO_REPLACEMENT_REASON, jamais un littéral
+  // dupliqué, pour ne jamais diverger silencieusement du texte réellement inséré plus bas.
+  const { rows: [existingAutoPenalty] } = await db.query(
+    `SELECT id FROM reliability_events WHERE oeil_id=$1 AND mission_id=$2 AND reason=$3`,
+    [assistanceRequest.oeil_id, mission.id, TRANSFER_DURING_NO_REPLACEMENT_REASON]
+  );
+  if (existingAutoPenalty) {
+    return res.status(400).json({ error: "Cette mission a déjà reçu la pénalité automatique -70 (aucun remplaçant trouvé) — requalification inutile, l'abandon est déjà sanctionné." });
+  }
 
   // Garde d'idempotence posée sur l'UPDATE lui-même, même principe que les autres routes de ce
   // chantier : si deux admins requalifient la même déclaration en concurrence, un seul applique
@@ -3639,6 +3707,11 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
   });
 }));
 
+// Reason partagée avec la garde anti-double-pénalité de POST /assistance-requests/:id/requalify
+// (voir son commentaire) — un seul littéral, jamais dupliqué, pour que la comparaison de
+// requalify ne puisse jamais diverger silencieusement du texte réellement inséré ci-dessous.
+const TRANSFER_DURING_NO_REPLACEMENT_REASON = 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission';
+
 // ── Cron : vérifier deadlines transfert expirées ──────────
 // (appelé depuis index.js via cron)
 async function checkTransferDeadlines(db, io, emitToUser) {
@@ -3776,7 +3849,7 @@ async function checkTransferDeadlines(db, io, emitToUser) {
     //    l'état mission restent cohérents, réconciliation intacte ; pas de rejeu) — voir rapport
     //    Groupe 3 §3.3.
     if (applyDuringPenalty) {
-      await logReliabilityEvent(db, mission.transferred_from, mission.id, transferDuringNoReplacementPenaltyPoints, 'Transfert pendant mission sans remplaçant trouvé — abandon en cours de mission', true);
+      await logReliabilityEvent(db, mission.transferred_from, mission.id, transferDuringNoReplacementPenaltyPoints, TRANSFER_DURING_NO_REPLACEMENT_REASON, true);
     } else if (isBefore) {
       await logReliabilityEvent(db, mission.transferred_from, mission.id, transferBeforeNoReplacementPenaltyPoints, 'Transfert avant démarrage sans remplaçant trouvé', true);
     }

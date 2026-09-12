@@ -844,6 +844,18 @@ initDb().then(() => {
               oeil_id: null,
               batch_wave_count: 0,
               transfer_h30_no_show: true,
+              // transfer_no_penalty=true (correctif 2026-09-12, RAPPORT_PENALITES_FIABILITE.md) :
+              // sans ce flag, checkTransferDeadlines (missions.js) réapplique SA PROPRE pénalité
+              // "avant démarrage, sans remplaçant" (transfer_before_no_replacement_penalty_points,
+              // -10 par défaut) si aucun remplaçant n'est trouvé avant transfer_deadline — en plus
+              // du -20 déjà journalisé plus bas (noShowH30PenaltyPoints), pour un total de -30 non
+              // documenté nulle part (le texte admin de no_show_h30_penalty_points promet -20 "en
+              // plus du transfert automatique et du débit financier", pas d'un 2ᵉ événement de
+              // fiabilité). Même flag que releaseMissionForReplacement (URGENCE), checkPresence
+              // ConfirmationDeadlines et reassignMissionsOnSuspension : la pénalité de CE cron est
+              // déjà entièrement décidée et journalisée ci-dessous (logReliabilityEvent), le filet
+              // checkTransferDeadlines ne doit pas en rejouer une seconde, distincte, par défaut.
+              transfer_no_penalty: true,
             },
             note: 'Transfert automatique — mission non démarrée à l\'heure (H+30)',
           });
