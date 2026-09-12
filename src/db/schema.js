@@ -1198,11 +1198,16 @@ CREATE TABLE IF NOT EXISTS identity_documents (
 
     -- Réattribution forcée par un admin (PROMPT 2 point 4, 2026-08-17) — POST /missions/:id/
     -- force-reassign insère une ligne category='urgence' comme si l'Œil l'avait lui-même
-    -- déclarée (même parcours releaseMissionForReplacement, skipReliabilityPenalty:true, même
-    -- requalification a posteriori possible via POST /missions/assistance-requests/:id/
-    -- requalify, PROMPT 1 point 5, inchangée). triggered_by_admin_id (NULL pour une déclaration
-    -- Œil normale) distingue les deux origines dans l'historique/l'écran admin, sans dupliquer
-    -- le mécanisme de requalification pour un cas qui suit exactement les mêmes règles.
+    -- déclarée (même parcours releaseMissionForReplacement), toujours requalifiable a posteriori
+    -- via POST /missions/assistance-requests/:id/requalify (PROMPT 1 point 5, inchangée — voir
+    -- toutefois sa garde anti-double-pénalité ajoutée 2026-09-12). triggered_by_admin_id (NULL
+    -- pour une déclaration Œil normale) distingue les deux origines dans l'historique/l'écran
+    -- admin, sans dupliquer le mécanisme de requalification pour un cas qui suit exactement les
+    -- mêmes règles. Correctif 2026-09-12 (RAPPORT_PENALITES_FIABILITE.md) : skipReliabilityPenalty
+    -- N'EST PLUS systématiquement true ici — passé conditionnellement selon exempt_penalty (champ
+    -- explicite du body, jamais un défaut silencieux), voir le commentaire de la route. Avant ce
+    -- correctif la pénalité -70 (transfer_during_no_replacement_penalty_points) était
+    -- structurellement inatteignable par cette route (skip toujours true).
     ALTER TABLE mission_assistance_requests ADD COLUMN IF NOT EXISTS triggered_by_admin_id TEXT REFERENCES users(id);
 
     -- ── Strikes "client absent" (anti-fraude no-show client) ──────────────────────────────
