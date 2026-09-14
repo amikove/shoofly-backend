@@ -22,7 +22,7 @@ const { resolveQuartier, validateCityInput } = require('../constants/villes');
 const { isValidSubcategory } = require('../constants/missionCategories');
 const { getSubcategoryMinPrice, loadSubcategoryMinPricesMap } = require('../utils/subcategoryMinPrices');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
-const { checkCashCommissionBalance, settleCashCommission } = require('../utils/cashCommission');
+const { checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins } = require('../utils/cashCommission');
 const { generateUniqueReference } = require('../utils/ticketReference');
 const { parsePagination } = require('../utils/pagination');
 // notify() — point d'insertion unique in-app + socket live + push (voir utils/notify.js).
@@ -449,7 +449,7 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
 // épuisé ; sinon laisse le champ à NULL — l'alerte admin "mission sans Œil depuis 12h" déjà
 // existante (index.js, cronStaleMissionsRunning) prend le relais, aucune nouvelle logique de
 // repli à construire ici (garde-fou explicite de la spec).
-async function sendUrgentWhatsAppWave(db, mission) {
+async function sendUrgentWhatsAppWave(db, mission, emitToUser = null) {
   const batchSize = await getSetting(db, 'urgent_mission_whatsapp_batch_size', 10);
   const delayMinutes = await getSetting(db, 'urgent_mission_whatsapp_batch_delay_minutes', 30);
 
@@ -473,6 +473,15 @@ async function sendUrgentWhatsAppWave(db, mission) {
     } else {
       console.warn(`[wasel] Œil ${o.id} sans téléphone renseigné — envoi ignoré (urgent-mission-wave)`);
     }
+    // Chantier notifications (2026-09-14), Partie A/C14 : en complément du WhatsApp ci-dessus
+    // (100% mort tant que G5 n'est pas résolu, voir waselTemplates.js), jamais à sa place — c'est
+    // le seul filet IA+push pour ce pool précis (Œils pas encore candidats, aucun autre chemin ne
+    // les touche). Inconditionnel (même Œil sans téléphone y compris) : notify() ne dépend pas du
+    // téléphone, contrairement à WhatsApp.
+    await notify(db, o.id, '🚨 Mission urgente disponible',
+      `${mission.title} — ${mission.city} · ${mission.price} MAD`, 'mission', mission.id, emitToUser, null,
+      'urgentWaveOeilTitle', 'urgentWaveOeilBody',
+      { missionTitle: mission.title, city: mission.city, price: mission.price });
   }
 
   // Reste-t-il des Œils éligibles non encore contactés ? Si oui, vague suivante programmée ;
@@ -518,7 +527,7 @@ async function notifyNewMission(db, mission, emitToUser, io) {
   // par vagues seulement, voir sendUrgentWhatsAppWave ci-dessus. Missions non urgentes : aucun
   // WhatsApp ici (comportement inchangé — seule la notification in-app ci-dessus existait déjà).
   if (mission.is_urgent) {
-    await sendUrgentWhatsAppWave(db, mission);
+    await sendUrgentWhatsAppWave(db, mission, emitToUser);
   }
 }
 
@@ -629,6 +638,8 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
     await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'paymentReceivedOeilTitle', 'paymentReceivedOeilBody', {missionTitle: mission.title, amount: mission.oeil_earning});
   }
   await notify(db, mission.client_id, '✅ Mission validée', `Vous avez validé "${mission.title}".`, 'info', mission.id, emitToUser, null, 'missionValidatedClientTitle', 'missionValidatedClientBody', {missionTitle: mission.title});
+  // Chantier notifications (2026-09-14), Partie C/G3 — no-op si pas de manque à gagner.
+  await notifyShortfallAdmins(db, mission, cashSettlement, emitToUser);
 
   res.json({ ok: true });
 }));
@@ -2426,26 +2437,18 @@ const { rows: [msg] } = await db.query(
   [req.params.id, req.user.id, cleanContent, isFlagged]
 );
 
-// Notifier l'admin si message suspect
+// Notifier l'admin si message suspect — migré vers notify() (chantier notifications
+// 2026-09-14, Partie B) : gagne le push, live socket conservé via emitToUser.
 if (isFlagged) {
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`)
   const sender = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [req.user.id])
   const senderName = `${sender.rows[0]?.first_name} ${sender.rows[0]?.last_name}`
+  const emitToUser = req.app.get('emitToUser')
   for (const admin of admins) {
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-       VALUES ($1, $2, $3, 'warning', $4, 'admin_messages_suspects', $5, $6, $7)`,
-      [admin.id, '⚠️ Message suspect détecté',
-       `${senderName} a peut-être partagé un contact externe dans la mission "${mission.title}"`,
-       req.params.id,
-       'suspiciousMessageAdminTitle', 'suspiciousMessageAdminBody', JSON.stringify({senderName, missionTitle: mission.title})]
-    )
-    const emitToUser = req.app.get('emitToUser')
-    if (emitToUser) emitToUser(admin.id, 'notification', {
-      title: '⚠️ Message suspect détecté',
-      body: `${senderName} — mission "${mission.title}"`,
-      missionId: req.params.id
-    })
+    await notify(db, admin.id, '⚠️ Message suspect détecté',
+      `${senderName} a peut-être partagé un contact externe dans la mission "${mission.title}"`,
+      'warning', req.params.id, emitToUser, 'admin_messages_suspects',
+      'suspiciousMessageAdminTitle', 'suspiciousMessageAdminBody', {senderName, missionTitle: mission.title})
   }
 }
 
@@ -2457,26 +2460,17 @@ if (isFlagged) {
       sender_role: req.user.role,
     });
   }
-// Notification à l'autre partie
-  const recipientId = req.user.id === mission.client_id 
-    ? mission.oeil_id 
+// Notification à l'autre partie — migré vers notify() (chantier notifications 2026-09-14,
+  // Partie B) : gagne le push, live socket conservé via emitToUser.
+  const recipientId = req.user.id === mission.client_id
+    ? mission.oeil_id
     : mission.client_id;
 
   if (recipientId) {
     const notifBody = `${mission.title} : ${content.trim().slice(0, 60)}`
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-      VALUES ($1, 'Nouveau message', $2, 'message', $3, 'chat', $4, $5, $6)`,
-      [recipientId, notifBody, req.params.id, 'newMessageMissionTitle', null, null]
-    );
     const emitToUser = req.app.get('emitToUser');
-    if (emitToUser) {
-      emitToUser(recipientId, 'notification', {
-        title: 'Nouveau message',
-        body: notifBody,
-        missionId: req.params.id
-      });
-    }
+    await notify(db, recipientId, 'Nouveau message', notifBody, 'message', req.params.id, emitToUser, 'chat',
+      'newMessageMissionTitle', null, null);
   }
   res.status(201).json({ message: msg });
 }));
@@ -3025,6 +3019,8 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
       await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé votre déclaration d'assistance sur "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceValidatedOeilTitle', 'assistanceValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
     }
     await notify(db, mission.client_id, '✅ Confirmé', `Vous avez validé la déclaration de l'Œil pour "${mission.title}".`, 'info', mission.id, emitToUser, null, 'assistanceValidatedClientTitle', 'assistanceValidatedClientBody', { missionTitle: mission.title });
+    // Chantier notifications (2026-09-14), Partie C/G3 — no-op si pas de manque à gagner.
+    await notifyShortfallAdmins(db, mission, cashSettlement, emitToUser);
 
     if (io) {
       io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'completed' });
@@ -3323,6 +3319,8 @@ router.post('/assistance-requests/:id/commission', authenticate, requireRole('ad
       `Un administrateur a décidé de ne pas prélever de commission sur "${mission.title}".`,
       'info', mission.id, emitToUser, null, 'commissionReleasedOeilTitle', 'commissionReleasedOeilBody', { missionTitle: mission.title });
   }
+  // Chantier notifications (2026-09-14), Partie C/G3 — no-op si decision==='release' (cashSettlement reste null) ou pas de manque à gagner.
+  await notifyShortfallAdmins(db, mission, cashSettlement, emitToUser);
 
   res.json({ ok: true, commission_decision: decision === 'debit' ? 'debited' : 'released', collected: cashSettlement?.collected ?? 0 });
 }));
@@ -3881,16 +3879,9 @@ async function checkTransferDeadlines(db, io, emitToUser) {
       ? `Aucun Œil disponible pour "${mission.title}".`
       : `Aucun Œil disponible pour "${mission.title}". Remboursement intégral effectué.`;
 
-    await emitToUser?.(mission.client_id, 'notification', {
-      title: '❌ Mission annulée',
-      body: cancelBody,
-      type: 'error'
-    });
-
-    await db.query(
-      `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,'❌ Mission annulée',$2,'error',$3,'mission_view',$4,$5,$6)`,
-      [mission.client_id, cancelBody, mission.id, 'missionCancelledNoReplacementTitle', 'missionCancelledNoReplacementBody', null]
-    );
+    await notify(db, mission.client_id, '❌ Mission annulée', cancelBody,
+      'error', mission.id, emitToUser, 'mission_view', 'missionCancelledNoReplacementTitle',
+      'missionCancelledNoReplacementBody', null);
 
     // Gabarit WhatsApp approuvé affirme explicitement un montant remboursé ({{2}}) — texte figé
     // côté Wasel/Meta. Aucun remboursement n'existant pour une mission cash, sauté pour 'cash'
@@ -4588,38 +4579,24 @@ router.post('/:id/report-problem', authenticate, asyncHandler(async (req, res) =
     [mission.id]
   );
 
-  // Notifier l'admin
+  // Notifier l'admin — migré vers notify() (chantier notifications 2026-09-14, Partie B) :
+  // gagne le push, live socket conservé via emitToUser.
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
   for (const admin of admins) {
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-       VALUES ($1, '🚨 Problème signalé en cours de mission', $2, 'error', $3, 'admin_problems', $4, $5, $6)`,
-      [admin.id, `${reporterRole === 'client' ? 'Client' : 'Œil'} a signalé : "${type}" sur "${mission.title}"`, mission.id,
-       'problemReportedAdminTitle', 'problemReportedAdminBody', JSON.stringify({reporterRole: reporterRole === 'client' ? 'Client' : 'Œil', problemType: type, missionTitle: mission.title})]
-    );
-    if (emitToUser) emitToUser(admin.id, 'notification', {
-      title: '🚨 Problème signalé en cours de mission',
-      body: `"${type}" sur "${mission.title}"`,
-      missionId: mission.id,
-      type: 'error'
-    });
+    await notify(db, admin.id, '🚨 Problème signalé en cours de mission',
+      `${reporterRole === 'client' ? 'Client' : 'Œil'} a signalé : "${type}" sur "${mission.title}"`,
+      'error', mission.id, emitToUser, 'admin_problems',
+      'problemReportedAdminTitle', 'problemReportedAdminBody',
+      {reporterRole: reporterRole === 'client' ? 'Client' : 'Œil', problemType: type, missionTitle: mission.title});
   }
 
-  // Notifier l'autre partie
+  // Notifier l'autre partie — même migration.
   const otherId = req.user.id === mission.client_id ? mission.oeil_id : mission.client_id;
   if (otherId) {
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-       VALUES ($1, '⚠️ Problème signalé sur votre mission', $2, 'warning', $3, 'mission_view', $4, $5, $6)`,
-      [otherId, `Un problème a été signalé : "${type}". L'équipe Shoofly a été alertée.`, mission.id,
-       'problemReportedPartyTitle', 'problemReportedPartyBody', JSON.stringify({problemType: type})]
-    );
-    if (emitToUser) emitToUser(otherId, 'notification', {
-      title: '⚠️ Problème signalé',
-      body: `"${type}" — Shoofly a été alerté`,
-      missionId: mission.id,
-      type: 'warning'
-    });
+    await notify(db, otherId, '⚠️ Problème signalé sur votre mission',
+      `Un problème a été signalé : "${type}". L'équipe Shoofly a été alertée.`,
+      'warning', mission.id, emitToUser, 'mission_view',
+      'problemReportedPartyTitle', 'problemReportedPartyBody', {problemType: type});
   }
 
   // Émettre aux deux parties connectées
@@ -4686,22 +4663,17 @@ router.put('/admin/problems/:id', authenticate, requireRole('admin'), asyncHandl
     );
     if (!report) return res.status(404).json({ error: 'Ticket introuvable' });
 
-    // Notifier le rapporteur (client ou Œil) de la décision admin — persistant, consultable même si la notif est ratée
+    // Notifier le rapporteur (client ou Œil) de la décision admin — persistant, consultable même
+    // si la notif est ratée. Migré vers notify() (chantier notifications 2026-09-14, Partie B) :
+    // gagne le push (mes_signalements est désormais résolu par rôle, voir services/push.js).
     const emitToUser = req.app.get('emitToUser');
     const statusLabel = { in_progress: 'pris en charge', resolved: 'résolu', dismissed: 'classé sans suite' }[status] || status;
     const reportStatusTitleKey = { in_progress: 'reportStatusInProgressTitle', resolved: 'reportStatusResolvedTitle', dismissed: 'reportStatusDismissedTitle' }[status] || null;
     const reportBodyKey = admin_note ? null : 'reportStatusDefaultBody';
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, mission_id, action_type, title_key, body_key, params)
-       VALUES ($1, $2, $3, 'info', $4, 'mes_signalements', $5, $6, $7)`,
-      [report.reporter_id, `📋 Votre signalement a été ${statusLabel}`, admin_note || 'Votre signalement a été traité par notre équipe.', report.mission_id,
-       reportStatusTitleKey, reportBodyKey, null]
-    );
-    if (emitToUser) emitToUser(report.reporter_id, 'notification', {
-      title: `📋 Votre signalement a été ${statusLabel}`,
-      body: admin_note || 'Votre signalement a été traité par notre équipe.',
-      missionId: report.mission_id
-    });
+    await notify(db, report.reporter_id, `📋 Votre signalement a été ${statusLabel}`,
+      admin_note || 'Votre signalement a été traité par notre équipe.',
+      'info', report.mission_id, emitToUser, 'mes_signalements',
+      reportStatusTitleKey, reportBodyKey, null);
 
     // Si résolu → retirer sous_surveillance si plus aucun ticket ouvert
     if (['resolved','dismissed'].includes(status)) {

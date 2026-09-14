@@ -3,6 +3,8 @@ const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const asyncHandler = require('../middleware/asyncHandler');
+// notify() — même point d'insertion unique que routes/missions.js, voir utils/notify.js.
+const { notify } = require('../utils/notify');
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // Contestation d'un compte bloqué (is_active=false) — chantier L4 (2026-09-09).
@@ -66,22 +68,16 @@ router.post('/', authenticate, asyncHandler(async (req, res) => {
     [req.user.id, message.trim()]
   );
 
-  // Notif admins — même forme que A49 (reliabilityRoutes.js:83) : IA sans socket live (un admin
-  // hors-ligne la verra au prochain chargement ; l'écran /admin/block-appeals liste les 'pending').
+  // Notif admins — même forme que A49 (reliabilityRoutes.js:83). Migré vers notify() (chantier
+  // notifications 2026-09-14, Partie B) : gagne le push (deep-link /admin/block-appeals, voir
+  // services/push.js) + live pour un admin déjà connecté ; un admin hors-ligne la verra sinon au
+  // prochain chargement, comme avant.
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
   for (const admin of admins) {
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-       VALUES ($1, $2, $3, 'warning', 'admin_block_appeals', $4, $5, $6)`,
-      [
-        admin.id,
-        '📨 Contestation de blocage reçue',
-        `Un compte bloqué (${ctx === 'fraud_block' ? 'anti-fraude' : ctx === 'noshow_strikes' ? 'strikes no-show' : 'désactivation admin'}) a déposé une contestation.`,
-        'blockAppealReceivedAdminTitle',
-        'blockAppealReceivedAdminBody',
-        JSON.stringify({ context: ctx || 'unknown' }),
-      ]
-    );
+    await notify(db, admin.id, '📨 Contestation de blocage reçue',
+      `Un compte bloqué (${ctx === 'fraud_block' ? 'anti-fraude' : ctx === 'noshow_strikes' ? 'strikes no-show' : 'désactivation admin'}) a déposé une contestation.`,
+      'warning', null, emitToUser, 'admin_block_appeals',
+      'blockAppealReceivedAdminTitle', 'blockAppealReceivedAdminBody', { context: ctx || 'unknown' });
   }
 
   res.status(201).json({ appeal });
@@ -150,21 +146,16 @@ router.post('/admin/:id/decide', authenticate, requireRole('admin'), requirePerm
         : `UPDATE users SET is_active=true, deactivation_context=NULL WHERE id=$1`,
       [appeal.user_id]
     );
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-       VALUES ($1, '✅ Compte réactivé', $2, 'success', 'none', $3, $4, $5)`,
-      [appeal.user_id, `Votre compte a été réexaminé et réactivé. ${response || ''}`.trim(),
-       'accountReactivatedTitle', 'blockAppealApprovedBody', JSON.stringify({ response: response || '' })]
-    );
+    await notify(db, appeal.user_id, '✅ Compte réactivé',
+      `Votre compte a été réexaminé et réactivé. ${response || ''}`.trim(),
+      'success', null, emitToUser, 'none',
+      'accountReactivatedTitle', 'blockAppealApprovedBody', { response: response || '' });
   } else {
-    await db.query(
-      `INSERT INTO notifications (user_id, title, body, type, action_type, title_key, body_key, params)
-       VALUES ($1, '❌ Contestation refusée', $2, 'error', 'none', $3, $4, $5)`,
-      [appeal.user_id, `Votre contestation a été examinée et refusée. ${response || ''}`.trim(),
-       'blockAppealRejectedTitle', 'blockAppealRejectedBody', JSON.stringify({ response: response || '' })]
-    );
+    await notify(db, appeal.user_id, '❌ Contestation refusée',
+      `Votre contestation a été examinée et refusée. ${response || ''}`.trim(),
+      'error', null, emitToUser, 'none',
+      'blockAppealRejectedTitle', 'blockAppealRejectedBody', { response: response || '' });
   }
-  if (emitToUser) emitToUser(appeal.user_id, 'notification', { title: decision === 'approved' ? '✅ Compte réactivé' : '❌ Contestation refusée' });
 
   res.json({ appeal });
 }));

@@ -56,8 +56,8 @@ router.post('/', authenticate, requireRole('client', 'oeil'), asyncHandler(async
     await db.query(`UPDATE missions SET under_surveillance=true, updated_at=NOW() WHERE id=$1`, [mission.id]);
   }
 
+  const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
   if (isUrgent) {
-    const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
     for (const admin of admins) {
       await notify(
         db, admin.id,
@@ -73,6 +73,22 @@ router.post('/', authenticate, requireRole('client', 'oeil'), asyncHandler(async
     }
     const io = req.app.get('io');
     if (io) io.to('room:admin').emit('urgent_ticket_created', { ticketId: ticket.id, reference, subcategory });
+  } else {
+    // Chantier notifications (2026-09-14), Partie C/G5 — jusqu'ici aucun canal (seul filet : GET
+    // /tickets/admin/all consulté manuellement). notify() simple, mêmes admins que la branche
+    // urgente ci-dessus (aucune permission dédiée aux tickets dans middleware/permissions.js —
+    // les routes admin de ce fichier ne sont elles-mêmes gardées que par requireRole('admin')),
+    // sans WhatsApp (réservé aux tickets urgents).
+    for (const admin of admins) {
+      await notify(
+        db, admin.id,
+        '🎫 Nouveau ticket',
+        `${req.user.role === 'client' ? 'Client' : 'Œil'} a ouvert un ticket : "${subcategory || category}" (${reference})`,
+        'info', mission ? mission.id : null, emitToUser, 'admin_new_ticket',
+        'newTicketAdminTitle', 'newTicketAdminBody',
+        { reporterRole: req.user.role === 'client' ? 'Client' : 'Œil', subcategory: subcategory || category, reference, ticketId: ticket.id }
+      );
+    }
   }
 
   res.status(201).json({ ticket });

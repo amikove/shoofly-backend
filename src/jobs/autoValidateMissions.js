@@ -1,7 +1,7 @@
 const { getSetting } = require('../utils/settings');
 const { logStatus } = require('../utils/missionHistory');
 const walletService = require('../services/walletService');
-const { settleCashCommission } = require('../utils/cashCommission');
+const { settleCashCommission, notifyShortfallAdmins } = require('../utils/cashCommission');
 // notify() vient de routes/missions.js — require sûr ici (missions.js ne require jamais ce
 // module en retour, pas de cycle) : évite de dupliquer l'INSERT INTO notifications + emitToUser
 // déjà standardisé ailleurs dans le projet.
@@ -128,6 +128,8 @@ async function runAutoValidateMissions(db, emitToUser = null) {
         `"${mission.title}" a été validée automatiquement après ${clientValidationHours}h sans réponse de votre part.`,
         'info', mission.id, emitToUser, null, 'autoValidatedClientTitle', 'autoValidatedClientBody',
         { missionTitle: mission.title, hours: clientValidationHours });
+      // Chantier notifications (2026-09-14), Partie C/G3 — no-op si pas de manque à gagner.
+      await notifyShortfallAdmins(db, mission, cashSettlement, emitToUser);
     } catch (e) {
       console.error(`❌ Notification auto-validation mission ${mission.id} error:`, e.message);
     }

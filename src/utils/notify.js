@@ -1,5 +1,22 @@
 const push = require('../services/push');
 
+// action_type dont le deep-link dépend du rôle du destinataire (chemin /oeil/... vs
+// /client/...) — seuls ceux-ci justifient un aller-retour DB supplémentaire avant le push
+// (lookup PK sur users.id, un seul indexé, négligeable). Tous les autres action_type gardent le
+// contrat existant : aucune requête additionnelle. Voir push.js deepLinkFor pour le détail des cas.
+const ROLE_AWARE_ACTION_TYPES = new Set(['mission_view', 'chat', 'ticket_view', 'mes_signalements']);
+
+// Résout le deep-link complet en repoussant le lookup de rôle (si nécessaire) après l'insertion
+// in-app — jamais sur le chemin critique de la réponse HTTP (voir contrat sendWebPush ci-dessous).
+async function resolveDeepLink(db, userId, actionType, missionId, titleKey, params) {
+  let role = null;
+  if (ROLE_AWARE_ACTION_TYPES.has(actionType)) {
+    const { rows: [u] } = await db.query('SELECT role FROM users WHERE id=$1', [userId]);
+    role = u ? u.role : null;
+  }
+  return push.deepLinkFor(actionType, missionId, { role, titleKey, params });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Point d'insertion UNIQUE des notifications utilisateur. Écrit la ligne in-app (table
 // `notifications`), pousse le socket live si `emitToUser` est fourni, puis tente le canal push
@@ -23,17 +40,20 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 
   // 3ᵉ canal — après l'in-app et le socket live. Jamais attendu, jamais bloquant, ne lève
-  // jamais (services/push.js avale tout). `tag` dédupe côté navigateur si l'utilisateur est
+  // jamais (services/push.js avale tout, y compris un échec du lookup de rôle ci-dessous —
+  // même .catch qu'avant ce correctif). `tag` dédupe côté navigateur si l'utilisateur est
   // multi-appareils et déjà en train de lire.
-  push.sendWebPush(userId, {
-    title,
-    body,
-    url: push.deepLinkFor(actionType, missionId),
-    tag: `notif-${r.rows[0].id}`,
-    urgent: type === 'error',
-    notificationId: r.rows[0].id,
-    eventKey: titleKey || null,
-  }).catch(() => {});
+  resolveDeepLink(db, userId, actionType, missionId, titleKey, params)
+    .then((url) => push.sendWebPush(userId, {
+      title,
+      body,
+      url,
+      tag: `notif-${r.rows[0].id}`,
+      urgent: type === 'error',
+      notificationId: r.rows[0].id,
+      eventKey: titleKey || null,
+    }))
+    .catch(() => {});
 }
 
 module.exports = { notify };

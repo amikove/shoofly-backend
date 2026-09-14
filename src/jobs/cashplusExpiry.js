@@ -12,15 +12,30 @@
 // payments.js — jamais ici), donc rien à défaire. Un callback HMAC-valide arrivant APRÈS ce
 // passage en 'expired' reste honoré normalement (voir routes/payments.js) : ce cron ne fait
 // qu'une hypothèse optimiste en l'absence de callback, jamais une décision définitive.
-async function runCashplusExpiry(db) {
+//
+// Chantier notifications (2026-09-14), Partie C/G1 — jusqu'ici totalement silencieux (seul le
+// console.log ci-dessous en traçait le passage) : l'Œil n'avait aucun signal ("en attente",
+// "expiré", "réessayez"). notify() simple par Œil concerné, emitToUser optionnel (comme partout
+// ailleurs dans le projet, voir jobs/walletReconciliation.js).
+const { notify } = require('../utils/notify');
+
+async function runCashplusExpiry(db, emitToUser = null) {
   const { rows } = await db.query(`
     UPDATE cashplus_recharge_requests
     SET status='expired'
     WHERE status='pending' AND date_expiration < NOW()
-    RETURNING id, request_id, oeil_id
+    RETURNING id, request_id, oeil_id, amount
   `);
   if (rows.length) {
     console.log(`⏳ CashPlus — ${rows.length} demande(s) de recharge expirée(s)`);
+    for (const r of rows) {
+      try {
+        await notify(db, r.oeil_id, '⏳ Recharge CashPlus expirée',
+          `Votre demande de recharge de ${r.amount} MAD a expiré sans confirmation. Vous pouvez réessayer.`,
+          'warning', null, emitToUser, null,
+          'cashplusExpiredOeilTitle', 'cashplusExpiredOeilBody', { amount: r.amount });
+      } catch (e) { console.error(`❌ Notification expiration CashPlus ${r.id} error:`, e.message); }
+    }
   }
   return rows;
 }

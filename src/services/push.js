@@ -44,11 +44,20 @@ const HEALTH_ALERT_THRESHOLD = parseInt(process.env.PUSH_HEALTH_ALERT_THRESHOLD)
 // (clients.openWindow). MIROIR du switch de shoofly-react/src/components/layout/Topbar.jsx
 // (handleClick) : le clic sur un push doit atterrir au même endroit que le clic sur la
 // notification in-app correspondante.
-//   • action_type dépendant du rôle (chat / mission_view / interests_modal → /oeil ou /client) :
-//     le SW n'a pas le rôle sous la main → on renvoie '/', l'app route ensuite via la cloche +
-//     le socket. Affiner en Phase 2 (frontend) si besoin réel.
 //   • action_type admin ou spécifiques Œil (gains, vérification) : non ambigus → chemin réel.
-function deepLinkFor(actionType, _missionId = null) {
+//   • action_type dépendant du rôle (chat / mission_view / ticket_view) : le SW n'a pas le rôle
+//     sous la main, donc `ctx.role` est résolu en amont par notify() (lookup DB, uniquement pour
+//     ces action_type — voir ROLE_AWARE_ACTION_TYPES) et transmis ici. `ctx.role` absent/inconnu
+//     → repli sur '/' (comportement historique, jamais pire qu'avant ce correctif).
+//   • correctif chantier "deep-link push" (2026-09-13) : mission_view/interests_modal/ticket_view
+//     ouvraient tous '/' (générique) faute de case dédiée — ajout des 3 cases ci-dessous, mêmes
+//     règles de sous-branchement que Topbar.jsx (title_key pour mission_view, params.ticketId
+//     pour ticket_view). 'chat' était déjà absent lui aussi ; case ajoutée pour cohérence/prêt à
+//     l'emploi, mais RESTE INATTEIGNABLE tant que les 2 sites d'appel bruts (index.js, chat
+//     missions.js) ne sont pas migrés vers notify() — voir rapport de chantier §B, signalement.
+function deepLinkFor(actionType, missionId = null, ctx = {}) {
+  const { role = null, titleKey = null, params = null } = ctx;
+  const missionsPath = role === 'oeil' ? '/oeil/missions' : role === 'client' ? '/client/missions' : null;
   switch (actionType) {
     case 'admin_missions':                     return '/admin/missions';
     case 'admin_problems':                     return '/admin/problemes';
@@ -57,10 +66,40 @@ function deepLinkFor(actionType, _missionId = null) {
     case 'admin_wallet_reconciliation':        return '/admin/wallet-reconciliation';
     case 'admin_missions_proches_validation':  return '/admin/missions-proches-validation';
     case 'admin_urgent_ticket':
-    case 'admin_ticket_message':               return '/admin/tickets';
+    case 'admin_ticket_message':
+    case 'admin_new_ticket':                   return '/admin/tickets';
+    case 'admin_block_appeals':                return '/admin/block-appeals';
     case 'gains_page':                         return '/oeil/gains';
     case 'verification_page':                  return '/oeil/verification-identite';
     case 'reliability_page':                   return '/oeil/compte';
+    // Toujours envoyé à mission.client_id (routes/missions.js POST /:id/interest) : rôle fixe,
+    // aucun lookup nécessaire.
+    case 'interests_modal':
+      return missionId ? `/client/missions?pending=interests_modal&missionId=${missionId}` : '/client/missions';
+    case 'chat':
+      if (!missionsPath) return '/';
+      return missionId ? `${missionsPath}?pending=chat&missionId=${missionId}` : missionsPath;
+    case 'mission_view': {
+      if (!missionsPath) return '/';
+      if (!missionId) return missionsPath;
+      // Mêmes 2 title_key spéciaux que Topbar.jsx — tout autre title_key retombe sur la liste
+      // (déjà correcte par rôle), exactement comme le clic in-app aujourd'hui.
+      if (titleKey === 'assistanceMissionRequestClientTitle') return `/client/missions?pending=mission_detail&missionId=${missionId}`;
+      if (titleKey === 'candidateConfirmRequestTitle') return `/oeil/missions?pending=candidate_confirm&missionId=${missionId}`;
+      // Tout autre title_key : Topbar.jsx ne fait qu'un navigate(missionsRoute) sans setPending
+      // (aucune modale/highlight dédiée n'existe côté in-app pour ces title_key) — parité stricte,
+      // pas de query `pending` ici (rien à consommer côté frontend).
+      return missionsPath;
+    }
+    case 'ticket_view': {
+      const ticketsPath = role === 'oeil' ? '/oeil/tickets' : role === 'client' ? '/client/tickets' : null;
+      if (!ticketsPath) return '/';
+      const ticketId = params && params.ticketId;
+      return ticketId ? `${ticketsPath}?openTicketId=${ticketId}` : ticketsPath;
+    }
+    // Miroir de useNotifications.js (frontend) — même branchement par rôle.
+    case 'mes_signalements':
+      return role === 'oeil' ? '/oeil/mes-signalements' : role === 'client' ? '/client/mes-signalements' : '/';
     default:                                   return '/';
   }
 }

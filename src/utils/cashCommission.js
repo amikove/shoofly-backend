@@ -1,4 +1,5 @@
 const walletService = require('../services/walletService');
+const { notify } = require('./notify');
 
 // ── Modèle de paiement cash (2026-08-13) — voir RAPPORT_DIAGNOSTIC_COHERENCE_CASH_VS_PAYZONE.md
 // et schema.js (missions.payment_method, mission_commission_shortfalls). Ce module ne contient
@@ -83,4 +84,31 @@ async function settleCashCommission(client, mission, reason) {
   return { collected, shortfall };
 }
 
-module.exports = { checkCashCommissionBalance, settleCashCommission };
+// ── Chantier notifications (2026-09-14), Partie C/G3 : notifie les admins finance d'un manque à
+// gagner commission — HORS transaction (règle projet : jamais de notify() dans une transaction,
+// voir jobs/walletReconciliation.js). settleCashCommission tourne toujours À L'INTÉRIEUR d'une
+// transaction (voir son propre commentaire ci-dessus) : cette fonction est donc appelée APRÈS
+// coup par chacun des 6 sites qui l'utilisent, au même endroit que leur notify() existant vers
+// l'Œil (règle « notifications toujours après le commit », déjà suivie partout dans ce projet).
+// No-op silencieux si shortfall<=0 — chaque appelant peut donc appeler ceci inconditionnellement
+// juste après avoir consommé cashSettlement, sans re-tester la condition lui-même.
+// Notifier l'Œil lui-même d'un manque à gagner est une question produit distincte, non tranchée
+// (voir rapport de chantier) — volontairement PAS fait ici.
+async function notifyShortfallAdmins(db, mission, cashSettlement, emitToUser = null) {
+  if (!cashSettlement || !(cashSettlement.shortfall > 0)) return;
+  const { rows: admins } = await db.query(
+    `SELECT id FROM users WHERE role='admin' AND is_active=true AND (is_super_admin=true OR permissions ? 'finance')`
+  );
+  for (const admin of admins) {
+    await notify(
+      db, admin.id,
+      '⚠️ Manque à gagner commission cash',
+      `${cashSettlement.shortfall} MAD de commission non collectés sur "${mission.title}" (solde Œil insuffisant).`,
+      'warning', mission.id, emitToUser, null,
+      'commissionShortfallAdminTitle', 'commissionShortfallAdminBody',
+      { missionTitle: mission.title, shortfall: cashSettlement.shortfall, collected: cashSettlement.collected }
+    );
+  }
+}
+
+module.exports = { checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins };

@@ -6,7 +6,7 @@ const { requirePermission } = require('../middleware/permissions');
 const { refundOnCancellation } = require('../utils/refund');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const walletService = require('../services/walletService');
-const { settleCashCommission } = require('../utils/cashCommission');
+const { settleCashCommission, notifyShortfallAdmins } = require('../utils/cashCommission');
 const { applyClientStrike } = require('../utils/clientStrikes');
 const cashplusService = require('../services/cashplus');
 const { isNewOeil } = require('../utils/reliabilityScore');
@@ -248,6 +248,21 @@ router.post('/oeil/withdraw', authenticate, requireRole('oeil'), asyncHandler(as
   } catch (e) {
     if (e.code === 'INSUFFICIENT_BALANCE') return res.status(400).json({ error: 'Solde insuffisant' });
     throw e;
+  }
+
+  // Chantier notifications (2026-09-14), Partie C/G4 — jusqu'ici aucune notification aux admins
+  // (seul filet : un admin qui pense à ouvrir GET /admin/withdrawals). notify() simple, admins
+  // permission finance uniquement (même bucket que le reste des écrans virement/finance) — hors
+  // transaction (règle projet : jamais de notify() dans une transaction), le débit est déjà commité.
+  const emitToUser = req.app.get('emitToUser');
+  const { rows: financeAdmins } = await db.query(
+    `SELECT id FROM users WHERE role='admin' AND is_active=true AND (is_super_admin=true OR permissions ? 'finance')`
+  );
+  for (const admin of financeAdmins) {
+    await notifyUser(db, admin.id, '💸 Demande de virement soumise',
+      `Un Œil a soumis une demande de virement de ${amount} MAD.`,
+      'info', null, emitToUser, null,
+      'withdrawalRequestAdminTitle', 'withdrawalRequestAdminBody', { amount });
   }
 
   res.status(201).json({ message: `Virement de ${amount} MAD soumis. Traitement sous 48h.` });
@@ -2019,6 +2034,8 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
       await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.', 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
     }
     await notify(mission.client_id, 'Réclamation résolue', 'Résolue en faveur de l\'Œil.', 'claimResolvedClientLoseTitle', 'claimResolvedClientLoseBody', null);
+    // Chantier notifications (2026-09-14), Partie C/G3 — no-op si pas de manque à gagner.
+    await notifyShortfallAdmins(db, mission, cashSettlement, emitToUser);
 
     // PROMPT 2 — strike no-show client, notification distincte selon le seuil franchi. Une
     // notification "avertissement" au 1er strike, "compte suspendu" (+ alerte tous admins)
@@ -2128,6 +2145,8 @@ router.post('/admin/claims/:missionId/commission', authenticate, requireRole('ad
       `Un administrateur a décidé de ne pas prélever de commission sur "${mission.title}".`,
       'info', mission.id, emitToUser, null, 'commissionReleasedOeilTitle', 'commissionReleasedOeilBody', { missionTitle: mission.title });
   }
+  // Chantier notifications (2026-09-14), Partie C/G3 — no-op si decision==='release' (cashSettlement reste null) ou pas de manque à gagner.
+  await notifyShortfallAdmins(db, mission, cashSettlement, emitToUser);
 
   res.json({ ok: true, commission_decision: decision === 'debit' ? 'debited' : 'released', collected: cashSettlement?.collected ?? 0 });
 }));

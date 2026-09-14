@@ -419,26 +419,29 @@ io.on('connection', (socket) => {
       // Broadcast to the mission room
       io.to(`mission:${missionId}`).emit('new_message', msg);
 
-      // Notify the other party if offline
+      // Notify the other party if offline — migré vers notify() (chantier notifications
+      // 2026-09-14, Partie B) : gagne le push. Recipient déjà connu hors-ligne ici (garde
+      // !userSockets.get(recipientId)?.size ci-dessus), emitToUser n'a donc rien à émettre en
+      // pratique — passé quand même pour rester cohérent avec le reste du projet.
       const recipientId = uid === m.client_id ? m.oeil_id : m.client_id;
       if (recipientId && !userSockets.get(recipientId)?.size) {
-        await db.query(
-          `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'message',$4,'chat',$5,$6,$7)`,
-          [recipientId, `Message de ${sender.rows[0].first_name}`, cleanContent.slice(0, 80), missionId, 'newMessageTitle', null, JSON.stringify({ senderName: sender.rows[0].first_name })]
-        );
+        await notify(db, recipientId, `Message de ${sender.rows[0].first_name}`, cleanContent.slice(0, 80),
+          'message', missionId, app.get('emitToUser'), 'chat',
+          'newMessageTitle', null, { senderName: sender.rows[0].first_name });
       }
 
       // Notifier l'admin si message suspect — même pattern que POST /:id/messages (REST).
+      // Migré vers notify() (chantier notifications 2026-09-14, Partie B) : gagne le push, live
+      // socket conservé via emitToUser.
       if (isFlagged) {
         const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`);
         const senderName = `${sender.rows[0].first_name} ${sender.rows[0].last_name}`;
         const emitToUser = app.get('emitToUser');
         for (const admin of admins) {
-          await db.query(
-            `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,'warning',$4,'admin_messages_suspects',$5,$6,$7)`,
-            [admin.id, '⚠️ Message suspect détecté', `${senderName} a peut-être partagé un contact externe dans la mission "${m.title}"`, missionId, 'suspiciousMessageAdminTitle', 'suspiciousMessageAdminBody', JSON.stringify({ senderName, missionTitle: m.title })]
-          );
-          if (emitToUser) emitToUser(admin.id, 'notification', { title: '⚠️ Message suspect détecté', body: `${senderName} — mission "${m.title}"`, missionId });
+          await notify(db, admin.id, '⚠️ Message suspect détecté',
+            `${senderName} a peut-être partagé un contact externe dans la mission "${m.title}"`,
+            'warning', missionId, emitToUser, 'admin_messages_suspects',
+            'suspiciousMessageAdminTitle', 'suspiciousMessageAdminBody', { senderName, missionTitle: m.title });
         }
       }
     } catch (e) { console.error('WS message error:', e.message); }
@@ -1420,6 +1423,7 @@ initDb().then(() => {
     cronUrgentWhatsAppWaveRunning = true;
     try {
       const db = getDb();
+      const emitToUser = app.get('emitToUser');
       const { rows: dueMissions } = await db.query(`
         SELECT * FROM missions
         WHERE is_urgent=true AND oeil_id IS NULL
@@ -1430,7 +1434,7 @@ initDb().then(() => {
         // l'audit, même classe de défaut que les 12 boucles listées : sendUrgentWhatsAppWave
         // qui lève sur une mission abandonnait les vagues des missions suivantes du tick.
         try {
-        const sent = await sendUrgentWhatsAppWave(db, mission);
+        const sent = await sendUrgentWhatsAppWave(db, mission, emitToUser);
         console.log(`📲 Vague WhatsApp mission urgente ${mission.id} — ${sent} Œil(s) contacté(s)`);
         } catch (e) { console.error(`❌ Cron vagues WhatsApp urgentes — mission ${mission.id} :`, e.message); }
       }
@@ -1725,7 +1729,7 @@ initDb().then(() => {
     if (cronCashplusExpiryRunning) { console.warn('⏭️ Cron expiration CashPlus déjà en cours, tick ignoré'); return; }
     cronCashplusExpiryRunning = true;
     try {
-      await runCashplusExpiry(getDb());
+      await runCashplusExpiry(getDb(), app.get('emitToUser'));
     } catch (e) { console.error('❌ Cron expiration CashPlus error:', e.message); }
     finally { cronCashplusExpiryRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
