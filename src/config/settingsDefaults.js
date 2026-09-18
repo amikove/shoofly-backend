@@ -37,6 +37,14 @@ module.exports = {
   abandon_during_mission_cooldown_hours: '48',
   stale_mission_hours: '12',
   stale_mission_min_lead_hours: '4',
+  // Correctif audit financier 2026-09-17, §2.4.1 : distinct de stale_mission_hours ci-dessus
+  // (qui alerte 12h après CRÉATION, tant que le créneau reste encore lointain) — celui-ci couvre
+  // le cas qu'aucun cron n'observait : une mission 'pending'/oeil_id NULL dont le créneau prévu
+  // est déjà PASSÉ. Alerte admin immédiate dans ce cas, puis annulation automatique (même
+  // traitement financier qu'une annulation client avant affectation — remboursement intégral si
+  // payée en ligne, rien si cash) si toujours aucun Œil après ce délai compté depuis
+  // scheduled_at. Voir cronPendingMissionExpiration, index.js.
+  pending_mission_expiration_hours: '24',
   mission_overdue_verification_hours: '24',
   late_start_alert_window_minutes: '30',
   late_start_auto_transfer_minutes: '60',

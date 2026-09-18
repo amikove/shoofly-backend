@@ -3617,39 +3617,61 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     if (override_reason) note += ` — raison : ${override_reason}`;
   }
 
+  // Verrou + re-vérification atomique (audit financier 2026-09-17, §2.3a/§2.5, F3/F4) : le
+  // checkOeilAssignable ci-dessus n'est qu'un snapshot — une suspension (PUT /admin/:id/
+  // toggle-active) ou un passage indisponible (PUT /oeil/toggle-available) peut committer entre
+  // ce snapshot et l'écriture ci-dessous, affectant la mission à un Œil déjà inéligible sans
+  // qu'aucun override n'ait été demandé ni tracé. FOR UPDATE (checkOeilAssignable, forUpdate:true)
+  // verrouille la ligne de l'Œil jusqu'au commit : soit ce bloc gagne (le toggle concurrent
+  // attend son tour, voit ensuite la mission déjà assignée), soit le toggle gagne (ce
+  // re-contrôle voit l'état à jour et échoue proprement en 409 — pas d'affectation silencieuse).
+  // overridable reprend exactement la décision déjà prise plus haut (override_warning) : un
+  // override déjà confirmé par l'admin reste valable ici, il ne redemande pas confirmation.
   try {
-    await transitionMission(db, mission.id, 'pending', 'assigned', req.user.id, {
-      extraFields: {
-        oeil_id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
-        presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
-        candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
-        urgent_whatsapp_next_wave_at: null,
-      },
-      note,
+    await walletService.withTransaction(db, async (client) => {
+      const assignCheckLocked = await checkOeilAssignable(client, oeil_id, {
+        scheduledAt: mission.scheduled_at,
+        excludeMissionId: mission.id,
+        overridable: !!override_warning,
+        forUpdate: true,
+      });
+      if (assignCheckLocked.error) {
+        throw new MissionTransitionError('STALE_STATE', assignCheckLocked.error);
+      }
+
+      await transitionMission(client, mission.id, 'pending', 'assigned', req.user.id, {
+        extraFields: {
+          oeil_id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
+          presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
+          candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
+          urgent_whatsapp_next_wave_at: null,
+        },
+        note,
+      });
+
+      // Ardoise vierge sur la cascade par lot (même correctif que POST /:id/accept ci-dessus) —
+      // une affectation manuelle admin court-circuite la cascade à tout moment, y compris pendant
+      // un lot ou un départage en cours ; sans ce nettoyage, une réouverture future de cette
+      // mission hériterait à tort d'un solicited_at/confirmed_at périmé.
+      await client.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
+
+      // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
+      // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
+      if (mission.transfer_type === 'during') {
+        const { rows: [{ n: nextOrder }] } = await client.query(
+          `SELECT COALESCE(MAX(sequence_order), 0) + 1 AS n FROM mission_transfer_chain WHERE mission_id=$1`,
+          [mission.id]
+        );
+        await client.query(
+          `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
+           VALUES ($1, $2, NOW(), $3)`,
+          [mission.id, oeil_id, nextOrder]
+        );
+      }
     });
   } catch (e) {
     if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
     throw e;
-  }
-
-  // Ardoise vierge sur la cascade par lot (même correctif que POST /:id/accept ci-dessus) —
-  // une affectation manuelle admin court-circuite la cascade à tout moment, y compris pendant
-  // un lot ou un départage en cours ; sans ce nettoyage, une réouverture future de cette
-  // mission hériterait à tort d'un solicited_at/confirmed_at périmé.
-  await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
-
-  // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
-  // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
-  if (mission.transfer_type === 'during') {
-    const { rows: [{ n: nextOrder }] } = await db.query(
-      `SELECT COALESCE(MAX(sequence_order), 0) + 1 AS n FROM mission_transfer_chain WHERE mission_id=$1`,
-      [mission.id]
-    );
-    await db.query(
-      `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
-       VALUES ($1, $2, NOW(), $3)`,
-      [mission.id, oeil_id, nextOrder]
-    );
   }
 
   await notify(db, oeil_id,
@@ -4161,38 +4183,59 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   // (même en dehors du cron/de la cascade) pour qu'une sélection manuelle par le client
   // n'importe quand empêche définitivement toute reprise ultérieure de la cascade de
   // confirmation sur cette mission (voir advanceCandidateCascade).
+  //
+  // Verrou + re-vérification atomique (audit financier 2026-09-17, §2.3a/§2.5, F3/F4) : le
+  // checkOeilAssignable ci-dessus n'est qu'un snapshot — une suspension ou un passage
+  // indisponible peut committer entre ce snapshot et l'écriture ci-dessous. FOR UPDATE
+  // (checkOeilAssignable, forUpdate:true) verrouille la ligne de l'Œil jusqu'au commit — même
+  // mécanisme que POST /:id/assign-admin. Jamais overridable ici (hireOeilCore n'a aucun
+  // mécanisme de confirmation, client ou cascade automatique) : échec propre en 409 si l'Œil
+  // vient de devenir inéligible.
   let updated;
   try {
-    updated = await transitionMission(db, mission.id, 'pending', 'assigned', changedById, {
-      extraFields: {
-        oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
-        presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
-        urgent_whatsapp_next_wave_at: null,
-      },
-      note: historyNote,
+    updated = await walletService.withTransaction(db, async (client) => {
+      const assignCheckLocked = await checkOeilAssignable(client, oeilId, {
+        scheduledAt: mission.scheduled_at,
+        excludeMissionId: mission.id,
+        forUpdate: true,
+      });
+      if (assignCheckLocked.error) {
+        throw new MissionTransitionError('STALE_STATE', assignCheckLocked.error);
+      }
+
+      const updatedInner = await transitionMission(client, mission.id, 'pending', 'assigned', changedById, {
+        extraFields: {
+          oeil_id: oeilId, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null, candidate_window_ends_at: null, pending_candidate_id: null, batch_tiebreak_ends_at: null,
+          presence_confirmed_at: null, presence_confirmation_requested_at: null, presence_confirmation_deadline_at: null,
+          urgent_whatsapp_next_wave_at: null,
+        },
+        note: historyNote,
+      });
+
+      // Ardoise vierge sur la cascade par lot (même correctif que POST /:id/accept et
+      // /:id/assign-admin) — voir garde-fous de la spec réattribution par lot.
+      await client.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
+
+      // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
+      // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
+      if (mission.transfer_type === 'during') {
+        const { rows: [{ n: nextOrder }] } = await client.query(
+          `SELECT COALESCE(MAX(sequence_order), 0) + 1 AS n FROM mission_transfer_chain WHERE mission_id=$1`,
+          [updatedInner.id]
+        );
+        await client.query(
+          `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
+           VALUES ($1, $2, NOW(), $3)`,
+          [updatedInner.id, updatedInner.oeil_id, nextOrder]
+        );
+      }
+
+      return updatedInner;
     });
   } catch (e) {
     if (e instanceof MissionTransitionError) return { ok: false, status: 409, error: e.message };
     throw e;
   }
-
-  // Ardoise vierge sur la cascade par lot (même correctif que POST /:id/accept et
-  // /:id/assign-admin) — voir garde-fous de la spec réattribution par lot.
-  await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
-
-    // Mission issue d'un transfert en cours de route : on ouvre une nouvelle ligne dans la chaîne
-    // pour ce nouvel Œil (elle sera fermée à son tour s'il retransfère, ou au moment de la validation finale).
-    if (mission.transfer_type === 'during') {
-      const { rows: [{ n: nextOrder }] } = await db.query(
-        `SELECT COALESCE(MAX(sequence_order), 0) + 1 AS n FROM mission_transfer_chain WHERE mission_id=$1`,
-        [updated.id]
-      );
-      await db.query(
-        `INSERT INTO mission_transfer_chain (mission_id, oeil_id, started_at, sequence_order)
-         VALUES ($1, $2, NOW(), $3)`,
-        [updated.id, updated.oeil_id, nextOrder]
-      );
-    }
 
   // Supprimer les intérêts en conflit de créneau — requête distincte du contrôle de
   // checkOeilAssignable ci-dessus (ici : les AUTRES missions encore pending sur lesquelles cet
@@ -4880,9 +4923,138 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
   }
 }
 
+// ── Missions 'pending' jamais candidatées dont le créneau prévu est déjà dépassé ──
+// Correctif audit financier 2026-09-17, §2.4.1/§2.5(point 9). Distinct du cron « missions sans
+// Œil » (index.js, cronStaleMissionsRunning) : celui-là alerte 12h après CRÉATION tant que le
+// créneau reste à >= 4h, et s'arrête explicitement dès qu'une mission devient imminente — il ne
+// couvre donc jamais le cas d'un créneau déjà PASSÉ. Deux volets dans le même appel (même
+// condition de base, deux seuils temporels) :
+//   1) Alerte admin UNE FOIS dès que scheduled_at est dépassé (pending_expired_notified_at,
+//      même sentinelle/même garde d'idempotence que stale_notified_at).
+//   2) Annulation automatique après le délai de grâce configurable (pending_mission_
+//      expiration_hours, défaut 24h) compté depuis scheduled_at — même traitement financier
+//      qu'une annulation client avant affectation (refundOnCancellation, initiatedByClient:
+//      false → remboursement intégral si payée en ligne, rien pour le cash) puisque oeil_id est
+//      structurellement NULL ici (aucun Œil n'a jamais travaillé sur cette mission).
+// Exportée (comme les 4 fonctions ci-dessus) pour rester appelable directement depuis
+// index.js (cron) ET depuis les scripts E2E (_audit/e2e) sans attendre un vrai tick.
+async function checkPendingMissionExpiration(db, io, emitToUser) {
+  // ── 1) Alerte admin (une fois) ──
+  const { rows: overdue } = await db.query(`
+    SELECT * FROM missions
+    WHERE status='pending' AND oeil_id IS NULL
+      AND scheduled_at < NOW()
+      AND pending_expired_notified_at IS NULL
+  `);
+  if (overdue.length > 0) {
+    const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
+    for (const m of overdue) {
+      try {
+        // Garde d'idempotence AVANT les notifications admin (même ordre que le cron missions
+        // sans Œil, index.js) : un échec au milieu de la boucle admin n'en rejoue pas d'autres.
+        const { rowCount } = await db.query(
+          `UPDATE missions SET pending_expired_notified_at = NOW() WHERE id = $1 AND pending_expired_notified_at IS NULL`,
+          [m.id]
+        );
+        if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
+        for (const admin of admins) {
+          await notify(
+            db, admin.id,
+            '⏰ Mission jamais assignée, créneau dépassé',
+            `"${m.title}" est toujours sans Œil alors que son créneau prévu est déjà passé. Annulation automatique et remboursement du client si la situation ne change pas d'ici la fin du délai de grâce.`,
+            'warning', m.id, emitToUser, 'admin_missions',
+            'pendingExpiredAdminTitle', 'pendingExpiredAdminBody', { missionTitle: m.title }
+          );
+        }
+      } catch (e) { console.error(`❌ checkPendingMissionExpiration: alerte mission ${m.id} :`, e.message); }
+    }
+  }
+
+  // ── 2) Annulation automatique après le délai de grâce ──
+  const pendingMissionExpirationHours = await getSetting(db, 'pending_mission_expiration_hours', 24);
+  const { rows: expired } = await db.query(`
+    SELECT * FROM missions
+    WHERE status='pending' AND oeil_id IS NULL
+      AND scheduled_at < NOW() - INTERVAL '1 hour' * $1::numeric
+  `, [pendingMissionExpirationHours]);
+
+  for (const m of expired) {
+    // Isolation par itération (O-BE-2) : un crash sur CETTE mission ne doit jamais abandonner
+    // le reste du lot — même granularité que checkTransferDeadlines ci-dessus.
+    try {
+      // Écritures financières / d'état groupées dans UNE transaction (même principe que
+      // checkTransferDeadlines) : transition + remboursement tout-ou-rien, pour qu'un crash entre
+      // les deux ne laisse jamais une mission annulée sans remboursement (ou l'inverse).
+      // transitionMission garde optimiste sur status='pending' : si la mission a été
+      // assignée/annulée entre le SELECT ci-dessus et cette itération, MissionTransitionError est
+      // levée et on passe à la suivante sans rejouer de remboursement.
+      let updated, refund, solicited;
+      try {
+        ({ updated, refund, solicited } = await walletService.withTransaction(db, async (client) => {
+          const updatedInner = await transitionMission(client, m.id, 'pending', 'cancelled', null, {
+            extraFields: {
+              cancelled_at: 'NOW()',
+              cancel_reason: `Annulation automatique — aucun Œil trouvé, créneau dépassé depuis plus de ${pendingMissionExpirationHours}h`,
+            },
+            note: 'Annulation automatique — mission jamais assignée, créneau expiré',
+          });
+
+          const refundInner = updatedInner.payment_method !== 'cash'
+            ? await refundOnCancellation(client, updatedInner, false)
+            : 0;
+
+          // Candidats déjà sollicités (cascade épuisée sans jamais aboutir à une embauche) —
+          // capturés AVANT le nettoyage ci-dessous pour pouvoir les notifier après commit (même
+          // correctif CONSTAT 15 audit-360 que POST /:id/status pour ce même cas oeil_id NULL).
+          const { rows: solicitedInner } = await client.query(
+            `SELECT oeil_id FROM mission_interests WHERE mission_id=$1 AND solicited_at IS NOT NULL`,
+            [updatedInner.id]
+          );
+          await client.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [updatedInner.id]);
+
+          return { updated: updatedInner, refund: refundInner, solicited: solicitedInner };
+        }));
+      } catch (e) {
+        if (e instanceof MissionTransitionError) continue; // statut déjà changé entre-temps
+        throw e;
+      }
+
+      // CONSTAT 16 (audit-360) : ce chemin transitionne vers 'cancelled' sans passer par
+      // POST /:id/status — émission + fermeture de room répliquées ici pour cette même raison
+      // (sinon un client ayant la mission ouverte n'apprend jamais l'annulation en direct).
+      io.to(`mission:${updated.id}`).emit('mission_status_changed', { missionId: updated.id, status: 'cancelled' });
+      closeMissionChatRoom(io, updated.id);
+      io.to('room:admin').emit('mission_updated', updated);
+
+      await notify(
+        db, updated.client_id,
+        '❌ Mission annulée automatiquement',
+        refund > 0
+          ? `Aucun Œil n'a été trouvé pour "${updated.title}" et le créneau prévu est dépassé depuis plus de ${pendingMissionExpirationHours}h. La mission a été annulée automatiquement et ${refund} MAD ont été recrédités sur votre portefeuille.`
+          : `Aucun Œil n'a été trouvé pour "${updated.title}" et le créneau prévu est dépassé depuis plus de ${pendingMissionExpirationHours}h. La mission a été annulée automatiquement.`,
+        'info', updated.id, emitToUser, null,
+        'pendingExpiredCancelledClientTitle', 'pendingExpiredCancelledClientBody', { missionTitle: updated.title, refund }
+      );
+      for (const s of solicited) {
+        await notify(db, s.oeil_id, 'Mission annulée',
+          `La mission "${updated.title}" a été annulée.`, 'info', updated.id, emitToUser, null,
+          'missionCancelledByClientTitle', 'missionCancelledByClientBody', { missionTitle: updated.title });
+      }
+    } catch (e) {
+      console.error(`❌ checkPendingMissionExpiration: annulation mission ${m.id} :`, e.message);
+      Sentry.captureException(e, {
+        level: 'error',
+        tags: { area: 'pending_mission_expiration' },
+        extra: { missionId: m.id },
+      });
+    }
+  }
+}
+
 router.checkTransferDeadlines = checkTransferDeadlines;
 router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
 router.checkAssistanceRequestExpiry = checkAssistanceRequestExpiry;
+router.checkPendingMissionExpiration = checkPendingMissionExpiration;
 router.checkPresenceConfirmationDeadlines = checkPresenceConfirmationDeadlines;
 router.checkActivityPhotoDeadlines = checkActivityPhotoDeadlines;
 router.hireOeilCore = hireOeilCore;

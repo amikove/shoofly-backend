@@ -567,6 +567,14 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- fixtures de test).
     ALTER TABLE reliability_events ADD COLUMN IF NOT EXISTS reverses_event_id INTEGER REFERENCES reliability_events(id) ON DELETE CASCADE;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS stale_notified_at TIMESTAMPTZ;
+    -- Correctif audit financier 2026-09-17, §2.4.1 : sentinelle « pas encore alertée » pour le
+    -- cas qu'aucun cron ne couvrait — une mission 'pending'/oeil_id NULL dont scheduled_at est
+    -- déjà dépassé. Même rôle et même polarité que stale_notified_at ci-dessus (voir I8g plus
+    -- bas) : NULL = jamais alertée, posé une seule fois par cronPendingMissionExpiration
+    -- (index.js), qui gère aussi l'annulation automatique après le délai configuré
+    -- (pending_mission_expiration_hours) — celle-ci n'a besoin d'aucune sentinelle propre, le
+    -- passage de status à 'cancelled' la retire déjà du balayage 'pending'.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS pending_expired_notified_at TIMESTAMPTZ;
 
     -- Index de performance sur les colonnes fréquemment filtrées/jointes
     CREATE INDEX IF NOT EXISTS idx_withdrawals_oeil_id ON withdrawals(oeil_id);
@@ -1424,6 +1432,8 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- lui non sélectif (quasi tout le backlog pending est à NULL). Polarité inversée dans le
     -- rapport source : signalée, non implémentée (aucun consommateur ne lit cette colonne en
     -- IS NOT NULL).
+    -- pending_expired_notified_at (correctif audit financier 2026-09-17) — même raisonnement,
+    -- même polarité IS NULL : volontairement pas d'index non plus.
 
     -- I9 (MOYEN) — filtre fonctionnel DATE(scheduled_at AT TIME ZONE 'Africa/Casablanca') des
     -- crons J-1 : présence Œil 20h (index.js:520), rappel client 20h (index.js:580), récap admin

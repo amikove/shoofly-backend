@@ -19,7 +19,7 @@
 // retente, `min_price` = pas de plancher global) et rien dans le code ne permet de distinguer
 // un 0 voulu d'un 0 accidentel pour les autres.
 //
-// Périmètre = les 77 clés réellement déstructurées par PUT /admin/settings. `urgency_fee` et
+// Périmètre = les 78 clés réellement déstructurées par PUT /admin/settings. `urgency_fee` et
 // `accept_delay` sont seedées mais ABSENTES de l'allowlist (non modifiables via l'API) donc
 // pas validées ici — si elles y entrent un jour, leur ajouter une règle (urgency_fee serait
 // un { min: 0, max: 1 }, accept_delay n'a aucun lecteur).
@@ -89,6 +89,7 @@ const SETTING_RULES = {
   abandon_during_mission_cooldown_hours:       { min: 0 }, // missions.js:3611
   stale_mission_hours:                         { min: 0 }, // index.js:1518  INTERVAL '1 hour' * $1
   stale_mission_min_lead_hours:                { min: 0 }, // index.js:1519  INTERVAL '1 hour' * $2
+  pending_mission_expiration_hours:            { min: 0 }, // index.js cronPendingMissionExpiration  INTERVAL '1 hour' * $n
   mission_overdue_verification_hours:          { min: 0 }, // index.js:925
   late_start_alert_window_minutes:             { min: 0 }, // index.js:726/779  INTERVAL '1 minute' * $n
   late_start_auto_transfer_minutes:            { min: 0 }, // index.js:779

@@ -23,16 +23,25 @@ const { getSetting } = require('./settings');
 // overridable : si true, une suspension/blocage anti-fraude ne fait pas échouer ce contrôle —
 //   mais reste signalée via isSuspended/isActive en retour, pour que l'appelant décide lui-même
 //   de la confirmation et trace l'override le cas échéant.
+// forUpdate : si true, verrouille la ligne users+oeil_profiles lue ci-dessous (FOR UPDATE)
+//   jusqu'au commit de la transaction appelante — à utiliser uniquement quand `db` est un client
+//   déjà en transaction (walletService.withTransaction), juste avant d'écrire une transition
+//   pending→assigned, pour fermer la course avec PUT /admin/:id/toggle-active / PUT /oeil/
+//   toggle-available (audit financier 2026-09-17, §2.3a/§2.5, F3/F4) : ces deux routes n'ont
+//   besoin d'aucun changement, un UPDATE Postgres prend déjà seul le verrou de ligne nécessaire
+//   pour être bloqué par ce FOR UPDATE (ou pour faire échouer le re-contrôle s'il committe le
+//   premier). Sans effet sur les autres appelants (prepareMissionInsert, GET /:id/interests) :
+//   défaut false.
 //
 // Ne fait aucune écriture DB. Retourne { error, code } si une vérification bloque (rejet
 // définitif quel que soit l'appelant), sinon { ok:true, isSuspended, isActive } — ces deux
 // derniers champs permettent à l'appelant de savoir si is_suspended/is_active auraient bloqué
 // sans le paramètre overridable, pour tracer un éventuel override.
-async function checkOeilAssignable(db, oeilId, { scheduledAt, excludeMissionId = null, overridable = false } = {}) {
+async function checkOeilAssignable(db, oeilId, { scheduledAt, excludeMissionId = null, overridable = false, forUpdate = false } = {}) {
   const { rows: [oeilCheck] } = await db.query(
     `SELECT u.role, u.is_active, u.is_suspended, p.is_verified, p.is_available
      FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-     WHERE u.id=$1`,
+     WHERE u.id=$1${forUpdate ? ' FOR UPDATE' : ''}`,
     [oeilId]
   );
   if (!oeilCheck || oeilCheck.role !== 'oeil') return { error: 'Œil introuvable', code: 'not_found' };

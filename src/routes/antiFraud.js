@@ -471,6 +471,14 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
   // 'active'/'en_route') : un blocage anti-fraude ne doit produire aucun mouvement financier ni
   // split au prorata pour l'Œil bloqué. Contrairement à toggle-active, aucun message "aucune
   // pénalité" n'est envoyé à l'Œil ici — un blocage pour fraude reste une mesure punitive.
+  // transfer_no_penalty:true (correctif audit financier 2026-09-17, §1.9) ne contredit pas cette
+  // punition : il neutralise uniquement la pénalité de fiabilité -10 DISTINCTE que
+  // checkTransferDeadlines réappliquerait si aucun remplaçant n'est trouvé à temps (même flag,
+  // même intention que reassignMissionsOnSuspension missions.js, releaseMissionForReplacement
+  // via urgence, et le cron H+30 — les 3 autres sites qui posent transfer_type:'before' +
+  // transferred_from). La sanction reste le blocage lui-même (is_active=false, accès restreint) ;
+  // avant ce correctif, ce site était le seul des 4 à omettre ce flag, exposant l'Œil bloqué à un
+  // second événement de fiabilité non voulu, avec un motif qui ne mentionne même pas la fraude.
   let reassignedCount = 0;
   const { rows: strandedMissions } = await db.query(
     `SELECT * FROM missions WHERE oeil_id=$1 AND status IN ('assigned','en_route','active')`,
@@ -494,6 +502,7 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
             transferred_from: req.params.userId,
             transfer_reason: 'Compte prestataire bloqué pour fraude',
             transfer_deadline: deadline,
+            transfer_no_penalty: true,
             oeil_id: null,
             batch_wave_count: 0,
             transfer_h30_no_show: false,

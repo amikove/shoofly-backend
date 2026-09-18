@@ -65,6 +65,7 @@ const missionRoutesModule = require('./routes/missions');
 const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
 const checkMissionEditRequestExpiry = missionRoutesModule.checkMissionEditRequestExpiry;
 const checkAssistanceRequestExpiry = missionRoutesModule.checkAssistanceRequestExpiry;
+const checkPendingMissionExpiration = missionRoutesModule.checkPendingMissionExpiration;
 const checkPresenceConfirmationDeadlines = missionRoutesModule.checkPresenceConfirmationDeadlines;
 const checkActivityPhotoDeadlines = missionRoutesModule.checkActivityPhotoDeadlines;
 const advanceCandidateCascade = missionRoutesModule.advanceCandidateCascade;
@@ -502,6 +503,7 @@ initDb().then(() => {
   let cronAssistanceRequestExpiryRunning = false;
   let cronAutoValidateRunning = false;
   let cronStaleMissionsRunning = false;
+  let cronPendingExpirationRunning = false;
   let cronCandidateWindowRunning = false;
   let cronTicketAutoResolveRunning = false;
   let cronPresenceConfirmationRunning = false;
@@ -1619,6 +1621,26 @@ initDb().then(() => {
         }
     } catch (e) { console.error('❌ Cron missions sans Œil error:', e.message); }
     finally { cronStaleMissionsRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron toutes les 30 min — Missions pending jamais assignées, créneau déjà dépassé ──
+  // Correctif audit financier 2026-09-17, §2.4.1/§2.5(point 9) : distinct du cron ci-dessus
+  // (qui alerte 12h après CRÉATION, tant que le créneau reste à >= 4h — il s'arrête donc
+  // explicitement dès qu'une mission devient imminente). Aucun cron n'observait le cas d'une
+  // mission 'pending'/oeil_id NULL dont scheduled_at est déjà PASSÉ. Logique dans
+  // checkPendingMissionExpiration (routes/missions.js, même convention que
+  // checkTransferDeadlines/checkAssistanceRequestExpiry ci-dessous) plutôt qu'inline ici, pour
+  // rester appelable directement depuis les scripts E2E (_audit/e2e) sans attendre un vrai tick.
+  cron.schedule('28-59/30 * * * *', async () => {
+    if (cronPendingExpirationRunning) { console.warn('⏭️ Cron missions pending expirées déjà en cours, tick ignoré'); return; }
+    cronPendingExpirationRunning = true;
+    try {
+      const db = getDb();
+      const io = app.get('io');
+      const emitToUser = app.get('emitToUser');
+      await checkPendingMissionExpiration(db, io, emitToUser);
+    } catch (e) { console.error('❌ Cron missions pending expirées error:', e.message); }
+    finally { cronPendingExpirationRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les heures — auto-résolution des tickets après 72h d'inactivité ──
