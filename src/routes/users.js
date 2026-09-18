@@ -1910,7 +1910,7 @@ router.put('/admin/subcategory-min-prices', authenticate, requireRole('admin'), 
 router.get('/admin/flagged-messages', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows } = await db.query(`
-    SELECT mm.id, mm.content, mm.created_at, mm.mission_id,
+    SELECT mm.id, mm.content, mm.created_at, mm.mission_id, mm.sender_id,
       u.first_name||' '||u.last_name AS sender_name, u.role AS sender_role,
       m.title AS mission_title
     FROM mission_messages mm
