@@ -745,11 +745,24 @@ router.get('/admin/dashboard/funnel', authenticate, requireRole('admin'), requir
   ];
 
   // Temps moyen avant la première candidature d'un Œil (missions créées sur la période, ayant reçu au moins 1 candidature)
+  // Audit santé technique 2026-09-18, §3.1 : la sous-requête sur mission_interests n'avait
+  // aucun prédicat de date — scan/agrégat de la table ENTIÈRE à chaque chargement, quel que soit
+  // date_from/date_to choisi à l'écran. Filtrée ici via un JOIN sur missions (pas sur
+  // mission_interests.created_at directement : une candidature arrive après missions.created_at,
+  // parfois après date_to pour une mission créée en fin de fenêtre — filtrer sur sa propre date
+  // aurait pu exclure à tort la première candidature d'une mission pourtant dans la période).
+  // idx_mission_interests_created_at (schema.js) restait inutilisé faute de ce prédicat ; le vrai
+  // gain vient ici de idx_missions_created_at + idx_interests_mission (mission_id FK) qui bornent
+  // désormais mission_interests au sous-ensemble pertinent avant l'agrégation.
   const { rows: [premiereCandidature] } = await db.query(`
     SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (fi.first_interest_at - m.created_at))/60),0)::numeric(8,1) AS avg_minutes
     FROM missions m
-    JOIN (SELECT mission_id, MIN(created_at) AS first_interest_at FROM mission_interests GROUP BY mission_id) fi
-      ON fi.mission_id = m.id
+    JOIN (
+      SELECT mi.mission_id, MIN(mi.created_at) AS first_interest_at
+      FROM mission_interests mi
+      JOIN missions m2 ON m2.id = mi.mission_id AND m2.created_at BETWEEN $1 AND $2
+      GROUP BY mi.mission_id
+    ) fi ON fi.mission_id = m.id
     WHERE m.created_at BETWEEN $1 AND $2
   `, [date_from, date_to]);
 
@@ -818,6 +831,11 @@ router.get('/admin/dashboard/geo', authenticate, requireRole('admin'), requirePe
   `, [date_from, date_to]);
 
   // ── Candidatures moyennes par mission, par ville/quartier de la MISSION ──
+  // Audit santé technique 2026-09-18, §3.1 : même défaut que premiereCandidature ci-dessus (sous-
+  // requête mission_interests sans prédicat, scan complet). Ici pas d'ambiguïté de bornage (on
+  // compte, on ne prend pas un MIN daté) : préfiltrer par mission_id via un JOIN sur missions
+  // déjà bornées par date_from/date_to suffit, LEFT JOIN préservé pour garder les missions à 0
+  // candidature dans la moyenne (COALESCE(...,0) inchangé).
   const { rows: candidaturesRows } = await db.query(`
     SELECT
       m.city, m.quartier,
@@ -825,7 +843,10 @@ router.get('/admin/dashboard/geo', authenticate, requireRole('admin'), requirePe
       COALESCE(AVG(COALESCE(mi.interest_count,0)),0)::numeric(5,2) AS avg_candidatures
     FROM missions m
     LEFT JOIN (
-      SELECT mission_id, COUNT(*)::int AS interest_count FROM mission_interests GROUP BY mission_id
+      SELECT mi.mission_id, COUNT(*)::int AS interest_count
+      FROM mission_interests mi
+      JOIN missions m2 ON m2.id = mi.mission_id AND m2.created_at BETWEEN $1 AND $2
+      GROUP BY mi.mission_id
     ) mi ON mi.mission_id = m.id
     WHERE m.created_at BETWEEN $1 AND $2 AND m.city IS NOT NULL
     GROUP BY m.city, m.quartier
@@ -1645,6 +1666,7 @@ const {
   presence_confirmation_deadline_minutes, presence_confirmation_deadline_minutes_sameday,
   candidate_batch_size, candidate_tiebreak_window_minutes, candidate_batch_max_waves,
   activity_photo_interval_minutes,
+  new_mission_whatsapp_delay_hours,
   urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
   candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
   candidature_relance_first_after_minutes, candidature_relance_interval_minutes,
@@ -1689,6 +1711,7 @@ const {
     presence_confirmation_deadline_minutes, presence_confirmation_deadline_minutes_sameday,
     candidate_batch_size, candidate_tiebreak_window_minutes, candidate_batch_max_waves,
     activity_photo_interval_minutes,
+    new_mission_whatsapp_delay_hours,
     urgent_mission_whatsapp_batch_size, urgent_mission_whatsapp_batch_delay_minutes,
     candidature_whatsapp_seuil_count, candidature_whatsapp_seuil_minutes,
     candidature_relance_first_after_minutes, candidature_relance_interval_minutes,

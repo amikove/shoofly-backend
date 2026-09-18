@@ -438,17 +438,23 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
   return mission;
 }
 
-// ── Réutilisable : vague WhatsApp pour une mission urgente — appelée à la création (voir
-// notifyNewMission ci-dessous, mission.is_urgent) ET par le cron de vagues suivantes (index.js).
-// Contacte au plus urgent_mission_whatsapp_batch_size Œils éligibles (disponibles, vérifiés,
-// même ville que la mission) PAS ENCORE contactés pour cette mission précise (table dédiée
-// mission_whatsapp_contacts — anti-doublon), classés reliability_score DESC, rating_avg DESC
-// (même principe que advanceCandidateCascade, sans réutiliser mission_interests : ici personne
-// n'a encore postulé, c'est le pool des Œils disponibles de la ville, pas des candidats).
+// ── Réutilisable : vague WhatsApp pour une mission — déclenchée une 1ère fois par
+// checkNewMissionWhatsappWave (cron, plus bas) après new_mission_whatsapp_delay_hours sans
+// aucune candidature reçue, PUIS par le cron de vagues suivantes (index.js) tant que le pool
+// n'est pas épuisé. Contacte au plus urgent_mission_whatsapp_batch_size Œils éligibles
+// (disponibles, vérifiés, même ville que la mission) PAS ENCORE contactés pour cette mission
+// précise (table dédiée mission_whatsapp_contacts — anti-doublon), classés reliability_score
+// DESC, rating_avg DESC (même principe que advanceCandidateCascade, sans réutiliser
+// mission_interests : ici personne n'a encore postulé, c'est le pool des Œils disponibles de la
+// ville, pas des candidats).
 // Programme la vague suivante (missions.urgent_whatsapp_next_wave_at) si le pool n'est pas
 // épuisé ; sinon laisse le champ à NULL — l'alerte admin "mission sans Œil depuis 12h" déjà
 // existante (index.js, cronStaleMissionsRunning) prend le relais, aucune nouvelle logique de
 // repli à construire ici (garde-fou explicite de la spec).
+// Audit santé technique 2026-09-18, §3.7 : nom de fonction/colonnes conservés tels quels
+// (infrastructure de vagues réutilisée, pas dupliquée) malgré l'usage désormais élargi aux
+// missions NON urgentes — plus de distinction produit trouvée entre les deux (urgency_fee,
+// seul réglage qui aurait pu en dépendre, est seedé mais jamais lu nulle part dans le code).
 async function sendUrgentWhatsAppWave(db, mission, emitToUser = null) {
   const batchSize = await getSetting(db, 'urgent_mission_whatsapp_batch_size', 10);
   const delayMinutes = await getSetting(db, 'urgent_mission_whatsapp_batch_delay_minutes', 30);
@@ -463,7 +469,12 @@ async function sendUrgentWhatsAppWave(db, mission, emitToUser = null) {
     [mission.city, mission.id, batchSize]
   );
 
-  for (const o of pool) {
+  // Sollicitation en parallèle de tout le pool (audit santé technique 2026-09-18, §3.7 — même
+  // correctif que notifyNewMission/advanceCandidateCascade ci-dessous) : chaque Œil du pool est
+  // indépendant des autres (rien ne dépend de l'ordre), Promise.all remplace le for...await
+  // séquentiel qui faisait grandir la durée de cette vague avec sa taille (jusqu'à
+  // urgent_mission_whatsapp_batch_size × ~10s de timeout WhatsApp dans le pire cas).
+  await Promise.all(pool.map(async (o) => {
     await db.query(
       `INSERT INTO mission_whatsapp_contacts (mission_id, oeil_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
       [mission.id, o.id]
@@ -477,12 +488,17 @@ async function sendUrgentWhatsAppWave(db, mission, emitToUser = null) {
     // (100% mort tant que G5 n'est pas résolu, voir waselTemplates.js), jamais à sa place — c'est
     // le seul filet IA+push pour ce pool précis (Œils pas encore candidats, aucun autre chemin ne
     // les touche). Inconditionnel (même Œil sans téléphone y compris) : notify() ne dépend pas du
-    // téléphone, contrairement à WhatsApp.
-    await notify(db, o.id, '🚨 Mission urgente disponible',
+    // téléphone, contrairement à WhatsApp. Titre conditionné sur is_urgent (audit santé technique
+    // 2026-09-18) : cette vague se déclenche désormais aussi pour des missions NON urgentes
+    // (relance différée), le cadrage "urgente" serait trompeur pour ce sous-ensemble. Seul le
+    // canal in-app/push est ajustable ici : le template WhatsApp Meta lui-même (approuvé sous le
+    // nom "nouvelle_mission_urgente") reste figé tel quel, signalé au rapport de session.
+    await notify(db, o.id,
+      mission.is_urgent ? '🚨 Mission urgente disponible' : '📋 Mission disponible',
       `${mission.title} — ${mission.city} · ${mission.price} MAD`, 'mission', mission.id, emitToUser, null,
       'urgentWaveOeilTitle', 'urgentWaveOeilBody',
       { missionTitle: mission.title, city: mission.city, price: mission.price });
-  }
+  }));
 
   // Reste-t-il des Œils éligibles non encore contactés ? Si oui, vague suivante programmée ;
   // sinon pool épuisé, on ne programme rien de plus (voir garde-fou ci-dessus).
@@ -508,6 +524,18 @@ async function sendUrgentWhatsAppWave(db, mission, emitToUser = null) {
 // ── Réutilisable : notifications + broadcast admin après création — JAMAIS à l'intérieur
 // d'une transaction. Identique que la mission vienne d'une création directe (POST /missions)
 // ou d'un paiement PayZone confirmé (POST /payments/payzone/callback).
+// Audit santé technique 2026-09-18, §3.7 — deux correctifs combinés, décidés ensemble :
+//  1. Appelée en tâche de fond par les deux sites d'appel (après l'envoi de la réponse HTTP,
+//     jamais attendue par elle) — voir POST /missions et payments.js. Cette fonction elle-même
+//     reste `async`/attendable (inchangé) : c'est la responsabilité de CHAQUE appelant de ne pas
+//     l'attendre, pas la sienne de se détacher elle-même (elle ne connaît pas `res`).
+//  2. La boucle de notification ci-dessous, qui grandissait linéairement avec le nombre d'Œils
+//     éligibles de la ville (for...await, jamais Promise.all), est désormais parallélisée —
+//     chaque Œil est indépendant des autres, aucun ordre à préserver.
+// Le WhatsApp immédiat pour les missions urgentes a été retiré d'ici (voir
+// checkNewMissionWhatsappWave, plus bas) : il devient une relance différée déclenchée par cron
+// après new_mission_whatsapp_delay_hours sans aucune candidature, pour TOUTE mission — plus de
+// distinction is_urgent à la création (voir justification sur sendUrgentWhatsAppWave ci-dessus).
 async function notifyNewMission(db, mission, emitToUser, io) {
   const { rows: oeils } = await db.query(
     `SELECT u.id FROM users u JOIN oeil_profiles p ON p.user_id=u.id
@@ -515,19 +543,59 @@ async function notifyNewMission(db, mission, emitToUser, io) {
        AND u.city=$1`,
     [mission.city]
   );
-  for (const o of oeils) {
-    await notify(db, o.id, `Nouvelle mission${mission.is_urgent?' 🚨 URGENTE':''}`,
-      `${mission.title} — ${mission.city} · ${mission.price} MAD`, 'mission', mission.id, emitToUser, null,
-      mission.is_urgent ? 'newMissionUrgentTitle' : 'newMissionAvailableTitle', 'newMissionBody',
-      { missionTitle: mission.title, city: mission.city, price: mission.price });
-  }
+  await Promise.all(oeils.map((o) => notify(db, o.id, `Nouvelle mission${mission.is_urgent?' 🚨 URGENTE':''}`,
+    `${mission.title} — ${mission.city} · ${mission.price} MAD`, 'mission', mission.id, emitToUser, null,
+    mission.is_urgent ? 'newMissionUrgentTitle' : 'newMissionAvailableTitle', 'newMissionBody',
+    { missionTitle: mission.title, city: mission.city, price: mission.price })));
   if (io) io.to('room:admin').emit('new_mission', mission);
+}
 
-  // WhatsApp (facturé par Wasel) : jamais à tous les Œils en une fois pour une mission urgente —
-  // par vagues seulement, voir sendUrgentWhatsAppWave ci-dessus. Missions non urgentes : aucun
-  // WhatsApp ici (comportement inchangé — seule la notification in-app ci-dessus existait déjà).
-  if (mission.is_urgent) {
-    await sendUrgentWhatsAppWave(db, mission, emitToUser);
+// ── Cron (index.js) : relance WhatsApp différée pour les missions sans AUCUNE candidature ──
+// Audit santé technique 2026-09-18, §3.7 — nouvelle direction produit : remplace l'ancien envoi
+// WhatsApp immédiat à la création (retiré de notifyNewMission ci-dessus) par une relance
+// déclenchée seulement si le client n'a toujours reçu aucune proposition après
+// new_mission_whatsapp_delay_hours (compté depuis missions.created_at). "Aucune proposition" =
+// aucune ligne mission_interests non refusée pour cette mission — même définition que celle déjà
+// utilisée par advanceCandidateCascade pour tirer son pool de candidats (mi.declined=false),
+// alignée ici plutôt qu'une nouvelle définition inventée (le client attend une candidature, pas
+// nécessairement déjà un Œil embauché).
+// S'applique à TOUTE mission, urgente ou non (voir justification sur sendUrgentWhatsAppWave) :
+// réutilise cette même fonction pour la 1ère vague, qui programme elle-même les vagues suivantes
+// (urgent_whatsapp_next_wave_at) — logique de lots non dupliquée ici.
+async function checkNewMissionWhatsappWave(db, emitToUser) {
+  const delayHours = await getSetting(db, 'new_mission_whatsapp_delay_hours', 2);
+  const { rows: dueMissions } = await db.query(`
+    SELECT * FROM missions
+    WHERE status='pending' AND oeil_id IS NULL
+      AND created_at <= NOW() - INTERVAL '1 hour' * $1::numeric
+      AND new_mission_whatsapp_relance_sent_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM mission_interests mi WHERE mi.mission_id = missions.id AND mi.declined = false
+      )
+  `, [delayHours]);
+
+  for (const mission of dueMissions) {
+    // Isolation par itération (O-BE-2) : un crash sur CETTE mission (vague WhatsApp) ne doit
+    // jamais abandonner le reste du lot — même granularité que les autres crons de ce fichier.
+    try {
+      // Garde d'idempotence AVANT l'envoi (même patron que checkPendingMissionExpiration) : si
+      // deux ticks se chevauchaient, un seul gagne la course et déclenche la vague.
+      const { rowCount } = await db.query(
+        `UPDATE missions SET new_mission_whatsapp_relance_sent_at=NOW() WHERE id=$1 AND new_mission_whatsapp_relance_sent_at IS NULL`,
+        [mission.id]
+      );
+      if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
+
+      const sent = await sendUrgentWhatsAppWave(db, mission, emitToUser);
+      console.log(`📲 Relance WhatsApp différée — mission ${mission.id} (${sent} Œil(s) contacté(s), toujours sans candidature après ${delayHours}h)`);
+    } catch (e) {
+      console.error(`❌ checkNewMissionWhatsappWave: mission ${mission.id} :`, e.message);
+      Sentry.captureException(e, {
+        level: 'error',
+        tags: { area: 'new_mission_whatsapp_wave' },
+        extra: { missionId: mission.id },
+      });
+    }
   }
 }
 
@@ -942,6 +1010,22 @@ const missionCreateLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Rate limit dédié sur la candidature Œil (audit santé technique 2026-09-18, §2.6) — seul le
+// plafond global (300/15min) protégeait POST /:id/interest jusqu'ici. Plafond volontairement
+// plus large que missionCreateLimiter ci-dessus : candidater est une action de consultation/
+// parcours (un Œil actif peut légitimement candidater à plusieurs dizaines de missions dans son
+// heure de pointe), pas une action ponctuelle comme créer une mission ou se connecter — 30/15min
+// reste très au-dessus d'un usage légitime intensif tout en bornant un abus qui, sans ce
+// limiteur, pourrait aussi forcer artificiellement le seuil WhatsApp client
+// (candidature_whatsapp_seuil_count) sur de nombreuses missions à la fois.
+const interestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { error: 'Trop de candidatures depuis cette adresse. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // ── Anti-double-création (PROMPT 1 point 4, 2026-08-17) ────────────────────
 // missionCreateLimiter ci-dessus throttle le volume (10/15min) mais ne dédoublonne rien : deux
 // requêtes quasi simultanées (double-clic, retry réseau du frontend) passent toutes les deux le
@@ -1081,9 +1165,22 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), miss
 
   await db.query(`UPDATE mission_create_locks SET mission_id=$1 WHERE client_id=$2 AND fingerprint=$3`, [mission.id, req.user.id, fingerprint]);
 
-  await notifyNewMission(db, mission, emitToUser, io);
-
   res.status(201).json({ mission });
+
+  // Mise en fond (audit santé technique 2026-09-18, §3.7) : notifyNewMission n'est plus attendue
+  // avant la réponse — son coût (notifications à tous les Œils éligibles de la ville, désormais
+  // parallélisées en interne) ne doit plus jamais faire grandir le temps de réponse de cette
+  // route avec la taille du pool d'Œils. Le client a déjà sa réponse 201 ci-dessus ; une erreur
+  // ici ne doit donc jamais remonter vers lui — .catch() + Sentry (même convention que le reste
+  // du projet, ex. checkPendingMissionExpiration) au lieu de laisser une unhandledRejection.
+  notifyNewMission(db, mission, emitToUser, io).catch((e) => {
+    console.error(`❌ notifyNewMission (fond, mission ${mission.id}) :`, e.message);
+    Sentry.captureException(e, {
+      level: 'error',
+      tags: { area: 'notify_new_mission_background' },
+      extra: { missionId: mission.id },
+    });
+  });
 }));
 
 // ── PUT /missions/:id ── Client modifie sa mission après création ──────────
@@ -2582,7 +2679,7 @@ router.post('/:id/rate-client', authenticate, requireRole('oeil'), [
 
 // ── POST /:id/interest ── Œil exprime son intérêt ─────────
 
-router.post('/:id/interest', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+router.post('/:id/interest', interestLimiter, authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
     const db = getDb();
     const { message } = req.body;
     // La suspension est vérifiée en amont par le middleware authenticate ; le cooldown
@@ -4396,7 +4493,12 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
       'SELECT id, phone FROM users WHERE id = ANY($1::text[])', [candidateIds]
     );
     const phoneById = new Map(candidateContacts.map(c => [c.id, c.phone]));
-    for (const nextOeilId of candidateIds) {
+    // Audit santé technique 2026-09-18, §3.7 : le commentaire ci-dessus promettait déjà une
+    // sollicitation "SIMULTANÉE", mais l'implémentation était un for...await séquentiel — jusqu'à
+    // candidate_batch_size (défaut 10) × ~10s de timeout WhatsApp dans le pire cas (~100s
+    // cumulés). Promise.all fait enfin correspondre le code à ce que ce commentaire annonçait
+    // depuis toujours : chaque candidat est indépendant des autres, aucun ordre à préserver.
+    await Promise.all(candidateIds.map(async (nextOeilId) => {
       await notify(db, nextOeilId,
         '🎯 Confirmez votre disponibilité',
         `Vous êtes parmi les candidats les mieux classés pour "${mission.title}". Confirmez votre disponibilité sous ${confirmationMinutes} min pour être considéré.`,
@@ -4408,7 +4510,7 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
       if (candidatePhone) {
         await sendWhatsAppTemplate(waselTemplates.candidate_confirmation_request.template_name, candidatePhone, [mission.title, String(confirmationMinutes)]);
       }
-    }
+    }));
 
     if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, pending_candidate_id: candidateIds[0], batch_candidate_count: candidateIds.length });
   } else {
@@ -5055,6 +5157,7 @@ router.checkTransferDeadlines = checkTransferDeadlines;
 router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
 router.checkAssistanceRequestExpiry = checkAssistanceRequestExpiry;
 router.checkPendingMissionExpiration = checkPendingMissionExpiration;
+router.checkNewMissionWhatsappWave = checkNewMissionWhatsappWave;
 router.checkPresenceConfirmationDeadlines = checkPresenceConfirmationDeadlines;
 router.checkActivityPhotoDeadlines = checkActivityPhotoDeadlines;
 router.hireOeilCore = hireOeilCore;

@@ -575,6 +575,16 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- (pending_mission_expiration_hours) — celle-ci n'a besoin d'aucune sentinelle propre, le
     -- passage de status à 'cancelled' la retire déjà du balayage 'pending'.
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS pending_expired_notified_at TIMESTAMPTZ;
+    -- Audit santé technique 2026-09-18, §3.7 — nouvelle relance WhatsApp différée (remplace
+    -- l'ancien envoi immédiat à la création, voir notifyNewMission/sendUrgentWhatsAppWave,
+    -- routes/missions.js) : sentinelle « 1ère vague déjà déclenchée pour cette mission », même
+    -- rôle/polarité que stale_notified_at/pending_expired_notified_at ci-dessus (NULL = jamais
+    -- déclenchée). Distincte de mission_whatsapp_contacts (qui trace QUI a été contacté, pas SI
+    -- une vague a déjà eu lieu) : nécessaire ici pour rester idempotent même dans le cas limite
+    -- où sendUrgentWhatsAppWave trouve un pool vide (aucune ligne insérée dans
+    -- mission_whatsapp_contacts) — sans cette colonne, checkNewMissionWhatsappWave retenterait
+    -- indéfiniment la même mission à chaque tick.
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS new_mission_whatsapp_relance_sent_at TIMESTAMPTZ;
 
     -- Index de performance sur les colonnes fréquemment filtrées/jointes
     CREATE INDEX IF NOT EXISTS idx_withdrawals_oeil_id ON withdrawals(oeil_id);
@@ -832,14 +842,17 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- ne pas avoir de compte bancaire. Renseigné via PUT /auth/me (voir routes/auth.js).
     ALTER TABLE oeil_profiles ADD COLUMN IF NOT EXISTS has_bank_account BOOLEAN;
 
-    -- Vagues WhatsApp pour les missions urgentes (notifyNewMission) — évite d'envoyer un
+    -- Vagues WhatsApp (sendUrgentWhatsAppWave, routes/missions.js) — évite d'envoyer un
     -- WhatsApp (facturé par Wasel) à tous les Œils disponibles de la ville en une seule fois.
-    -- À la création, seuls les urgent_mission_whatsapp_batch_size premiers Œils éligibles
-    -- (classés reliability_score DESC, rating_avg DESC) sont contactés par WhatsApp ; la
-    -- notification in-app, elle, part toujours à tous immédiatement (inchangée). Si la mission
-    -- reste sans oeil_id après urgent_mission_whatsapp_batch_delay_minutes, le cron dédié
-    -- (index.js) envoie une nouvelle vague aux Œils éligibles pas encore contactés — voir
-    -- sendUrgentWhatsAppWave, routes/missions.js.
+    -- Chaque vague ne contacte que les urgent_mission_whatsapp_batch_size premiers Œils
+    -- éligibles pas encore contactés (classés reliability_score DESC, rating_avg DESC). La
+    -- notification in-app, elle, part toujours à tous immédiatement à la création (notify
+    -- NewMission, inchangé). Audit santé technique 2026-09-18, §3.7 : la 1ère vague WhatsApp
+    -- n'est plus déclenchée à la création — checkNewMissionWhatsappWave (cron, index.js) la
+    -- déclenche après new_mission_whatsapp_delay_hours si la mission n'a toujours aucune
+    -- candidature, urgente ou non. Si la mission reste sans oeil_id après
+    -- urgent_mission_whatsapp_batch_delay_minutes suivant une vague, le cron dédié (index.js)
+    -- en envoie une nouvelle aux Œils éligibles pas encore contactés.
     CREATE TABLE IF NOT EXISTS mission_whatsapp_contacts (
       mission_id   TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
       oeil_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1481,6 +1494,16 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     CREATE INDEX IF NOT EXISTS idx_missions_updated_at           ON missions(updated_at);
     CREATE INDEX IF NOT EXISTS idx_mission_interests_created_at  ON mission_interests(created_at);
     CREATE INDEX IF NOT EXISTS idx_reliability_events_created_at ON reliability_events(created_at);
+
+    -- Audit santé technique 2026-09-18, §3.1 — dashboard anti-fraude "messages suspects"
+    -- (antiFraud.js, GET /anti-fraud/dashboard) : le prédicat mm.created_at > NOW() - INTERVAL
+    -- existe DÉJÀ (fraud_dashboard_recent_days, défaut 7j) — contrairement à premiereCandidature/
+    -- candidaturesRows ci-dessus, ce n'est pas un prédicat manquant, mais un prédicat sans index
+    -- pour le servir : Seq Scan de mission_messages entier à chaque chargement malgré l'intention
+    -- de ne regarder qu'une fenêtre récente. Le motif ~* (regex) sur mm.content ne peut de toute
+    -- façon pas utiliser d'index B-tree, mais borner par created_at D'ABORD réduit déjà
+    -- l'essentiel du volume scanné avant d'évaluer le regex sur ce qui reste.
+    CREATE INDEX IF NOT EXISTS idx_mission_messages_created_at ON mission_messages(created_at);
 
     -- ── P1 (c) — colonnes de tri de GET /api/missions sans index (routes/missions.js:774-791) ──
     -- ORDER BY réellement proposé par l'UI : admin/Missions.jsx (sortBy ∈ title|client|oeil|price|

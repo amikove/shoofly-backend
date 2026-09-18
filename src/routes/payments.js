@@ -2,6 +2,7 @@
 // confirmation du paiement (callback webhook PayZone), jamais au moment du formulaire —
 // voir mission_payment_attempts (db/schema.js) et le rapport de session pour le détail.
 const crypto = require('crypto');
+const Sentry = require('@sentry/node');
 const router = require('express').Router();
 const { validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
@@ -150,9 +151,23 @@ router.post('/payzone/callback', asyncHandler(async (req, res) => {
     // Notifications APRÈS le commit (règle du projet : jamais de notify() dans une transaction).
     const emitToUser = req.app.get('emitToUser');
     const io = req.app.get('io');
-    await notifyNewMission(db, mission, emitToUser, io);
 
-    return res.status(200).json({ status: 'OK', message: 'Mission créée' });
+    const response = res.status(200).json({ status: 'OK', message: 'Mission créée' });
+
+    // Mise en fond (audit santé technique 2026-09-18, §3.7 — même correctif que POST /missions) :
+    // PayZone attend cette réponse pour arrêter de réessayer le webhook ; notifyNewMission ne
+    // doit plus jamais la retarder avec la taille du pool d'Œils de la ville. .catch() + Sentry
+    // au lieu de laisser une unhandledRejection, la réponse HTTP étant déjà partie ci-dessus.
+    notifyNewMission(db, mission, emitToUser, io).catch((e) => {
+      console.error(`❌ notifyNewMission (fond, mission ${mission.id}) :`, e.message);
+      Sentry.captureException(e, {
+        level: 'error',
+        tags: { area: 'notify_new_mission_background' },
+        extra: { missionId: mission.id },
+      });
+    });
+
+    return response;
   }
 
   if (payload.status === 'DECLINED') {

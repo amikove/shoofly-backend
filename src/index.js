@@ -66,6 +66,7 @@ const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
 const checkMissionEditRequestExpiry = missionRoutesModule.checkMissionEditRequestExpiry;
 const checkAssistanceRequestExpiry = missionRoutesModule.checkAssistanceRequestExpiry;
 const checkPendingMissionExpiration = missionRoutesModule.checkPendingMissionExpiration;
+const checkNewMissionWhatsappWave = missionRoutesModule.checkNewMissionWhatsappWave;
 const checkPresenceConfirmationDeadlines = missionRoutesModule.checkPresenceConfirmationDeadlines;
 const checkActivityPhotoDeadlines = missionRoutesModule.checkActivityPhotoDeadlines;
 const advanceCandidateCascade = missionRoutesModule.advanceCandidateCascade;
@@ -504,6 +505,7 @@ initDb().then(() => {
   let cronAutoValidateRunning = false;
   let cronStaleMissionsRunning = false;
   let cronPendingExpirationRunning = false;
+  let cronNewMissionWhatsappWaveRunning = false;
   let cronCandidateWindowRunning = false;
   let cronTicketAutoResolveRunning = false;
   let cronPresenceConfirmationRunning = false;
@@ -1410,25 +1412,30 @@ initDb().then(() => {
     finally { cronCandidateWindowRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
-  // ── Cron toutes les 5 min — Vagues WhatsApp suivantes (missions urgentes) ─
+  // ── Cron toutes les 5 min — Vagues WhatsApp suivantes ─────
   // Cadence alignée sur checkTransferDeadlines/checkMissionEditRequestExpiry/
   // checkPresenceConfirmationDeadlines ci-dessus (vérifications de deadline sur des fenêtres de
   // dizaines de minutes à quelques heures) — pas la cadence 2min de la cascade candidat
   // ci-dessus, réservée à ses propres fenêtres plus courtes (candidate_confirmation_minutes,
   // candidate_tiebreak_window_minutes). urgent_whatsapp_next_wave_at est posé par
-  // sendUrgentWhatsAppWave (routes/missions.js — appelée depuis notifyNewMission à la création
-  // ET ici pour les vagues suivantes, logique non dupliquée) : NULL tant qu'aucune vague n'est
-  // en attente (mission non urgente, déjà assignée, ou pool d'Œils éligibles épuisé — dans ce
-  // dernier cas l'alerte admin "mission sans Œil depuis 12h" ci-dessous prend le relais).
+  // sendUrgentWhatsAppWave (routes/missions.js) : NULL tant qu'aucune vague n'est en attente
+  // (aucune vague encore déclenchée, mission déjà assignée, ou pool d'Œils éligibles épuisé — dans
+  // ce dernier cas l'alerte admin "mission sans Œil depuis 12h" ci-dessous prend le relais).
+  // Audit santé technique 2026-09-18, §3.7 : le filtre is_urgent=true a été retiré — la 1ère
+  // vague est désormais déclenchée par checkNewMissionWhatsappWave (relance différée, plus bas)
+  // pour TOUTE mission sans candidature, plus seulement les urgentes à la création. Le sentinel
+  // urgent_whatsapp_next_wave_at (posé uniquement par sendUrgentWhatsAppWave) est déjà une
+  // condition suffisante à lui seul — is_urgent=true excluait à tort les vagues suivantes des
+  // missions non urgentes désormais entrées dans ce mécanisme.
   cron.schedule('1-59/5 * * * *', async () => {
-    if (cronUrgentWhatsAppWaveRunning) { console.warn('⏭️ Cron vagues WhatsApp missions urgentes déjà en cours, tick ignoré'); return; }
+    if (cronUrgentWhatsAppWaveRunning) { console.warn('⏭️ Cron vagues WhatsApp suivantes déjà en cours, tick ignoré'); return; }
     cronUrgentWhatsAppWaveRunning = true;
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
       const { rows: dueMissions } = await db.query(`
         SELECT * FROM missions
-        WHERE is_urgent=true AND oeil_id IS NULL
+        WHERE oeil_id IS NULL
           AND urgent_whatsapp_next_wave_at IS NOT NULL AND urgent_whatsapp_next_wave_at <= NOW()
       `);
       for (const mission of dueMissions) {
@@ -1437,11 +1444,30 @@ initDb().then(() => {
         // qui lève sur une mission abandonnait les vagues des missions suivantes du tick.
         try {
         const sent = await sendUrgentWhatsAppWave(db, mission, emitToUser);
-        console.log(`📲 Vague WhatsApp mission urgente ${mission.id} — ${sent} Œil(s) contacté(s)`);
-        } catch (e) { console.error(`❌ Cron vagues WhatsApp urgentes — mission ${mission.id} :`, e.message); }
+        console.log(`📲 Vague WhatsApp mission ${mission.id} — ${sent} Œil(s) contacté(s)`);
+        } catch (e) { console.error(`❌ Cron vagues WhatsApp suivantes — mission ${mission.id} :`, e.message); }
       }
-    } catch (e) { console.error('❌ Cron vagues WhatsApp missions urgentes error:', e.message); }
+    } catch (e) { console.error('❌ Cron vagues WhatsApp suivantes error:', e.message); }
     finally { cronUrgentWhatsAppWaveRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron toutes les 15 min — Relance WhatsApp différée (missions sans candidature) ──
+  // Audit santé technique 2026-09-18, §3.7 : remplace l'ancien envoi WhatsApp immédiat à la
+  // création. Logique dans checkNewMissionWhatsappWave (routes/missions.js, même convention que
+  // les autres checkXxx de ce fichier) pour rester appelable directement depuis les scripts E2E
+  // (_audit/e2e) sans attendre un vrai tick. Cadence plus fine que les crons de deadline
+  // ci-dessus (fenêtre en heures, pas en dizaines de minutes) mais plus large que la cascade
+  // candidat (2min) : cette relance n'a rien d'urgent au sens temps réel, 15min de granularité
+  // sur un délai de 2-3h reste largement suffisant.
+  cron.schedule('7-59/15 * * * *', async () => {
+    if (cronNewMissionWhatsappWaveRunning) { console.warn('⏭️ Cron relance WhatsApp différée déjà en cours, tick ignoré'); return; }
+    cronNewMissionWhatsappWaveRunning = true;
+    try {
+      const db = getDb();
+      const emitToUser = app.get('emitToUser');
+      await checkNewMissionWhatsappWave(db, emitToUser);
+    } catch (e) { console.error('❌ Cron relance WhatsApp différée error:', e.message); }
+    finally { cronNewMissionWhatsappWaveRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 5 min — Seuil WhatsApp candidatures (repli délai) ────

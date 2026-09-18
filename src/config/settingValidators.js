@@ -19,7 +19,7 @@
 // retente, `min_price` = pas de plancher global) et rien dans le code ne permet de distinguer
 // un 0 voulu d'un 0 accidentel pour les autres.
 //
-// Périmètre = les 78 clés réellement déstructurées par PUT /admin/settings. `urgency_fee` et
+// Périmètre = les 79 clés réellement déstructurées par PUT /admin/settings. `urgency_fee` et
 // `accept_delay` sont seedées mais ABSENTES de l'allowlist (non modifiables via l'API) donc
 // pas validées ici — si elles y entrent un jour, leur ajouter une règle (urgency_fee serait
 // un { min: 0, max: 1 }, accept_delay n'a aucun lecteur).
@@ -109,6 +109,7 @@ const SETTING_RULES = {
   candidate_batch_max_waves:                   { min: 0 }, // missions.js:4066  batch_wave_count >= maxBatchWaves (0 = bascule élargie immédiate)
   activity_photo_interval_minutes:             { min: 0 }, // media.js:92, missions.js:3813
   urgent_mission_whatsapp_batch_delay_minutes: { min: 0 }, // missions.js:424
+  new_mission_whatsapp_delay_hours:            { min: 0 }, // missions.js:565  checkNewMissionWhatsappWave, INTERVAL '1 hour' * $n
   candidature_whatsapp_seuil_count:            { min: 0 }, // missions.js:2539  COUNT(*) >= $n (comparaison → décimale tolérée)
   candidature_whatsapp_seuil_minutes:          { min: 0 }, // index.js:1417/1426  INTERVAL '1 minute' * $1
   candidature_relance_first_after_minutes:     { min: 0 }, // jobs/candidatureRelance.js:20/33

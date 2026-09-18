@@ -147,6 +147,12 @@ function postFormViaHttps(url, formBody, agent) {
       res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
       res.on('error', reject);
     });
+    // Audit santé technique 2026-09-18, §3.6 : sans timeout, une connexion acceptée par CashPlus
+    // mais jamais suivie d'une réponse laissait cette promesse indéfiniment en attente (bornée
+    // uniquement par les timeouts réseau/OS). Même pattern déjà en place dans ce projet pour un
+    // appel https brut (keep-alive Render, index.js, req.setTimeout(10000, () => req.destroy())) —
+    // .destroy() déclenche 'error' ci-dessous, qui reject() la promesse au lieu de la laisser pendre.
+    req.setTimeout(10000, () => req.destroy());
     req.on('error', reject);
     req.write(formBody);
     req.end();

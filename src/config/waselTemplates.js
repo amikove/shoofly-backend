@@ -119,10 +119,12 @@ module.exports = {
     note: '{{1}} nom du client qui a embauché l\'Œil',
   },
 
-  // sendUrgentWhatsAppWave (routes/missions.js), appelée depuis notifyNewMission à la création
-  // d'une mission is_urgent=true (POST /missions direct ou paiement PayZone confirmé) ET par le
-  // cron de vagues suivantes (index.js) — mécanisme de vagues déjà en place, inchangé par cette
-  // session (seul le nom de template est mis à jour ici).
+  // sendUrgentWhatsAppWave (routes/missions.js), déclenchée par checkNewMissionWhatsappWave
+  // (relance différée après new_mission_whatsapp_delay_hours sans candidature — audit santé
+  // technique 2026-09-18, §3.7, remplace l'ancien envoi immédiat à la création) ET par le cron de
+  // vagues suivantes (index.js). Note : depuis ce correctif, ce template se déclenche aussi pour
+  // des missions NON urgentes — son texte approuvé côté Meta reste "nouvelle mission urgente" tel
+  // quel (aucune variable ne permet de l'ajuster), signalé au rapport de session.
   urgent_mission_whatsapp_wave: {
     template_name: 'nouvelle_mission_urgente',
     variableCount: 2,

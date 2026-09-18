@@ -71,6 +71,14 @@ module.exports = {
   payment_attempt_abandoned_minutes: '30',
   urgent_mission_whatsapp_batch_size: '10',
   urgent_mission_whatsapp_batch_delay_minutes: '30',
+  // Audit santé technique 2026-09-18, §3.7 — délai avant la 1ère vague WhatsApp d'une mission
+  // (checkNewMissionWhatsappWave, routes/missions.js), compté depuis missions.created_at,
+  // seulement si aucune candidature n'est encore arrivée (mission_interests vide). Remplace
+  // l'ancien envoi immédiat à la création : s'applique à TOUTE mission, urgente ou non — une
+  // fois déclenchée, la 1ère vague réutilise sendUrgentWhatsAppWave telle quelle (mêmes réglages
+  // urgent_mission_whatsapp_batch_* ci-dessus pour les vagues suivantes). Valeur provisoire (2h,
+  // bas de la fourchette 2-3h demandée) — à ajuster depuis /admin/parametres une fois en prod.
+  new_mission_whatsapp_delay_hours: '2',
   candidature_whatsapp_seuil_count: '3',
   candidature_whatsapp_seuil_minutes: '60',
   whatsapp_retry_max_attempts: '3',
