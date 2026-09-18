@@ -1,0 +1,82 @@
+name: CI
+
+# Audit santé technique 2026-09-18, §1.6 — jusqu'ici aucun filet entre un push et la prod :
+# pas de .github/workflows, aucun framework de test (jest/mocha/vitest), aucun script "test".
+# Ce workflow n'est PAS une suite de tests — voir le rapport de chantier pour ce qu'il attrape
+# réellement (crash au démarrage, migrations DDL cassées, imports fatals) et ce qu'il n'attrape
+# PAS (aucune régression fonctionnelle : aucun test n'exerce le comportement des routes).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+
+    # Postgres éphémère plutôt qu'un simple contrôle syntaxique : initDb() (src/db/schema.js)
+    # exécute ~260 instructions DDL réelles au démarrage (CREATE TABLE/ALTER/INDEX) — sans base
+    # réelle, ce correctif ne vérifierait qu'un require() propre, pas que les migrations
+    # s'appliquent effectivement. GitHub Actions fournit ce service sans complexité ajoutée.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: shoofly
+          POSTGRES_PASSWORD: shoofly_ci
+          POSTGRES_DB: shoofly_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://shoofly:shoofly_ci@localhost:5432/shoofly_ci
+      JWT_SECRET: ci-smoke-test-secret-not-for-prod
+      FRONTEND_URL: http://localhost:5173
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Rapport seulement (non bloquant) — 4 vulnérabilités modérées connues au 2026-09-18
+      # (express/qs/body-parser/morgan), voir §1.8 du rapport d'audit. Ne fait jamais échouer le
+      # job : l'objectif ici est la visibilité, pas un blocage sur des CVE non triées.
+      - name: npm audit (rapport, non bloquant)
+        run: npm audit || true
+
+      # Démarre le vrai serveur (start.js → src/index.js) contre la base éphémère ci-dessus,
+      # attend que /health réponde 200 (confirme migrations OK + port bindé), puis l'arrête.
+      # Un crash au démarrage (erreur de syntaxe, import cassé, DDL invalide) fait échouer ce
+      # step — c'est le filet minimal que §1.6 demandait, pas plus.
+      - name: Démarrage du serveur + vérification /health
+        run: |
+          npm start &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/health > /dev/null; then
+              echo "✅ Serveur démarré et /health répond OK"
+              kill $SERVER_PID
+              exit 0
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "❌ Le serveur s'est arrêté avant de répondre — voir les logs ci-dessus"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "❌ /health n'a jamais répondu après 30s"
+          kill $SERVER_PID 2>/dev/null || true
+          exit 1
