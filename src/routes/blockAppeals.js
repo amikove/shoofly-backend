@@ -142,8 +142,8 @@ router.post('/admin/:id/decide', authenticate, requireRole('admin'), requirePerm
     const wasNoShow = target?.deactivation_context === 'noshow_strikes';
     await db.query(
       wasNoShow
-        ? `UPDATE users SET is_active=true, deactivation_context=NULL, client_noshow_strikes=0 WHERE id=$1`
-        : `UPDATE users SET is_active=true, deactivation_context=NULL WHERE id=$1`,
+        ? `UPDATE users SET is_active=true, deactivation_context=NULL, client_noshow_strikes=0, suspended_reason=NULL WHERE id=$1`
+        : `UPDATE users SET is_active=true, deactivation_context=NULL, suspended_reason=NULL WHERE id=$1`,
       [appeal.user_id]
     );
     await notify(db, appeal.user_id, '✅ Compte réactivé',

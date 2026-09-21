@@ -1498,9 +1498,10 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
       const { rows: [row] } = await db.query(
         `UPDATE users
            SET is_active = NOT is_active,
-               deactivation_context = CASE WHEN is_active THEN 'admin_toggle' ELSE NULL END
+               deactivation_context = CASE WHEN is_active THEN 'admin_toggle' ELSE NULL END,
+               suspended_reason = CASE WHEN is_active THEN $2 ELSE NULL END
          WHERE id=$1 RETURNING is_active`,
-        [req.params.id]
+        [req.params.id, reason || 'Désactivation administrative']
       );
       u = row;
       // Client désactivé avec une mission en cours (PROMPT 6, 2026-08-18) : l'Œil assigné devient
@@ -1604,7 +1605,7 @@ router.post('/admin/clients/:id/unblock', authenticate, requireRole('admin'), re
   if (target.role !== 'client') return res.status(400).json({ error: 'Réservé aux comptes client.' });
 
   const { rows: [updated] } = await db.query(
-    `UPDATE users SET is_active=true, client_noshow_strikes=0, deactivation_context=NULL WHERE id=$1 RETURNING is_active, client_noshow_strikes`,
+    `UPDATE users SET is_active=true, client_noshow_strikes=0, deactivation_context=NULL, suspended_reason=NULL WHERE id=$1 RETURNING is_active, client_noshow_strikes`,
     [req.params.id]
   );
 

@@ -36,7 +36,12 @@ async function applyClientStrike(db, clientId, missionId, reason, createdBy) {
     // canal de contestation COMPLET (re-soumissible + fil de tickets), aligné sur is_suspended —
     // voir isDeactivatedAccountAllowed (middleware/auth.js). Remis à NULL à la réactivation
     // (decide 'approved' de account_block_appeals, ou POST /admin/clients/:id/unblock).
-    await db.query(`UPDATE users SET is_active=false, deactivation_context='noshow_strikes' WHERE id=$1`, [clientId]);
+    // suspended_reason (2026-09-18) : même formulation que la notification admin envoyée par
+    // l'appelant (routes/users.js, resolve claim) — voir Clients.jsx colonne "Raison".
+    await db.query(
+      `UPDATE users SET is_active=false, deactivation_context='noshow_strikes', suspended_reason=$2 WHERE id=$1`,
+      [clientId, `Bloqué automatiquement après ${count} litiges "client absent" résolus en sa défaveur.`]
+    );
     justBlocked = true;
   }
 

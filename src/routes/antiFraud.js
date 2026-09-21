@@ -430,20 +430,26 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
     const db = getDb();
     const emitToUser = req.app.get('emitToUser');
     const io = req.app.get('io');
-    const { reason } = req.body;
+    // Validation alignée sur PUT /users/admin/:id/toggle-active (même commentaire) : cette raison
+    // est désormais persistée (suspended_reason ci-dessous), plus seulement envoyée une fois en
+    // notification — même hygiène d'entrée que l'autre site qui écrit dans cette colonne.
+    const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+    if (reason.length > 500) {
+      return res.status(400).json({ error: 'La raison ne doit pas dépasser 500 caractères.' });
+    }
     const { rows: [target] } = await db.query('SELECT role, phone FROM users WHERE id=$1', [req.params.userId]);
     if (!target) return res.status(404).json({ error: 'Introuvable' });
     if (target.role === 'admin' && !req.user.is_super_admin) {
       return res.status(403).json({ error: 'Seul le Super Admin peut bloquer un compte administrateur.' });
     }
+    const suspensionReason = reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.';
     // deactivation_context='fraud_block' (chantier L4, 2026-09-09) : marque CE blocage comme
     // anti-fraude → l'utilisateur bloqué obtient un accès restreint MINIMAL (voir le motif +
     // UNE contestation jamais rouvrable, pas de fil de tickets) via isDeactivatedAccountAllowed
     // (middleware/auth.js). Volontairement plus étroit que le canal COMPLET d'une désactivation
     // client (admin_toggle / noshow_strikes) — un blocage pour fraude avérée reste une mesure
     // punitive (cf. commentaire ci-dessous : aucun message "aucune pénalité").
-    await db.query(`UPDATE users SET is_active=false, deactivation_context='fraud_block' WHERE id=$1`, [req.params.userId]);
-  const suspensionReason = reason || 'Votre compte a été suspendu suite à une activité suspecte détectée.';
+    await db.query(`UPDATE users SET is_active=false, deactivation_context='fraud_block', suspended_reason=$2 WHERE id=$1`, [req.params.userId, suspensionReason]);
   // NOTE (chantier push, 2026-09-09) — ce site est DÉLIBÉRÉMENT laissé en db.query brut, PAS
   // migré vers notify(). notify() déclenche le canal push, et un abonnement push vit dans le
   // navigateur indépendamment de is_active/JWT : le router via notify() ici enverrait un push à
