@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const { getDb } = require('../db/schema');
-const { authenticate, requireRole } = require('../middleware/auth');
+const { authenticate, requireRole, invalidateAuthCache } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const asyncHandler = require('../middleware/asyncHandler');
 // notify() — même point d'insertion unique que routes/missions.js, voir utils/notify.js.
@@ -146,6 +146,8 @@ router.post('/admin/:id/decide', authenticate, requireRole('admin'), requirePerm
         : `UPDATE users SET is_active=true, deactivation_context=NULL, suspended_reason=NULL WHERE id=$1`,
       [appeal.user_id]
     );
+    // A-3 (cache authenticate) : la réactivation doit être vue dès la requête suivante du compte.
+    invalidateAuthCache(appeal.user_id);
     await notify(db, appeal.user_id, '✅ Compte réactivé',
       `Votre compte a été réexaminé et réactivé. ${response || ''}`.trim(),
       'success', null, emitToUser, 'none',

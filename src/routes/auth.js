@@ -12,7 +12,7 @@ const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/schema');
 const { getSetting } = require('../utils/settings');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, invalidateAuthCache } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const { sendPasswordResetEmail } = require('../services/email');
@@ -207,6 +207,9 @@ router.put('/me', authenticate, asyncHandler(async (req, res) => {
      disponibilites ? JSON.stringify(disponibilites) : null,
      req.user.id]
   );
+  // A-3 (cache authenticate) : city est lue par authenticate (req.user.city, ex. GET /missions
+  // ?mode=available) — un changement de ville doit être vu dès la requête suivante.
+  invalidateAuthCache(req.user.id);
   if (req.user.role === 'oeil') {
     // has_bank_account est tri-state (true / false / jamais répondu) : contrairement à bio et
     // coverage_zone ci-dessus, `false` est une réponse valide qu'il ne faut pas confondre avec
@@ -244,6 +247,9 @@ router.put('/password', authenticate, [
     return res.status(400).json({ error: 'Mot de passe actuel incorrect' });
   const newPasswordHash = await bcrypt.hash(req.body.new_password, 10);
   await db.query('UPDATE users SET password=$1, password_changed_at=NOW() WHERE id=$2', [newPasswordHash, req.user.id]);
+  // A-3 (cache authenticate) : password_changed_at invalide tous les JWT émis avant cet instant —
+  // sans invalidation, l'ancien état (sans password_changed_at) resterait servi jusqu'au TTL.
+  invalidateAuthCache(req.user.id);
   res.json({ message: 'Mot de passe modifié' });
 }));
 
@@ -321,7 +327,9 @@ router.post('/reset-password', [
   // password_changed_at vient d'être posé — réutilise le mécanisme d'invalidation JWT déjà en
   // place (middleware/auth.js + revalidation Socket.IO périodique dans index.js) : toute session
   // ouverte avant cet instant (y compris via le mot de passe qu'on vient de remplacer) devient
-  // invalide au prochain appel, sans code supplémentaire à écrire ici.
+  // invalide au prochain appel. A-3 (cache authenticate) : l'entrée de cache de cet utilisateur
+  // doit être invalidée pour que ce soit vrai dès la requête suivante et pas au bout du TTL.
+  invalidateAuthCache(user.id);
   res.json({ message: 'Mot de passe réinitialisé avec succès.' });
 }));
 

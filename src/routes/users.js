@@ -1,7 +1,7 @@
 const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/schema');
-const { authenticate, requireRole } = require('../middleware/auth');
+const { authenticate, requireRole, invalidateAuthCache } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const { refundOnCancellation } = require('../utils/refund');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
@@ -1489,6 +1489,8 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
             [req.params.id]
           );
       u = row;
+      // A-3 (cache authenticate) : is_suspended vient de changer (autocommit) — invalide tout de suite.
+      invalidateAuthCache(req.params.id);
     } else {
       const { rows: [before] } = await db.query('SELECT is_active FROM users WHERE id=$1', [req.params.id]);
       // deactivation_context (chantier L4, 2026-09-09) : posé à 'admin_toggle' quand ce toggle
@@ -1504,6 +1506,10 @@ router.put('/admin/:id/toggle-active', authenticate, requireRole('admin'), requi
         [req.params.id, reason || 'Désactivation administrative']
       );
       u = row;
+      // A-3 (cache authenticate) : is_active/deactivation_context viennent de changer (autocommit) —
+      // invalide AVANT handleClientDisabled ci-dessous (notifications, plusieurs awaits) pour que la
+      // requête suivante du compte désactivé reçoive le 403 sans attendre.
+      invalidateAuthCache(req.params.id);
       // Client désactivé avec une mission en cours (PROMPT 6, 2026-08-18) : l'Œil assigné devient
       // décisionnaire (honorer/annuler sans pénalité) — voir handleClientDisabled, routes/missions.js.
       // before.is_active check : ne déclenche qu'à la désactivation, jamais à la réactivation.
@@ -1608,6 +1614,8 @@ router.post('/admin/clients/:id/unblock', authenticate, requireRole('admin'), re
     `UPDATE users SET is_active=true, client_noshow_strikes=0, deactivation_context=NULL, suspended_reason=NULL WHERE id=$1 RETURNING is_active, client_noshow_strikes`,
     [req.params.id]
   );
+  // A-3 (cache authenticate) : la réactivation doit être vue dès la requête suivante du client.
+  invalidateAuthCache(req.params.id);
 
   await missionRoutes.notify(db, req.params.id, '✅ Compte réactivé',
     'Votre compte a été réactivé par un administrateur.',
@@ -2039,6 +2047,12 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
     if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
     throw e;
   }
+
+  // A-3 (cache authenticate) : applyClientStrike (utils/clientStrikes.js) a pu passer le client en
+  // is_active=false DANS la transaction ci-dessus — invalidation ICI, après le COMMIT, jamais dans
+  // clientStrikes.js (avant commit, une lecture concurrente re-cacherait l'ancien état actif).
+  // Inconditionnel dès qu'un strike a été appliqué : coût = une relecture, aucun risque.
+  if (strikeResult) invalidateAuthCache(mission.client_id);
 
   // Notifications APRÈS le commit — jamais dans la transaction (règle de périmètre :
   // pas d'appel réseau/lent pendant qu'une connexion DB est retenue).

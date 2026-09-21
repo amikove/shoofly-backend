@@ -1,7 +1,7 @@
 const router = require('express').Router();
 const bcrypt = require('@node-rs/bcrypt');
 const { getDb } = require('../db/schema');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, invalidateAuthCache } = require('../middleware/auth');
 const { requireSuperAdmin, ALL_PERMISSIONS, PROFILES } = require('../middleware/permissions');
 const asyncHandler = require('../middleware/asyncHandler');
 
@@ -69,6 +69,8 @@ router.put('/admins/:id', authenticate, requireSuperAdmin, asyncHandler(async (r
   );
 
   if (!admin) return res.status(404).json({ error: 'Admin introuvable' });
+  // A-3 (cache authenticate) : permissions / is_active viennent de changer (autocommit).
+  invalidateAuthCache(req.params.id);
   res.json({ admin });
 }));
 
@@ -76,6 +78,8 @@ router.put('/admins/:id', authenticate, requireSuperAdmin, asyncHandler(async (r
 router.delete('/admins/:id', authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
   const db = getDb();
   await db.query(`DELETE FROM users WHERE id=$1 AND role='admin' AND is_super_admin=false`, [req.params.id]);
+  // A-3 (cache authenticate) : un compte supprimé doit être refusé (401) dès la requête suivante.
+  invalidateAuthCache(req.params.id);
   res.json({ message: 'Admin supprimé' });
 }));
 
@@ -98,6 +102,7 @@ router.post('/test-reliability/:oeilId', authenticate, requireSuperAdmin, asyncH
   // Nettoyer l'historique existant
   await db.query('DELETE FROM reliability_events WHERE oeil_id=$1', [oeilId]);
   await db.query('UPDATE users SET is_suspended=false, suspended_at=NULL, suspended_reason=NULL WHERE id=$1', [oeilId]);
+  invalidateAuthCache(oeilId); // A-3 (cache authenticate) — is_suspended vient de changer
   const scenarios = [
     ...Array(10).fill().map((_, i) => ({ points: 10, reason: `Mission honorée parfaitement #${i + 1}`, grave: false })),
     ...Array(5).fill().map((_, i) => ({ points: 5, reason: `Mission avec souci mineur #${i + 1}`, grave: false })),

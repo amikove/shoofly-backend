@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const { getDb } = require('../db/schema');
-const { authenticate, requireRole } = require('../middleware/auth');
+const { authenticate, requireRole, invalidateAuthCache } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const { getSetting } = require('../utils/settings');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -450,6 +450,10 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
     // client (admin_toggle / noshow_strikes) — un blocage pour fraude avérée reste une mesure
     // punitive (cf. commentaire ci-dessous : aucun message "aucune pénalité").
     await db.query(`UPDATE users SET is_active=false, deactivation_context='fraud_block', suspended_reason=$2 WHERE id=$1`, [req.params.userId, suspensionReason]);
+    // A-3 (cache authenticate) : écriture commitée (autocommit) → invalide TOUT DE SUITE, avant les
+    // awaits suivants (notification, WhatsApp, réattribution) : la prochaine requête de l'utilisateur
+    // bloqué relit la base et reçoit le 403, même si elle arrive dans la milliseconde qui suit.
+    invalidateAuthCache(req.params.userId);
   // NOTE (chantier push, 2026-09-09) — ce site est DÉLIBÉRÉMENT laissé en db.query brut, PAS
   // migré vers notify(). notify() déclenche le canal push, et un abonnement push vit dans le
   // navigateur indépendamment de is_active/JWT : le router via notify() ici enverrait un push à

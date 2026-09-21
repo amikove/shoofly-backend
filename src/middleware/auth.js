@@ -100,15 +100,90 @@ function isDeactivatedAccountAllowed(req) {
   return false;
 }
 
+// ── Cache court de la relecture utilisateur (A-3, audit perf 2026-09-19) ─────────────────────────
+// Avant : authenticate relisait la ligne `users` à CHAQUE requête HTTP (~40-50 % des requêtes SQL
+// du projet). Cache mémoire par user.id avec DEUX niveaux de garantie, à ne pas confondre :
+//
+//  1. INVALIDATION EXPLICITE = la garantie. Tout site qui écrit une colonne lue par AUTH_USER_SQL
+//     (is_active, is_suspended, deactivation_context, role, city, quartier, is_super_admin,
+//     permissions, password_changed_at) ou supprime l'utilisateur appelle invalidateAuthCache(id)
+//     APRÈS LE COMMIT de son écriture : la requête suivante de cet utilisateur relit la base, donc
+//     un blocage / une suspension / un changement de mot de passe prend effet à la requête qui
+//     suit, pas au bout du TTL. RÈGLE : jamais AVANT le COMMIT (une lecture concurrente
+//     re-cacherait l'ancien état) — pour un site qui écrit dans une transaction, invalider
+//     juste après le withTransaction, jamais à l'intérieur.
+//  2. TTL COURT = simple filet de sécurité (AUTH_CACHE_TTL_MS, 5 s par défaut ; 0 = cache
+//     désactivé, comportement d'avant strictement identique). Ne couvre que ce qu'aucune
+//     invalidation ne peut voir : écriture SQL directe, script d'admin, site oublié, 2e instance
+//     (le cache est PAR PROCESSUS — render.yaml déclare une seule instance). 5 s et non 10 s :
+//     l'essentiel du gain vient de la coalescence des rafales de requêtes d'un chargement de page
+//     (mesuré : −29,6 % de SQL à 5 s vs −31,3 % à 10 s) ; le TTL est aussi la fenêtre de risque
+//     d'une écriture non tracée, autant qu'elle reste la plus courte possible.
+//
+// Deux protections contre une lecture qui CHEVAUCHE une invalidation (sans elles, l'ancien état
+// serait re-caché juste après le blocage et resservi pendant tout le TTL) :
+//  - authCacheEpoch, incrémenté à chaque invalidation : une lecture démarrée avant n'est cachée
+//    que si aucune invalidation n'a eu lieu depuis son départ.
+//  - authInflight (single-flight) : les requêtes simultanées d'un même utilisateur (un chargement
+//    de page en lance 5 à 8 en parallèle) partagent UNE lecture ; l'entrée est supprimée à
+//    l'invalidation pour qu'une requête arrivée APRÈS l'écriture ne rejoigne jamais une lecture
+//    partie AVANT.
+// Le TTL est ancré sur le DÉBUT de la lecture (pas sa fin) : il borne l'âge réel de l'état servi.
+// La revalidation Socket.IO (index.js) lit la base en direct et ne passe volontairement pas ici.
+const AUTH_USER_SQL = 'SELECT id, role, is_active, is_suspended, deactivation_context, city, quartier, is_super_admin, permissions, password_changed_at FROM users WHERE id=$1';
+const AUTH_CACHE_TTL_MS = (() => {
+  const raw = parseInt(process.env.AUTH_CACHE_TTL_MS, 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 5000;
+})();
+const AUTH_CACHE_MAX_ENTRIES = 5000; // borne mémoire (~600 o/entrée) ; éviction du plus ancien
+const authCache = new Map();    // user.id -> { row, expiresAt }
+const authInflight = new Map(); // user.id -> Promise<row|undefined> (lecture en cours, partagée)
+let authCacheEpoch = 0;
+
+// À appeler APRÈS le commit de toute écriture sur une colonne lue par AUTH_USER_SQL (ou suppression
+// de l'utilisateur) — voir la règle ci-dessus. Idempotent et peu coûteux : au moindre doute, invalider.
+function invalidateAuthCache(userId) {
+  authCacheEpoch++;
+  authCache.delete(userId);
+  authInflight.delete(userId);
+}
+
+async function loadAuthUser(userId) {
+  if (AUTH_CACHE_TTL_MS === 0) {
+    const { rows: [row] } = await getDb().query(AUTH_USER_SQL, [userId]);
+    return row;
+  }
+  const hit = authCache.get(userId);
+  if (hit) {
+    if (hit.expiresAt > performance.now()) return hit.row;
+    authCache.delete(userId);
+  }
+  const pending = authInflight.get(userId);
+  if (pending) return pending;
+
+  const startedAt = performance.now();
+  const startedAtEpoch = authCacheEpoch;
+  const load = getDb().query(AUTH_USER_SQL, [userId]).then(({ rows: [row] }) => {
+    // Pas de cache négatif (utilisateur introuvable) ; pas de cache non plus si une invalidation
+    // a eu lieu pendant la lecture (l'état lu peut être antérieur à l'écriture qui l'a provoquée).
+    if (row && startedAtEpoch === authCacheEpoch) {
+      if (authCache.size >= AUTH_CACHE_MAX_ENTRIES) authCache.delete(authCache.keys().next().value);
+      authCache.set(userId, { row, expiresAt: startedAt + AUTH_CACHE_TTL_MS });
+    }
+    return row;
+  }).finally(() => {
+    if (authInflight.get(userId) === load) authInflight.delete(userId);
+  });
+  authInflight.set(userId, load);
+  return load;
+}
+
 async function authenticate(req, res, next) {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Token manquant' });
   try {
     const payload = jwt.verify(header.slice(7), process.env.JWT_SECRET);
-    const { rows: [user] } = await getDb().query(
-      'SELECT id, role, is_active, is_suspended, deactivation_context, city, quartier, is_super_admin, permissions, password_changed_at FROM users WHERE id=$1',
-      [payload.id]
-    );
+    const user = await loadAuthUser(payload.id);
     if (!user) return res.status(401).json({ error: 'Compte introuvable ou suspendu' });
     if (user.password_changed_at && payload.iat * 1000 < new Date(user.password_changed_at).getTime()) {
       return res.status(401).json({ error: 'Session expirée suite à un changement de mot de passe, veuillez vous reconnecter.' });
@@ -119,7 +194,7 @@ async function authenticate(req, res, next) {
       city:           user.city,
       quartier:       user.quartier,
       is_super_admin: user.is_super_admin || false,
-      permissions:    Array.isArray(user.permissions) ? user.permissions : [],
+      permissions:    Array.isArray(user.permissions) ? [...user.permissions] : [], // copie : la ligne peut être partagée par le cache
       is_suspended:   user.is_suspended || false,
       is_active:      user.is_active,
       deactivation_context: user.deactivation_context || null,
@@ -148,4 +223,4 @@ function requireRole(...roles) {
   };
 }
 
-module.exports = { authenticate, requireRole, isSuspendedOeilAllowed, isDeactivatedAccountAllowed };
+module.exports = { authenticate, requireRole, isSuspendedOeilAllowed, isDeactivatedAccountAllowed, invalidateAuthCache };

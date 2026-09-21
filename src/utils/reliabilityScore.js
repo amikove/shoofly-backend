@@ -1,5 +1,8 @@
 const { getDb } = require('../db/schema');
 const { getSetting } = require('./settings');
+// invalidateAuthCache (A-3, cache authenticate) — middleware/auth.js ne require que jsonwebtoken et
+// db/schema : aucun cycle avec ce module.
+const { invalidateAuthCache } = require('../middleware/auth');
 // notify() — in-app + socket live + push (utils/notify.js). Pas d'emitToUser dans ce module
 // (util appelé hors requête) → null : in-app identique (no-live) ; le gain ici est le push.
 const { notify } = require('./notify');
@@ -140,6 +143,11 @@ async function checkAndUpdateSuspension(db, oeilId) {
       `UPDATE users SET is_suspended=true, suspended_at=NOW(), suspended_reason='Score de fiabilité inférieur à 50%' WHERE id=$1`,
       [oeilId]
     );
+    // A-3 (cache authenticate) : `db` est le pool pour tous les appelants actuels (logReliabilityEvent,
+    // reverseReliabilityEvent — routes et crons : tous passent getDb(), aucun depuis une transaction)
+    // → l'UPDATE ci-dessus est déjà commité. Si un appelant passait un jour un client en transaction,
+    // il devrait invalider lui-même après son COMMIT (règle décrite dans middleware/auth.js).
+    invalidateAuthCache(oeilId);
     // BE-4 constat 10 (2026-08-21) : ajoute la même réassurance d'accès que le message de
     // suspension manuelle (users.js) — depuis le constat 09 ci-dessous, les deux voies
     // retirent réellement les missions en cours, donc les deux méritent la même précision sur
@@ -208,6 +216,8 @@ async function reactivateWithCorrectiveEvent(db, oeilId, targetScore, adminId) {
 
   const score = await computeReliabilityScore(db, oeilId);
   await db.query(`UPDATE users SET reliability_score=$1, is_suspended=false, suspended_at=NULL, suspended_reason=NULL WHERE id=$2`, [score, oeilId]);
+  // A-3 (cache authenticate) : la réintégration doit être vue dès la requête suivante de l'Œil.
+  invalidateAuthCache(oeilId);
   return score;
 }
 
