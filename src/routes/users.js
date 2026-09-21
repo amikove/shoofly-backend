@@ -2628,8 +2628,10 @@ router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('a
       if (!profile) { const err = new Error('Œil introuvable'); err.code = 'NOT_FOUND'; throw err; }
 
       await walletService.debit(client, req.params.oeilId, 'oeil', amount, 'Virement bancaire');
+      // Colonnes listées (ID-1, 2026-09-21) : `SELECT *` renverrait aussi la nouvelle colonne
+      // idempotency_key (toujours NULL ici) dans la réponse JSON — payload gardé strictement identique.
       const { rows: [row] } = await client.query(
-        `SELECT * FROM wallet_transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,
+        `SELECT id, user_id, type, amount, reason, mission_id, created_at FROM wallet_transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,
         [req.params.oeilId]
       );
       transaction = row;

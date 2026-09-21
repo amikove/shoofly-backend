@@ -792,6 +792,28 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       END IF;
     END $$;
 
+    -- ID-1 (audit perf/concurrence 2026-09-19) — cle d'idempotence OPTIONNELLE sur le ledger.
+    -- NULL pour toutes les lignes existantes ET pour tous les appelants actuels de
+    -- walletService.credit()/debit() (aucun ne passe de cle) ; renseignee uniquement par un appelant
+    -- qui passe opts.idempotencyKey (voir services/walletService.js). Index UNIQUE PARTIEL (seulement
+    -- les lignes dont la cle n'est pas NULL) : les lignes existantes ne sont pas indexees, aucun
+    -- surcout pour elles. Colonne ajoutee dans un bloc DO garde plutot que par ALTER TABLE ... ADD
+    -- COLUMN IF NOT EXISTS : cet ALTER prend un verrou ACCESS EXCLUSIVE meme quand la colonne existe
+    -- deja, et initDb garde ses verrous jusqu'a la fin de sa transaction implicite unique (audit
+    -- 2026-09-19, initDb) — sur une table financiere lue par le cron de reconciliation, on evite de
+    -- le reprendre a chaque demarrage. Le CREATE UNIQUE INDEX IF NOT EXISTS, lui, ne prend qu'un verrou
+    -- SHARE deja pris sur cette table par les index idx_wallet_transactions_* plus bas.
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'wallet_transactions' AND column_name = 'idempotency_key'
+      ) THEN
+        ALTER TABLE wallet_transactions ADD COLUMN idempotency_key TEXT;
+      END IF;
+    END $$;
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_wallet_transactions_idempotency_key
+      ON wallet_transactions (idempotency_key) WHERE idempotency_key IS NOT NULL;
+
     -- C5 — withdrawals.amount > 0. POST /oeil/withdraw (routes/users.js) est le seul writer hors
     -- db/seed.js : garde (!amount || amount < 100) en amont + walletService.debit (montant > 0)
     -- dans la même transaction avant l'INSERT — un retrait <= 0 est déjà triplement impossible.
