@@ -4602,9 +4602,9 @@ router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), asyncHa
   // Les deux écritures (confirmation + éventuelle ouverture de la fenêtre de départage)
   // forment un seul événement logique — transaction pour éviter qu'un crash entre les deux
   // laisse une confirmation enregistrée sans jamais ouvrir la fenêtre qui la traite.
-  let confirmedAt, batchTiebreakEndsAt;
+  let confirmedAt, batchTiebreakEndsAt, alreadyConfirmed;
   try {
-    ({ confirmedAt, batchTiebreakEndsAt } = await walletService.withTransaction(db, async (client) => {
+    ({ confirmedAt, batchTiebreakEndsAt, alreadyConfirmed } = await walletService.withTransaction(db, async (client) => {
     // Verrou + re-vérification atomique : les `if` sur mission.status ci-dessus ne sont qu'un
     // snapshot. Autre versant de l'audit CHAOS F1 (checkTransferDeadlines gardé côté cron) : le
     // cron peut annuler la mission entre ce SELECT snapshot et les UPDATE ci-dessous — sans ce
@@ -4624,10 +4624,23 @@ router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), asyncHa
       err.code = 'MISSION_UNAVAILABLE';
       throw err;
     }
+    // PW-5 (durcissement, 2026-09-21) : garde `confirmed_at IS NULL`. Le pré-contrôle « déjà confirmé » plus
+    // haut est hors verrou : il ne voit pas un doublon SIMULTANÉ du même Œil (requête rejouée par la file
+    // hors-ligne alors que la 1re est encore en vol) — sans cette garde, le 2e UPDATE réécrivait confirmed_at
+    // (décalage de quelques ms, mesuré sous 8 doublons parallèles). Aucune ligne retournée = un doublon a déjà
+    // confirmé : on relit SA valeur d'origine (jamais réécrite) et on répond comme au rejeu séquentiel.
     const { rows: [ci] } = await client.query(
-      `UPDATE mission_interests SET confirmed_at=NOW() WHERE mission_id=$1 AND oeil_id=$2 RETURNING confirmed_at`,
+      `UPDATE mission_interests SET confirmed_at=NOW() WHERE mission_id=$1 AND oeil_id=$2 AND confirmed_at IS NULL RETURNING confirmed_at`,
       [mission.id, req.user.id]
     );
+    let confirmedAtValue = ci && ci.confirmed_at;
+    if (!ci) {
+      const { rows: [existing] } = await client.query(
+        `SELECT confirmed_at FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`,
+        [mission.id, req.user.id]
+      );
+      confirmedAtValue = existing.confirmed_at;
+    }
     const { rows: [tb] } = await client.query(
       `UPDATE missions SET batch_tiebreak_ends_at = NOW() + INTERVAL '1 minute' * $2::numeric
        WHERE id=$1 AND batch_tiebreak_ends_at IS NULL
@@ -4639,16 +4652,18 @@ router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), asyncHa
       const { rows: [m2] } = await client.query('SELECT batch_tiebreak_ends_at FROM missions WHERE id=$1', [mission.id]);
       batchTiebreakEndsAt = m2.batch_tiebreak_ends_at;
     }
-    return { confirmedAt: ci.confirmed_at, batchTiebreakEndsAt };
+    return { confirmedAt: confirmedAtValue, batchTiebreakEndsAt, alreadyConfirmed: !ci };
     }));
   } catch (e) {
     if (e.code === 'MISSION_UNAVAILABLE') return res.status(409).json({ error: e.message });
     throw e;
   }
 
-  if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, batch_tiebreak_ends_at: batchTiebreakEndsAt });
+  // Doublon simultané : la requête gagnante a déjà notifié l'admin — même comportement que le rejeu
+  // séquentiel (pré-contrôle « déjà confirmé »), qui ne notifie pas non plus.
+  if (io && !alreadyConfirmed) io.to('room:admin').emit('mission_updated', { id: mission.id, batch_tiebreak_ends_at: batchTiebreakEndsAt });
 
-  res.json({ ok: true, confirmed_at: confirmedAt, batch_tiebreak_ends_at: batchTiebreakEndsAt });
+  res.json({ ok: true, ...(alreadyConfirmed ? { already_confirmed: true } : {}), confirmed_at: confirmedAt, batch_tiebreak_ends_at: batchTiebreakEndsAt });
 }));
 
 // ── POST /:id/candidate-decline ── Le candidat sollicité refuse explicitement ──
