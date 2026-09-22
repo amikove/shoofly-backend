@@ -1644,6 +1644,53 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     INSERT INTO subcategory_min_prices (subcategory, category, min_price) VALUES
       ${SUBCATEGORY_MIN_PRICES_SEED.map(r => `('${r.subcategory.replace(/'/g, "''")}', '${r.category}', ${r.min_price})`).join(',\n      ')}
     ON CONFLICT (subcategory) DO NOTHING;
+
+    -- ═══ Index de performance — audit Performance/Concurrence 2026-09-19/21, §6.2 (I-1 à I-8) ═══
+    -- Source : RAPPORT_AUDIT_PERFORMANCE_CONCURRENCE_2026-09-19.md, section 6.2 (numérotation
+    -- PROPRE à ce rapport — sans rapport avec les I1-I9 de l'audit BDD 09-06 déjà posés plus haut
+    -- dans ce fichier ; les deux jeux ont été comparés nom par nom, 0 recouvrement). I-9 (pg_trgm,
+    -- recherche admin S-2) est traité séparément dans le chantier Point 5 (PO-1/T-7), avec la
+    -- réécriture de requête qu'il nécessite — voir plus bas dans ce même fichier.
+    -- AJOUT PUREMENT ADDITIF pour I-1 à I-6 et I-8 : CREATE INDEX IF NOT EXISTS idempotent, aucune
+    -- requête ne change de sémantique, seul le plan change. Pas de CONCURRENTLY — même convention
+    -- que tout ce fichier (bloc implicite de initDb interdit CONCURRENTLY ; sur une table déjà
+    -- volumineuse en production, un CREATE INDEX CONCURRENTLY manuel hors-bande rend la ligne
+    -- IF NOT EXISTS no-op au démarrage suivant).
+    -- I-7 fait exception : c'est une contrainte UNIQUE (pas seulement un index de vitesse), voir
+    -- son commentaire dédié ci-dessous.
+
+    -- I-1 : cron d'auto-validation horaire (S-9) — WHERE status='completed' AND validated_at IS NULL.
+    CREATE INDEX IF NOT EXISTS idx_missions_unvalidated ON missions (completed_by_oeil_at) WHERE status='completed' AND validated_at IS NULL;
+    -- I-2 : GET /users/admin/flagged-messages, polling 60s par admin (S-6) — WHERE is_flagged=true.
+    CREATE INDEX IF NOT EXISTS idx_mission_messages_flagged ON mission_messages (created_at DESC) WHERE is_flagged=true;
+    -- I-3 : contrôle d'unicité téléphone à l'inscription, balayage complet aujourd'hui (S-10/C-9).
+    CREATE INDEX IF NOT EXISTS idx_users_phone ON users (phone) WHERE phone IS NOT NULL;
+    -- I-4 : funnel/KPI admin, GET /users/admin/all (tri par défaut) — WHERE/ORDER BY (role, created_at).
+    CREATE INDEX IF NOT EXISTS idx_users_role_created_at ON users (role, created_at);
+    -- I-5 : GET /users/notifications (ORDER BY created_at DESC LIMIT 50) + compteur non-lus.
+    -- Ajoutés EN PLUS de idx_notifs_user (user_id, is_read) existant, jamais en remplacement —
+    -- aucune suppression d'index dans ce chantier (décision explicite du 2026-09-22).
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_created_at ON notifications (user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications (user_id) WHERE is_read=false;
+    -- I-6 : fil de chat (inbox LATERAL « dernier message », GET /:id, compteur non-lus). Ajouté EN
+    -- PLUS de idx_messages_mission (mission_id) existant, jamais en remplacement (même raison que I-5).
+    CREATE INDEX IF NOT EXISTS idx_mission_messages_mission_created_at ON mission_messages (mission_id, created_at DESC);
+    -- I-7 : C-2 (audit) — une demande de modification 'pending' déjà en attente n'empêchait sa
+    -- duplication QUE par un SELECT applicatif fait juste avant l'INSERT (missions.js, PUT
+    -- /:id/edit-request) : deux requêtes concurrentes peuvent toutes les deux passer ce contrôle
+    -- avant que l'une des deux n'écrive, créant 2 lignes 'pending' pour la même mission (double
+    -- consommation de la fenêtre d'approbation de l'Œil). Contrainte UNIQUE PARTIELLE ajoutée
+    -- comme filet de dernier recours ; le site d'appel a été adapté (ON CONFLICT DO NOTHING) pour
+    -- que ce filet se traduise par le MÊME message 409 déjà existant, jamais par une erreur 500 —
+    -- voir routes/missions.js, PUT /:id/edit-request. Comportement séquentiel strictement inchangé.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_mission_edit_requests_one_pending ON mission_edit_requests (mission_id) WHERE status='pending';
+    -- I-8 (optionnel dans le rapport — inclus ici sur demande explicite « chaque index I-1 à I-9 »).
+    -- Index posé mais INERTE tant que le KPI qu'il viserait (users.js, "trop d'annulations", qui
+    -- filtre aujourd'hui sur missions.updated_at) n'est pas réécrit pour filtrer sur cancelled_at —
+    -- cette réécriture n'est PAS faite ici (le rapport la réserve explicitement à un chantier
+    -- dédié, "seulement si ce KPI devient lent") : aucun changement de comportement, l'index n'a
+    -- simplement aucun lecteur pour l'instant.
+    CREATE INDEX IF NOT EXISTS idx_missions_cancelled_at ON missions (cancelled_at) WHERE status='cancelled';
   `);
   console.log('✅ PostgreSQL schema ready');
 }

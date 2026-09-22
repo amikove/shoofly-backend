@@ -1344,9 +1344,22 @@ router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req,
 
     const { rows: [editRequest] } = await db.query(
       `INSERT INTO mission_edit_requests (mission_id, requested_by, proposed_changes, status, expires_at)
-       VALUES ($1,$2,$3,'pending',$4) RETURNING *`,
+       VALUES ($1,$2,$3,'pending',$4)
+       ON CONFLICT (mission_id) WHERE status='pending' DO NOTHING
+       RETURNING *`,
       [mission.id, req.user.id, JSON.stringify(changes), expiresAt]
     );
+    // Filet de dernier recours (I-7, audit perf/concurrence 2026-09-19/21, correctif C-2) : le
+    // SELECT de pré-contrôle ci-dessus (pendingRequest) n'est pas atomique avec cet INSERT — deux
+    // requêtes concurrentes peuvent toutes les deux le franchir avant que l'une des deux n'écrive.
+    // La contrainte UNIQUE PARTIELLE posée en base (schema.js, idx_mission_edit_requests_one_
+    // pending) fait perdre la course à la seconde SANS lever d'erreur SQL brute (ON CONFLICT DO
+    // NOTHING) : elle reçoit alors le MÊME message 409 que le cas séquentiel ci-dessus, jamais un
+    // 500 générique. Cas séquentiel (aucune course) : totalement inchangé, ce garde-fou ne se
+    // déclenche jamais (le SELECT l'a déjà intercepté avant).
+    if (!editRequest) {
+      return res.status(409).json({ error: "Une demande de modification est déjà en attente de réponse de l'Œil. Merci d'attendre sa résolution avant d'en soumettre une nouvelle." });
+    }
 
     const delayLabel = delayMinutes >= 60 ? `${delayMinutes / 60}h` : `${delayMinutes}min`;
 
