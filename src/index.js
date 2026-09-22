@@ -52,9 +52,9 @@ const { sendWhatsAppTemplate } = require('./services/wasel');
 const waselTemplates = require('./config/waselTemplates');
 
 const cron = require('node-cron');
-const xss = require('xss-clean');
 const hpp = require('hpp');
-const mongoSanitize = require('express-mongo-sanitize');
+// xss-clean et express-mongo-sanitize retirés — voir le commentaire détaillé sur leur ancien
+// point de montage plus bas (SP-1/CP-2, audit perf/concurrence 2026-09-19/21).
 const authRoutes    = require('./routes/auth');
 const fraudRoutes      = require('./routes/antiFraud');
 const superAdminRoutes = require('./routes/superAdmin');
@@ -212,26 +212,52 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 // Callback PayZone (webhook serveur-à-serveur) : la vérification de signature HMAC (voir
 // services/payzone.js) porte sur le corps BRUT exact reçu sur le fil — capturé ici, scopé à
 // cette route précise, AVANT tout body-parser JSON global (qui consommerait/re-sérialiserait
-// le flux, rendant la signature invérifiable). Les 4 middlewares globaux juste en dessous
-// (json/xss/hpp/mongoSanitize) sont donc explicitement sautés pour cette route : ils
-// liraient un flux déjà consommé et écraseraient le Buffer brut par un objet re-parsé.
+// le flux, rendant la signature invérifiable). Les middlewares globaux juste en dessous
+// (json, hpp — xss-clean et mongoSanitize retirés, voir SP-1 plus bas) sont donc explicitement
+// sautés pour cette route : ils liraient un flux déjà consommé et écraseraient le Buffer brut
+// par un objet re-parsé.
 const PAYZONE_CALLBACK_PATH = '/api/payments/payzone/callback';
 app.use(PAYZONE_CALLBACK_PATH, express.raw({ type: '*/*', limit: '1mb' }));
 const skipForPayzoneCallback = (middleware) => (req, res, next) => (
   req.path === PAYZONE_CALLBACK_PATH ? next() : middleware(req, res, next)
 );
-app.use(skipForPayzoneCallback(express.json({ limit: '5mb' })));
-// Callback CashPlus (routes/payments.js, POST /cashplus/callback) : contrairement à PayZone,
-// son HMAC ne porte que sur request_id+secret_key (pas sur le corps entier, voir services/
-// cashplus.js) — pas besoin d'express.raw() dédié. L'encodage exact utilisé par CashPlus pour
-// CE callback entrant n'est pas garanti par la doc résumée fournie (form-urlencoded vs JSON,
-// voir services/cashplus.js) : express.urlencoded() est ajouté ici en complément de
-// express.json() déjà présent, pour couvrir les deux cas sans deviner lequel CashPlus utilise
-// réellement (à confirmer au premier callback réel reçu en sandbox).
-app.use(skipForPayzoneCallback(express.urlencoded({ extended: true, limit: '5mb' })));
-app.use(skipForPayzoneCallback(xss()));
+// Callback CashPlus (routes/payments.js, POST /cashplus/callback) : son HMAC ne porte que sur
+// request_id+secret_key (pas sur le corps entier, voir services/cashplus.js) — pas besoin
+// d'express.raw() dédié comme PayZone. SP-1 (audit perf/concurrence 2026-09-19/21) :
+// express.urlencoded() n'a plus lieu d'être monté GLOBALEMENT — c'était son SEUL appelant réel
+// dans tout le projet (grep exhaustif) — donc scopé ici, sur cette seule route, avec une limite
+// resserrée à sa taille réelle (10 Ko, très au-dessus d'un webhook de paiement). L'encodage
+// exact utilisé par CashPlus pour ce callback n'est pas garanti par la doc résumée fournie
+// (form-urlencoded vs JSON, voir services/cashplus.js) : express.json() (ci-dessous) reste
+// monté globalement en complément, donc les deux cas restent couverts sans deviner lequel
+// CashPlus utilise réellement — comportement de PARSING inchangé pour cette route précise, seul
+// son périmètre (plus seulement cette route, avant) et la limite du JSON global changent.
+app.use('/api/payments/cashplus/callback', express.urlencoded({ extended: true, limit: '10kb' }));
+// SP-1 — limite ramenée de 5 Mo à 256 Ko : mesuré (scratchpad de session, colonnes réelles de la
+// base) qu'aucun payload JSON légitime du projet n'approche cet ordre de grandeur (le plus gros
+// trouvé, un rapport de mission/une demande de modification, tient en quelques Ko même
+// entièrement rempli) ; à l'inverse, un corps de plusieurs Mo à très nombreuses clés est
+// précisément ce qui permettait à un tiers NON AUTHENTIFIÉ de geler la boucle d'événements
+// (~0,8 s mesuré dans le rapport, xss-clean+mongo-sanitize compris) sur cette chaîne de
+// middlewares, avant même le routage/l'authentification. Les photos/vidéos ne transitent jamais
+// par ici (multipart, routes/media.js, limite dédiée séparée) : aucun rapport avec ce plafond.
+app.use(skipForPayzoneCallback(express.json({ limit: '256kb' })));
+// SP-1/CP-2 — xss-clean et express-mongo-sanitize RETIRÉS (jamais un simple ajustement de
+// limite) : (1) xss-clean est déprécié par son propre mainteneur (« Package no longer
+// supported », confirmé npm) ET altère des données légitimes en stockant une version
+// réencodée du texte (ex. "<b>" → "&lt;b>") — ce projet ne rend jamais de HTML utilisateur brut
+// (React échappe par défaut ; seul CGV.jsx utilise dangerouslySetInnerHTML, sur du contenu
+// légal statique, jamais une entrée utilisateur — vérifié par grep) ; (2) express-mongo-
+// sanitize protège contre une injection d'opérateur MongoDB ($gt, $where...) — ce projet n'a
+// AUCUNE dépendance Mongo, 100% PostgreSQL avec des requêtes 100% paramétrées (revue sécurité
+// 06/09) : cette protection est sans objet ici. Les deux faisaient une passe complète sur
+// CHAQUE clé du corps AVANT authentification (stringify→parse pour xss-clean, parcours
+// récursif pour mongo-sanitize) — mesuré comme le poste de coût dominant de SP-1 (0,44 s +
+// 0,16 s sur les 0,8 s totaux d'un corps à 250 000 clés). Les retirer élimine cette classe de
+// coût entièrement, la limite de 256 Ko ci-dessus bornant le reste (parse JSON pur, quelques ms
+// même au pire). hpp() conservé (protection différente, non déprécié, coût mesuré négligeable
+// ~1 ms, non mis en cause par ce constat).
 app.use(skipForPayzoneCallback(hpp()));
-app.use(skipForPayzoneCallback(mongoSanitize()));
 app.use('/uploads', express.static(path.resolve(process.env.UPLOAD_DIR || './uploads')));
 
 // ── Routes ────────────────────────────────────────────────
