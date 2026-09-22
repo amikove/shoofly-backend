@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const { v4: uuidv4 } = require('uuid');
+const Sentry = require('@sentry/node');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -57,41 +58,55 @@ router.post('/', authenticate, requireRole('client', 'oeil'), asyncHandler(async
   }
 
   const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
-  if (isUrgent) {
-    for (const admin of admins) {
-      await notify(
-        db, admin.id,
-        '🆘 TICKET URGENT — action immédiate requise',
-        `${req.user.role === 'client' ? 'Client' : 'Œil'} a ouvert un ticket urgent : "${subcategory || category}" (${reference})`,
-        'error', mission ? mission.id : null, emitToUser, 'admin_urgent_ticket',
-        'urgentTicketAdminTitle', 'urgentTicketAdminBody',
-        { reporterRole: req.user.role === 'client' ? 'Client' : 'Œil', subcategory: subcategory || category, reference, ticketId: ticket.id }
-      );
-      if (admin.phone) {
-        await sendWhatsAppTemplate(waselTemplates.urgent_ticket_admin.template_name, admin.phone, [reference, subcategory || category]);
+
+  // X-1/E-1 (audit perf/concurrence 2026-09-19/21, décision validée) — le ticket (et son 1er
+  // message) sont DÉJÀ enregistrés en base à ce stade : la réponse part maintenant, avant la
+  // notification des admins, exactement le même patron déjà validé pour notifyNewMission
+  // (routes/missions.js POST /missions). Avant ce correctif, un ticket urgent avec N admins
+  // actifs faisait attendre le créateur du ticket jusqu'à N × (notify + jusqu'à 10s WhatsApp),
+  // séquentiellement — bien au-delà du timeout client de 15s dès 2 admins.
+  res.status(201).json({ ticket });
+
+  (async () => {
+    if (isUrgent) {
+      for (const admin of admins) {
+        await notify(
+          db, admin.id,
+          '🆘 TICKET URGENT — action immédiate requise',
+          `${req.user.role === 'client' ? 'Client' : 'Œil'} a ouvert un ticket urgent : "${subcategory || category}" (${reference})`,
+          'error', mission ? mission.id : null, emitToUser, 'admin_urgent_ticket',
+          'urgentTicketAdminTitle', 'urgentTicketAdminBody',
+          { reporterRole: req.user.role === 'client' ? 'Client' : 'Œil', subcategory: subcategory || category, reference, ticketId: ticket.id }
+        );
+        if (admin.phone) {
+          await sendWhatsAppTemplate(waselTemplates.urgent_ticket_admin.template_name, admin.phone, [reference, subcategory || category]);
+        }
+      }
+      const io = req.app.get('io');
+      if (io) io.to('room:admin').emit('urgent_ticket_created', { ticketId: ticket.id, reference, subcategory });
+    } else {
+      // Chantier notifications (2026-09-14), Partie C/G5 — jusqu'ici aucun canal (seul filet : GET
+      // /tickets/admin/all consulté manuellement). notify() simple, mêmes admins que la branche
+      // urgente ci-dessus (aucune permission dédiée aux tickets dans middleware/permissions.js —
+      // les routes admin de ce fichier ne sont elles-mêmes gardées que par requireRole('admin')),
+      // sans WhatsApp (réservé aux tickets urgents).
+      for (const admin of admins) {
+        await notify(
+          db, admin.id,
+          '🎫 Nouveau ticket',
+          `${req.user.role === 'client' ? 'Client' : 'Œil'} a ouvert un ticket : "${subcategory || category}" (${reference})`,
+          'info', mission ? mission.id : null, emitToUser, 'admin_new_ticket',
+          'newTicketAdminTitle', 'newTicketAdminBody',
+          { reporterRole: req.user.role === 'client' ? 'Client' : 'Œil', subcategory: subcategory || category, reference, ticketId: ticket.id }
+        );
       }
     }
-    const io = req.app.get('io');
-    if (io) io.to('room:admin').emit('urgent_ticket_created', { ticketId: ticket.id, reference, subcategory });
-  } else {
-    // Chantier notifications (2026-09-14), Partie C/G5 — jusqu'ici aucun canal (seul filet : GET
-    // /tickets/admin/all consulté manuellement). notify() simple, mêmes admins que la branche
-    // urgente ci-dessus (aucune permission dédiée aux tickets dans middleware/permissions.js —
-    // les routes admin de ce fichier ne sont elles-mêmes gardées que par requireRole('admin')),
-    // sans WhatsApp (réservé aux tickets urgents).
-    for (const admin of admins) {
-      await notify(
-        db, admin.id,
-        '🎫 Nouveau ticket',
-        `${req.user.role === 'client' ? 'Client' : 'Œil'} a ouvert un ticket : "${subcategory || category}" (${reference})`,
-        'info', mission ? mission.id : null, emitToUser, 'admin_new_ticket',
-        'newTicketAdminTitle', 'newTicketAdminBody',
-        { reporterRole: req.user.role === 'client' ? 'Client' : 'Œil', subcategory: subcategory || category, reference, ticketId: ticket.id }
-      );
-    }
-  }
-
-  res.status(201).json({ ticket });
+  })().catch((e) => {
+    // Filet de dernier recours (notify()/sendWhatsAppTemplate ne lèvent normalement jamais) : la
+    // réponse HTTP est déjà partie ci-dessus, jamais d'unhandledRejection silencieux.
+    console.error(`❌ Notification admins ticket ${ticket.id} (fond) :`, e.message);
+    Sentry.captureException(e, { level: 'error', tags: { area: 'ticket_admin_notify_background' }, extra: { ticketId: ticket.id, isUrgent } });
+  });
 }));
 
 // ── GET /tickets/mine — liste des tickets de l'utilisateur connecté ──

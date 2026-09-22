@@ -2354,11 +2354,26 @@ router.post('/:id/status', authenticate, [
     await notify(db, mission.oeil_id, 'Mission terminée', `"${mission.title}" marquée comme terminée. Paiement en attente de validation.`, 'mission', mission.id, emitToUser, null, 'missionCompletedOeilTitle', 'missionCompletedOeilBody', {missionTitle: mission.title});
 
     // WhatsApp sur le numéro personnel du client — {{1}} nom de l'Œil, {{2}} titre de la mission.
+    // X-1/E-1 (audit perf/concurrence 2026-09-19/21, décision validée) — l'Œil qui clique
+    // « Terminer » attendait jusqu'ici cet appel Wasel (≤ 10 s) avant sa réponse, alors que la
+    // mission est DÉJÀ enregistrée 'completed' en base à ce stade (transitionMission, tout en
+    // haut de cette route). Même patron déjà validé pour notifyNewMission (POST /missions) :
+    // l'appel part en tâche de fond, sans jamais faire attendre l'action déjà actée ni jamais
+    // faire échouer la réponse déjà en cours de construction. sendWhatsAppTemplate ne lève de
+    // toute façon jamais (services/wasel.js) et journalise déjà tout échec réel dans
+    // whatsapp_send_failures (retenté par jobs/whatsappRetry.js) — le .catch() ici est un filet
+    // supplémentaire contre un bug futur dans cette fonction, jamais silencieux (log + Sentry).
+    // Contenu du message strictement inchangé (mêmes variables, même template) : seul le moment
+    // où il part change.
     const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
     if (clientContact?.phone) {
       const { rows: [oeilContact] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [mission.oeil_id]);
       const oeilName = oeilContact ? `${oeilContact.first_name} ${oeilContact.last_name}`.trim() : 'Œil';
-      await sendWhatsAppTemplate(waselTemplates.mission_completed_client.template_name, clientContact.phone, [oeilName, mission.title]);
+      sendWhatsAppTemplate(waselTemplates.mission_completed_client.template_name, clientContact.phone, [oeilName, mission.title])
+        .catch((e) => {
+          console.error(`❌ WhatsApp completed (fond, mission ${mission.id}) :`, e.message);
+          Sentry.captureException(e, { level: 'error', tags: { area: 'whatsapp_completed_background' }, extra: { missionId: mission.id } });
+        });
     } else {
       console.warn(`[wasel] Client ${mission.client_id} sans téléphone renseigné — envoi ignoré (completed)`);
     }
