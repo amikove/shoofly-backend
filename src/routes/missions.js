@@ -1010,18 +1010,51 @@ const missionCreateLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Rate limit dédié sur la candidature Œil (audit santé technique 2026-09-18, §2.6) — seul le
-// plafond global (300/15min) protégeait POST /:id/interest jusqu'ici. Plafond volontairement
-// plus large que missionCreateLimiter ci-dessus : candidater est une action de consultation/
-// parcours (un Œil actif peut légitimement candidater à plusieurs dizaines de missions dans son
-// heure de pointe), pas une action ponctuelle comme créer une mission ou se connecter — 30/15min
-// reste très au-dessus d'un usage légitime intensif tout en bornant un abus qui, sans ce
-// limiteur, pourrait aussi forcer artificiellement le seuil WhatsApp client
-// (candidature_whatsapp_seuil_count) sur de nombreuses missions à la fois.
+// ── A-1 (audit perf/concurrence 2026-09-19/21) — limiteurs par COMPTE, pas par IP ────────────
+// Ces 3 actions sont authentifiées, à fort trafic légitime et souvent À ÉCHÉANCE (rater une
+// confirmation de présence/candidature a une vraie conséquence métier : remplacement, perte de
+// mission). Les compter contre le plafond GLOBAL par IP (index.js, 300/15min) pénalisait
+// plusieurs comptes légitimes partageant une même IP — CGNAT mobile marocain très répandu,
+// Wi-Fi partagé — jusqu'à faire échouer en 429 précisément l'action à échéance d'un compte qui
+// n'a lui-même rien fait d'anormal. Ces 3 routes sont désormais EXEMPTÉES du plafond global
+// (voir index.js, skip du limiteur global) et protégées ICI à la place, par compte — la
+// protection ne disparaît pas, elle change seulement de clé. Montés APRÈS authenticate sur
+// chaque route (req.user doit être posé pour que keyGenerator le lise) ; repli sur req.ip
+// uniquement défensif, authenticate ayant déjà renvoyé 401 avant ce point sinon.
+function byUserId(req) { return req.user?.id ?? req.ip; }
+
+// Candidature Œil (audit santé technique 2026-09-18, §2.6, seuil 30/15min inchangé — seule la
+// clé passe d'IP à user.id ici). Plafond volontairement plus large que missionCreateLimiter :
+// candidater est une action de consultation/parcours (un Œil actif peut légitimement candidater
+// à plusieurs dizaines de missions dans son heure de pointe), pas une action ponctuelle comme
+// créer une mission ou se connecter — 30/15min reste très au-dessus d'un usage légitime intensif
+// tout en bornant un abus qui, sans ce limiteur, pourrait aussi forcer artificiellement le seuil
+// WhatsApp client (candidature_whatsapp_seuil_count) sur de nombreuses missions à la fois.
 const interestLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
-  message: { error: 'Trop de candidatures depuis cette adresse. Réessayez dans 15 minutes.' },
+  keyGenerator: byUserId,
+  message: { error: 'Trop de candidatures depuis ce compte. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Confirmer sa présence / confirmer sa candidature dans une cascade — actions rares par compte
+// (quelques fois par jour au plus, liées à des missions réellement assignées), seuil large,
+// simple filet contre un compte compromis plutôt qu'une borne d'usage normal.
+const confirmPresenceLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyGenerator: byUserId,
+  message: { error: 'Trop de tentatives depuis ce compte. Réessayez dans quelques minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const candidateConfirmLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyGenerator: byUserId,
+  message: { error: 'Trop de tentatives depuis ce compte. Réessayez dans quelques minutes.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -2692,7 +2725,7 @@ router.post('/:id/rate-client', authenticate, requireRole('oeil'), [
 
 // ── POST /:id/interest ── Œil exprime son intérêt ─────────
 
-router.post('/:id/interest', interestLimiter, authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+router.post('/:id/interest', authenticate, requireRole('oeil'), interestLimiter, asyncHandler(async (req, res) => {
     const db = getDb();
     const { message } = req.body;
     // La suspension est vérifiée en amont par le middleware authenticate ; le cooldown
@@ -3465,7 +3498,7 @@ router.get('/assistance-requests/commission-pending', authenticate, requireRole(
 // (checkPresenceConfirmationDeadlines a retiré l'Œil, oeil_id a changé ou est redevenu NULL),
 // cette vérification rejette naturellement toute confirmation tardive de l'Œil d'origine —
 // voir le rapport de session pour la nuance sur ce cas (point f de la spec).
-router.post('/:id/confirm-presence', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+router.post('/:id/confirm-presence', authenticate, requireRole('oeil'), confirmPresenceLimiter, asyncHandler(async (req, res) => {
   const db = getDb();
   const io = req.app.get('io');
 
@@ -4583,7 +4616,7 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandl
 // confirmations suivantes). La résolution (mieux classé parmi les confirmés → hireOeilCore)
 // est tranchée par le cron dédié (index.js), pas ici — voir spec réattribution par lot,
 // points 3/4/5.
-router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+router.post('/:id/candidate-confirm', authenticate, requireRole('oeil'), candidateConfirmLimiter, asyncHandler(async (req, res) => {
   const db = getDb();
   const io = req.app.get('io');
 

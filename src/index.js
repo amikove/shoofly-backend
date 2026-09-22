@@ -124,10 +124,21 @@ app.use((req, res, next) => {
 app.set('trust proxy', 1);
 
 // Rate limit global
+// A-1 (audit perf/concurrence 2026-09-19/21) — confirm-presence / candidate-confirm / interest
+// (candidature) sont exemptées ici : ce sont des actions authentifiées, à fort trafic légitime
+// et souvent à échéance, désormais protégées par un limiteur PAR COMPTE dédié (routes/
+// missions.js) plutôt que par ce plafond par IP — qui pénalisait plusieurs comptes légitimes
+// partageant une même IP (CGNAT mobile marocain très répandu, Wi-Fi partagé) jusqu'à faire
+// échouer en 429 précisément l'action à échéance d'un compte qui n'a lui-même rien fait
+// d'anormal. La protection ne disparaît pas, elle change de clé pour ces 3 routes précises —
+// toute autre route (dont /auth/login, /auth/register : leurs limiteurs dédiés par IP,
+// ci-dessous, restent inchangés et s'appliquent en plus de celui-ci) continue de compter
+// normalement contre ce plafond global.
+const USER_KEYED_LIMITER_PATHS = /^\/api\/missions\/[^/]+\/(confirm-presence|candidate-confirm|interest)$/;
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
-  skip: (req) => req.path === '/health',
+  skip: (req) => req.path === '/health' || (req.method === 'POST' && USER_KEYED_LIMITER_PATHS.test(req.path)),
   message: { error: 'Trop de requêtes, réessayez dans 15 minutes.' },
   standardHeaders: true,
   legacyHeaders: false,
