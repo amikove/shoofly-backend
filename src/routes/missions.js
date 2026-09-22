@@ -391,6 +391,43 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
     promo_code, discount, replacement_preference, status, payment_method,
   } = insertData;
 
+  // C-3 (audit perf/concurrence 2026-09-19/21) — un code promo GRATUIT (Shoofly paie l'Œil,
+  // platform_amount) pouvait être consommé plusieurs fois par le même client via 2 créations de
+  // mission simultanées (titres différents ⇒ empreintes mission_create_locks différentes : ce
+  // verrou-là ne protège que des requêtes IDENTIQUES) — prepareMissionInsert (plus haut) ne fait
+  // qu'un instantané lu-puis-écrit, non atomique, de used_count/max_uses_per_user. Verrou de
+  // ligne pris ICI, EN PREMIER, avant toute écriture : insertMissionRecord tourne désormais
+  // TOUJOURS dans une transaction (voir les deux appelants — POST /missions et le callback
+  // PayZone, tous deux passent maintenant un client withTransaction), donc ce FOR UPDATE tient
+  // jusqu'au COMMIT/ROLLBACK de CETTE mission et sérialise toute autre création qui consommerait
+  // LE MÊME code (même client ou non) pendant ce court intervalle — un code promo n'est jamais un
+  // chemin à fort débit, ce coût est négligeable. Revalidation SOUS VERROU (le contrôle de
+  // prepareMissionInsert a lu un instantané potentiellement déjà périmé) : si le code n'est plus
+  // valide, on ABANDONNE (throw → ROLLBACK de toute la mission, y compris son INSERT déjà fait
+  // plus bas) — jamais de mission gratuite créée sur un code en réalité déjà épuisé.
+  let lockedPromo = null;
+  if (promo_code) {
+    const { rows: [p] } = await db.query(
+      `SELECT * FROM promo_codes WHERE UPPER(code)=UPPER($1) FOR UPDATE`, [promo_code]
+    );
+    lockedPromo = p || null;
+    if (freePromo && lockedPromo) {
+      const now = new Date();
+      const stillValid = lockedPromo.is_active && lockedPromo.type === 'free'
+        && !(lockedPromo.expires_at && new Date(lockedPromo.expires_at) < now)
+        && !(lockedPromo.max_uses && lockedPromo.used_count >= lockedPromo.max_uses);
+      if (!stillValid) {
+        throw Object.assign(new Error('PROMO_NO_LONGER_VALID'), { code: 'PROMO_NO_LONGER_VALID', userMessage: 'Code promo invalide ou épuisé' });
+      }
+      const { rows: [usage] } = await db.query(
+        `SELECT COUNT(*)::int AS n FROM promo_uses WHERE promo_id=$1 AND user_id=$2`, [lockedPromo.id, clientId]
+      );
+      if (usage.n >= lockedPromo.max_uses_per_user) {
+        throw Object.assign(new Error('PROMO_ALREADY_USED'), { code: 'PROMO_ALREADY_USED', userMessage: 'Vous avez déjà utilisé ce code' });
+      }
+    }
+  }
+
   const id = uuidv4();
   const { rows: [mission] } = await db.query(`
     INSERT INTO missions (
@@ -420,18 +457,33 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
 
   await logStatus(db, mission.id, 'pending', clientId, 'Mission créée');
 
-  if (promo_code) {
-    const { rows: [promo] } = await db.query(
-      `SELECT id FROM promo_codes WHERE UPPER(code)=UPPER($1)`, [promo_code]
-    );
-    if (promo) {
+  if (promo_code && lockedPromo) {
+    if (freePromo) {
+      // Code gratuit : déjà revalidé sous verrou ci-dessus — consommation inconditionnelle,
+      // symétrique de l'ancien code (comportement séquentiel strictement inchangé), désormais à
+      // l'abri d'une course grâce au FOR UPDATE pris en tête de fonction.
       await db.query(
         `INSERT INTO promo_uses (promo_id, user_id, mission_id, discount) VALUES ($1,$2,$3,$4)`,
-        [promo.id, clientId, mission.id, discount || 0]
+        [lockedPromo.id, clientId, mission.id, discount || 0]
       );
-      await db.query(
-        `UPDATE promo_codes SET used_count=used_count+1 WHERE id=$1`, [promo.id]
+      await db.query(`UPDATE promo_codes SET used_count=used_count+1 WHERE id=$1`, [lockedPromo.id]);
+    } else {
+      // Code à réduction (non gratuit) : le prix facturé ne dépend JAMAIS de ce compteur (voir
+      // prepareMissionInsert — price vient du client, jamais recalculé depuis promo/discount) :
+      // comportement inchangé, jamais de rejet ici (aucune nouvelle règle introduite ; max_uses_
+      // per_user n'était et n'est toujours pas vérifié sur ce chemin). On borne seulement
+      // used_count pour qu'il ne dépasse jamais max_uses — avant : incrément inconditionnel et
+      // non borné, y compris sous course.
+      const { rowCount } = await db.query(
+        `UPDATE promo_codes SET used_count=used_count+1 WHERE id=$1 AND (max_uses IS NULL OR used_count<max_uses)`,
+        [lockedPromo.id]
       );
+      if (rowCount > 0) {
+        await db.query(
+          `INSERT INTO promo_uses (promo_id, user_id, mission_id, discount) VALUES ($1,$2,$3,$4)`,
+          [lockedPromo.id, clientId, mission.id, discount || 0]
+        );
+      }
     }
   }
 
@@ -1194,7 +1246,23 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), miss
     return res.status(409).json({ error: 'Cette mission est déjà en cours de création, merci de patienter quelques secondes.' });
   }
 
-  const mission = await insertMissionRecord(db, req.user.id, insert, freePromo);
+  // C-3 (audit perf/concurrence 2026-09-19/21) — insertMissionRecord tourne désormais dans une
+  // transaction (verrou de ligne sur le code promo, voir son commentaire dédié) : la garde
+  // AVAIT auparavant passé le pool nu (comportement toujours strictement identique pour tout ce
+  // qui n'est pas un code promo — mêmes écritures, même ordre, seule leur atomicité change).
+  let mission;
+  try {
+    mission = await walletService.withTransaction(db, (client) => insertMissionRecord(client, req.user.id, insert, freePromo));
+  } catch (e) {
+    // Revalidation sous verrou : le code promo gratuit n'est en réalité plus valide au moment où
+    // CETTE requête a obtenu le verrou (déjà consommé par une requête concurrente pendant qu'on
+    // attendait, ou expiré/désactivé entre-temps) — même message que le refus "à froid" déjà
+    // renvoyé par prepareMissionInsert plus haut pour le cas séquentiel, jamais un 500 générique.
+    if (e.code === 'PROMO_NO_LONGER_VALID' || e.code === 'PROMO_ALREADY_USED') {
+      return res.status(400).json({ error: e.userMessage });
+    }
+    throw e;
+  }
 
   await db.query(`UPDATE mission_create_locks SET mission_id=$1 WHERE client_id=$2 AND fingerprint=$3`, [mission.id, req.user.id, fingerprint]);
 
