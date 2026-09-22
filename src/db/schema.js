@@ -77,6 +77,22 @@ async function initDb() {
     -- NOT VALID→VALIDATE peut légitimement dépasser 15 s, et un boot qui n'arrive pas à poser son
     -- schéma est bien pire qu'une requête runtime lente. Runtime : inchangé (SET LOCAL ne fuit pas).
     SET LOCAL statement_timeout = 0;
+    -- T-7 (audit perf/concurrence 2026-09-19/21, chantier Point 5) — vérifié empiriquement sur
+    -- base jetable : un simple ADD COLUMN IF NOT EXISTS (colonne déjà existante, no-op) prend
+    -- quand même un verrou ACCESS EXCLUSIVE et ATTEND toute requête longue déjà en cours sur la
+    -- table visée — avec statement_timeout=0 ci-dessus, cette attente est AUJOURD'HUI illimitée :
+    -- au déploiement, une recherche admin lente en cours peut geler tout le démarrage, qui gèle à
+    -- son tour toute requête arrivée après lui (empilée derrière le même verrou). lock_timeout
+    -- (distinct de statement_timeout : borne l'ATTENTE d'un verrou, pas la durée d'exécution)
+    -- transforme ce blocage silencieux et illimité en échec net et rapide : initDb() rejette,
+    -- le .catch() déjà existant en bas de index.js journalise clairement et sort proprement
+    -- (process.exit(1)) — Render redémarre alors le service normalement, et le nouveau tick de
+    -- démarrage réussit dès que le verrou bloquant s'est libéré. Sur le chemin normal (aucune
+    -- requête concurrente ne tient ce verrou, le cas immense majorité des déploiements) cette
+    -- ligne n'a AUCUN effet observable : le verrou est libre, il est acquis instantanément comme
+    -- avant. Valeur alignée sur le timeout de recherche posé la même session (missions.js,
+    -- GET /missions) pour une seule et même politique de délai « raisonnable » dans ce chantier.
+    SET LOCAL lock_timeout = '3s';
 
     CREATE TABLE IF NOT EXISTS users (
       id          TEXT PRIMARY KEY,
@@ -1692,6 +1708,27 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- simplement aucun lecteur pour l'instant.
     CREATE INDEX IF NOT EXISTS idx_missions_cancelled_at ON missions (cancelled_at) WHERE status='cancelled';
   `);
+
+  // ═══ I-9 (audit perf/concurrence 2026-09-19/21, §6.2) — recherche admin S-2, chantier Point 5 ═══
+  // pg_trgm + 2 index GIN pour accélérer la requête ILIKE '%terme%' réécrite en UNION
+  // (routes/missions.js, GET /missions). Isolé du bloc DDL principal ci-dessus À DESSEIN, dans sa
+  // PROPRE requête hors de la transaction implicite commune : CREATE EXTENSION exige un privilège
+  // serveur qui n'est pas garanti sur tous les plans Postgres managés (à confirmer sur le
+  // dashboard Render réel — hors de portée d'une session Claude Code, voir le rapport de
+  // chantier). S'il échoue, c'est journalisé et SAUTÉ sans faire échouer le reste du démarrage
+  // (ni les 150+ instructions DDL ci-dessus, déjà validées à ce stade) : la requête réécrite
+  // reste 100% correcte sans ces index (Seq Scan au lieu d'Index Scan pour les branches
+  // titre/nom — ni plus lent ni plus rapide que le comportement actuel avant ce chantier, jamais
+  // un crash de démarrage).
+  try {
+    await db.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_missions_title_trgm ON missions USING gin (title gin_trgm_ops)`);
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_users_full_name_trgm ON users USING gin ((first_name || ' ' || last_name) gin_trgm_ops)`);
+    console.log('✅ I-9 : pg_trgm + index trigram (recherche admin) prêts');
+  } catch (err) {
+    console.error(`⚠️  I-9 (pg_trgm) indisponible sur cette base — recherche admin non accélérée mais fonctionnelle (Seq Scan) : ${err.message}`);
+  }
+
   console.log('✅ PostgreSQL schema ready');
 }
 module.exports = { getDb, initDb, checkDbConnection };

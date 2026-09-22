@@ -977,12 +977,22 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
   if (status) { where.push(`m.status=$${p++}`); params.push(status); }
     if (type)   { where.push(`m.type=$${p++}`);   params.push(type); }
     if (search) {
-      // Recherche sur : référence (fin de l'id), titre de mission, nom client, nom Œil
-      where.push(`(
-        m.id::text ILIKE $${p}
-        OR m.title ILIKE $${p}
-        OR (c.first_name || ' ' || c.last_name) ILIKE $${p}
-        OR (o.first_name || ' ' || o.last_name) ILIKE $${p}
+      // S-2 / I-9 (audit perf/concurrence 2026-09-19/21) — l'ancien OR combiné (id::text, titre,
+      // nom client, nom Œil) empêchait tout usage d'index (BitmapOr impossible post-jointure) :
+      // 2 404 ms mesurés à 300k missions pour un terme rare, une requête par frappe. Réécrit en
+      // UNION de sous-requêtes indépendantes : title / nom client / nom Œil peuvent chacune être
+      // servies par un index trigram GIN (pg_trgm, schema.js — dégradation propre en Seq Scan si
+      // l'extension n'est pas disponible sur le plan Postgres réel, jamais d'erreur). MÊMES 4
+      // conditions, MÊME ILIKE '%terme%' sur chacune, MÊME résultat pour n'importe quel terme
+      // (vérifié par test différentiel ancien/nouveau) — seul le plan change. m.id::text ILIKE
+      // reste substring/non indexé à l'identique (le rapport déconseille explicitement d'indexer
+      // cette colonne) : coût inchangé pour cette branche précise, mais elle ne bloque plus les 3
+      // autres derrière elle une fois sorties du OR combiné.
+      where.push(`m.id IN (
+        SELECT id FROM missions WHERE id::text ILIKE $${p}
+        UNION SELECT id FROM missions WHERE title ILIKE $${p}
+        UNION SELECT mm.id FROM missions mm JOIN users cc ON cc.id=mm.client_id WHERE (cc.first_name || ' ' || cc.last_name) ILIKE $${p}
+        UNION SELECT mm.id FROM missions mm JOIN users oo ON oo.id=mm.oeil_id WHERE (oo.first_name || ' ' || oo.last_name) ILIKE $${p}
       )`);
       params.push(`%${search}%`);
       p++;
@@ -990,7 +1000,20 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
     const wc = where.length ? 'WHERE ' + where.join(' AND ') : '';
 
 
-  const { rows: missions } = await db.query(`
+  // PO-1/S-2 (audit perf/concurrence 2026-09-19/21) — filet de sécurité : une recherche admin
+  // ILIKE inter-tables peut être lente sur une grande base et occuper une connexion du pool tout
+  // ce temps ; le statement_timeout GLOBAL (15 s, schema.js) protège contre une requête qui
+  // dérape complètement, mais laisse encore la place à PLUSIEURS recherches lentes simultanées
+  // pour affamer le pool à 15 connexions (PO-1, scénario de chevauchement vérifié dans le
+  // rapport de chantier). 3 s ici borne spécifiquement CETTE route (liste/recherche
+  // interactive) ; SET LOCAL ne vit que cette transaction courte et lecture seule (2 requêtes,
+  // aucune écriture) — ne fuit jamais vers une connexion réutilisée par une autre requête au
+  // retour dans le pool. Sur le chemin normal (sans "search", ou terme servi par l'index I-9
+  // ci-dessous) ce délai n'est jamais atteint — comportement inchangé, filet uniquement.
+  const { missions, total } = await walletService.withTransaction(db, async (client) => {
+    await client.query(`SET LOCAL statement_timeout = '3s'`);
+
+    const { rows: missionsRows } = await client.query(`
       SELECT m.*,
         c.first_name||' '||c.last_name AS client_name, c.phone AS client_phone, c.avatar_url AS client_avatar,
         c.client_rating_avg AS client_rating_avg, c.client_rating_count AS client_rating_count,
@@ -1013,16 +1036,16 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
       LIMIT $${p++} OFFSET $${p++}
     `, [...params, req.user.id, limit, offset]);
 
-
-
-
-  const { rows: [{ n: total }] } = await db.query(`
+    const { rows: [{ n: totalCount }] } = await client.query(`
       SELECT COUNT(*)::int AS n
       FROM missions m
       LEFT JOIN users c ON c.id=m.client_id
       LEFT JOIN users o ON o.id=m.oeil_id
       ${wc}
     `, params);
+
+    return { missions: missionsRows, total: totalCount };
+  });
 
   // C9 (audit valeurs-temps, 2026-09-03) — deux règles métier que le frontend client
   // (client/Missions.jsx) recopiait en dur (12 h et 2 h). Descendues ici comme champs de la
