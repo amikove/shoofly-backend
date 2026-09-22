@@ -34,14 +34,30 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// PW-7 (audit perf/résilience 2026-09-19/21) — étendu par cohérence avec le même correctif sur
+// routes/media.js : ces deux filtres ne testaient déjà QUE le MIME (pas de bug de casse sur le
+// nom de fichier ici), mais n'acceptaient pas image/heic|heif — un Œil qui choisit une pièce
+// d'identité ou un avatar directement depuis la pellicule d'un iPhone récent peut fournir ce
+// format brut. `format:'jpg'` uniquement pour ce cas (Cloudinary sait le décoder à la réception,
+// mais la plupart des navigateurs desktop non) — tous les autres formats déjà acceptés gardent
+// leur comportement exact d'avant (mêmes MIME, même absence de conversion forcée).
+function identityAvatarCloudinaryParams(folderPrefix, transformation) {
+  return async (req, file) => {
+    const isHeic = /^image\/hei[cf]$/.test(file.mimetype);
+    return {
+      folder: `${folderPrefix}/${req.user?.id}`,
+      resource_type: 'image',
+      allowed_formats: ['jpg','jpeg','png','webp','heic','heif'],
+      ...(isHeic ? { format: 'jpg' } : {}),
+      transformation,
+    };
+  };
+}
+const IDENTITY_AVATAR_ALLOWED_MIME = new Set(['image/jpeg','image/png','image/webp','image/heic','image/heif']);
+
 const identityStorage = new CloudinaryStorage({
   cloudinary,
-  params: async (req, file) => ({
-    folder: `shoofly/identity/${req.user?.id}`,
-    resource_type: 'image',
-    allowed_formats: ['jpg','jpeg','png','webp'],
-    transformation: [{ width: 1200, crop: 'limit' }],
-  }),
+  params: identityAvatarCloudinaryParams('shoofly/identity', [{ width: 1200, crop: 'limit' }]),
 });
 
 const uploadIdentity = multer({
@@ -49,30 +65,23 @@ const uploadIdentity = multer({
     limits: { fileSize: 5 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         file.originalname = file.originalname.replace(/[&<>"'`%;()]/g, '')
-        const allowed = /jpeg|jpg|png|webp/;
-        if (allowed.test(file.mimetype)) cb(null, true);
-        else cb(new Error('Format non supporté. Utilisez JPG ou PNG.'));
+        if (IDENTITY_AVATAR_ALLOWED_MIME.has(file.mimetype)) cb(null, true);
+        else cb(new Error('Format non supporté. Utilisez JPG, PNG ou HEIC.'));
       }
   });
 
 // ── Upload photo de profil (avatar) — Œils et clients ──
 const avatarStorage = new CloudinaryStorage({
   cloudinary,
-  params: async (req, file) => ({
-    folder: `shoofly/avatars/${req.user?.id}`,
-    resource_type: 'image',
-    allowed_formats: ['jpg','jpeg','png','webp'],
-    transformation: [{ width: 400, height: 400, crop: 'fill', gravity: 'face' }],
-  }),
+  params: identityAvatarCloudinaryParams('shoofly/avatars', [{ width: 400, height: 400, crop: 'fill', gravity: 'face' }]),
 });
 const uploadAvatar = multer({
   storage: avatarStorage,
   limits: { fileSize: 3 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     file.originalname = file.originalname.replace(/[&<>"'`%;()]/g, '')
-    const allowed = /jpeg|jpg|png|webp/;
-    if (allowed.test(file.mimetype)) cb(null, true);
-    else cb(new Error('Format non supporté. Utilisez JPG ou PNG.'));
+    if (IDENTITY_AVATAR_ALLOWED_MIME.has(file.mimetype)) cb(null, true);
+    else cb(new Error('Format non supporté. Utilisez JPG, PNG ou HEIC.'));
   }
 });
 

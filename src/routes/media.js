@@ -19,21 +19,40 @@ cloudinary.config({
 
 const storage = new CloudinaryStorage({
   cloudinary,
-  params: async (req, file) => ({
-    folder:         `shoofly/missions/${req.params.missionId}`,
-    resource_type:  file.mimetype.startsWith('video') ? 'video' : 'image',
-    allowed_formats: ['jpg','jpeg','png','webp','mp4','mov'],
-    transformation: file.mimetype.startsWith('video') ? [] : [{ width: 1200, crop: 'limit' }],
-  }),
+  params: async (req, file) => {
+    const isVideo = file.mimetype.startsWith('video');
+    // PW-7 (audit perf/résilience 2026-09-19/21) — un iPhone récent peut produire du HEIC brut
+    // au lieu d'un JPEG déjà converti. Cloudinary sait le décoder à la réception, mais la
+    // plupart des navigateurs desktop (Chrome/Firefox) ne savent pas afficher un .heic tel
+    // quel : sans conversion forcée, la preuve de mission serait acceptée à l'envoi puis
+    // invisible pour un admin qui l'ouvre. `format` ne s'applique qu'à ce cas précis — tous
+    // les autres formats déjà acceptés gardent leur format d'origine, inchangé.
+    const isHeic = /^image\/hei[cf]$/.test(file.mimetype);
+    return {
+      folder:         `shoofly/missions/${req.params.missionId}`,
+      resource_type:  isVideo ? 'video' : 'image',
+      allowed_formats: ['jpg','jpeg','png','webp','heic','heif','mp4','mov'],
+      ...(isHeic ? { format: 'jpg' } : {}),
+      transformation: isVideo ? [] : [{ width: 1200, crop: 'limit' }],
+    };
+  },
 });
 
 const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 },
-fileFilter: (req, file, cb) => {
+  // PW-7 (audit perf/résilience 2026-09-19/21) — l'ancienne regex testait AUSSI le nom de
+  // fichier, sensible à la casse (IMG_1234.JPG était refusé alors que image/jpeg est le MIME
+  // réel), et ne reconnaissait ni video/quicktime (MIME réel d'une vidéo iPhone — ne contient
+  // pas la sous-chaîne "mov", donc TOUJOURS refusée jusqu'ici, quelle que soit la casse) ni
+  // image/heic|heif (photos iPhone récentes). Le nom de fichier est arbitraire côté client et
+  // n'apporte aucune garantie que le MIME n'apporte déjà : on ne teste plus que le MIME
+  // (même convention que users.js pour avatar/identité), en liste blanche EXACTE plutôt
+  // qu'une regex à sous-chaînes (pas de faux-positif du style "image/jpeg-old").
+  fileFilter: (req, file, cb) => {
     file.originalname = file.originalname.replace(/[&<>"'`%;()]/g, '')
-    const allowed = /jpeg|jpg|png|webp|mp4|mov/;
-    if (allowed.test(file.mimetype) && allowed.test(file.originalname)) cb(null, true);
+    const ALLOWED_MIME = new Set(['image/jpeg','image/png','image/webp','image/heic','image/heif','video/mp4','video/quicktime']);
+    if (ALLOWED_MIME.has(file.mimetype)) cb(null, true);
     else cb(new Error('Type de fichier non supporté'));
   }
 });
