@@ -72,12 +72,25 @@ router.post('/', authenticate, asyncHandler(async (req, res) => {
   // notifications 2026-09-14, Partie B) : gagne le push (deep-link /admin/block-appeals, voir
   // services/push.js) + live pour un admin déjà connecté ; un admin hors-ligne la verra sinon au
   // prochain chargement, comme avant.
+  // Une clé par valeur de deactivation_context (chantier langue des notifications push,
+  // 2026-09-23) — le texte FR variait déjà par ternaire ; title_key/body_key doivent reproduire
+  // exactement la même branche, sinon Topbar.jsx (t('notif.'+body_key)) afficherait un texte FR
+  // différent de celui produit ici. 'admin_toggle' et tout ctx non reconnu (legacy, NULL) restent
+  // sur le même texte "désactivation admin" qu'aujourd'hui — clés distinctes malgré tout (texte
+  // identique pour l'instant, peuvent diverger plus tard sans nouveau chantier).
+  const blockAppealBodyKeyByCtx = {
+    fraud_block: 'blockAppealReceivedAdminFraudBody',
+    noshow_strikes: 'blockAppealReceivedAdminStrikesBody',
+    admin_toggle: 'blockAppealReceivedAdminAdminBody',
+  };
+  const blockAppealBodyKey = blockAppealBodyKeyByCtx[ctx] || 'blockAppealReceivedAdminOtherBody';
+
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
   for (const admin of admins) {
     await notify(db, admin.id, '📨 Contestation de blocage reçue',
       `Un compte bloqué (${ctx === 'fraud_block' ? 'anti-fraude' : ctx === 'noshow_strikes' ? 'strikes no-show' : 'désactivation admin'}) a déposé une contestation.`,
       'warning', null, emitToUser, 'admin_block_appeals',
-      'blockAppealReceivedAdminTitle', 'blockAppealReceivedAdminBody', { context: ctx || 'unknown' });
+      'blockAppealReceivedAdminTitle', blockAppealBodyKey, { context: ctx || 'unknown' });
   }
 
   res.status(201).json({ appeal });

@@ -548,7 +548,7 @@ async function sendUrgentWhatsAppWave(db, mission, emitToUser = null) {
     await notify(db, o.id,
       mission.is_urgent ? '🚨 Mission urgente disponible' : '📋 Mission disponible',
       `${mission.title} — ${mission.city} · ${mission.price} MAD`, 'mission', mission.id, emitToUser, null,
-      'urgentWaveOeilTitle', 'urgentWaveOeilBody',
+      mission.is_urgent ? 'urgentWaveOeilTitle' : 'missionAvailableOeilTitle', 'urgentWaveOeilBody',
       { missionTitle: mission.title, city: mission.city, price: mission.price });
   }));
 
@@ -1549,15 +1549,17 @@ router.put('/:id/admin-edit', authenticate, requireRole('admin'), requireSuperAd
   );
 
   // Notification in-app uniquement, même choix que POST /edit-requests/:id/cancel plus haut (pas
-  // de nouveau template WhatsApp, pas de title_key/body_key sans traduction frontend correspondante
-  // — chantier backend seul).
+  // de nouveau template WhatsApp). title_key/body_key branchés (chantier langue des notifications
+  // push, 2026-09-23) — traductions ajoutées à cette occasion, fr.json/ar.json + copie backend.
   await notify(db, mission.client_id, 'Mission modifiée',
     `Un administrateur a modifié les informations de votre mission "${updated.title}".`,
-    'mission', mission.id, emitToUser);
+    'mission', mission.id, emitToUser, null,
+    'missionEditedByAdminClientTitle', 'missionEditedByAdminClientBody', { missionTitle: updated.title });
   if (mission.oeil_id) {
     await notify(db, mission.oeil_id, 'Mission modifiée',
       `Un administrateur a modifié les informations de la mission "${updated.title}".`,
-      'mission', mission.id, emitToUser);
+      'mission', mission.id, emitToUser, null,
+      'missionEditedByAdminOeilTitle', 'missionEditedByAdminOeilBody', { missionTitle: updated.title });
   }
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: updated.status });
@@ -1737,13 +1739,14 @@ router.post('/edit-requests/:id/cancel', authenticate, requireRole('client'), as
   if (rowCount === 0) return res.status(409).json({ error: 'Cette demande a changé de statut entre-temps, veuillez rafraîchir.' });
 
   // Notification in-app uniquement — pas de template WhatsApp Wasel dédié à ce jour pour cet
-  // événement (chantier backend seul, aucune soumission de nouveau template hors périmètre) ;
-  // pas de title_key/body_key non plus, pour ne pas introduire une clé i18n sans traduction
-  // frontend correspondante (shoofly-react hors périmètre de ce chantier).
+  // événement (aucune soumission de nouveau template, hors périmètre). title_key/body_key
+  // branchés (chantier langue des notifications push, 2026-09-23) — traductions ajoutées à cette
+  // occasion, fr.json/ar.json + copie backend.
   await notify(db, mission.oeil_id,
     'Modification retirée',
     `Le client a retiré sa demande de modification sur "${mission.title}".`,
-    'mission', mission.id, emitToUser
+    'mission', mission.id, emitToUser, null,
+    'editRequestWithdrawnOeilTitle', 'editRequestWithdrawnOeilBody', { missionTitle: mission.title }
   );
 
   res.json({ mission, edit_request: { ...editRequest, status: 'cancelled' } });

@@ -86,8 +86,12 @@ async function runWalletReconciliation(db, io = null, emitToUser = null) {
 
       const title = '⚠️ Écart de réconciliation détecté';
       const body = `${userName} (${roleLabel}, ${a.user_id}) — solde ${storedBalance.toFixed(2)} MAD vs ledger ${ledgerBalance.toFixed(2)} MAD (écart ${discrepancy.toFixed(2)} MAD). Alerte #${a.id}.`;
+      // userTypeLabel ajouté (chantier langue des notifications push, revue BOSS 2026-09-23) :
+      // notif.walletReconciliationAlertAdminBody interpole {{userTypeLabel}}, absent jusqu'ici de
+      // ces params (seul userType, le code brut, y figurait) — un push localisé aurait laissé le
+      // placeholder tel quel. Même valeur que roleLabel (texte FR déjà utilisé ci-dessus).
       const params = {
-        alertId: a.id, userId: a.user_id, userType: a.user_type, userName,
+        alertId: a.id, userId: a.user_id, userType: a.user_type, userTypeLabel: roleLabel, userName,
         discrepancy, storedBalance, ledgerBalance,
       };
 
