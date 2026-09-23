@@ -98,7 +98,7 @@ router.post('/register', [
 
   await notify(
     db, id,
-    'Bienvenue sur SHOOFLY 👁️',
+    'Bienvenue sur Shoofly 👁️',
     role === 'oeil' ? 'Votre profil sera vérifié sous 24h.' : 'Vous pouvez commander votre première mission.',
     'info', null, null, 'none',
     'welcomeTitle',
