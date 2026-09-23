@@ -287,6 +287,41 @@ router.post('/pwa-installed', authenticate, pwaInstalledLimiter, requireRole('cl
   res.json({ pwa_installed_at: row.pwa_installed_at });
 }));
 
+// Même limiteur que pwa-installed (byUserId recopié plus haut) : action rare par compte, seuil
+// large, simple filet.
+const languageLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  keyGenerator: byUserId,
+  message: { error: 'Trop de tentatives. Réessayez dans quelques minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Langue de l'utilisateur, capturée côté serveur (chantier langue des notifications push,
+// 2026-09-23) — jusqu'ici purement côté client (localStorage.shoofly_lang, voir
+// shoofly-react/src/i18n/config.js), donc invisible au backend. Tous les rôles (pas de
+// requireRole) : contrairement à pwa-installed, rien n'exclut l'admin ici. Liste blanche stricte
+// ('fr'|'ar', les deux seules langues supportées par shoofly-react/src/i18n/config.js
+// SUPPORTED_LNGS) plutôt qu'un simple isString — une valeur arbitraire ferait silencieusement
+// échouer toute résolution de traduction plus tard (notify.js) sans jamais le signaler. PAS
+// d'invalidateAuthCache : language n'est ni lue par AUTH_USER_SQL ni exposée sur req.user
+// (middleware/auth.js), donc hors du chemin de données du cache A-3 — même raisonnement que
+// pwa_installed_at.
+router.post('/language', authenticate, languageLimiter, [
+  body('language').isIn(['fr', 'ar']),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const db = getDb();
+  const { rows: [row] } = await db.query(
+    `UPDATE users SET language=$1 WHERE id=$2 RETURNING language`,
+    [req.body.language, req.user.id]
+  );
+  res.json({ language: row.language });
+}));
+
 // Message et code HTTP strictement IDENTIQUES que l'email corresponde à un compte ou non — même
 // principe que /login (message générique "Email ou mot de passe incorrect", jamais "email
 // inconnu"). La réponse est envoyée sans attendre la fin de l'envoi de l'email (fire-and-forget,

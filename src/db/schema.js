@@ -480,6 +480,7 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS pwa_installed_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT;
 
 
     -- Signalements de problèmes en cours de mission — table dédiée, séparée des rapports de visite
