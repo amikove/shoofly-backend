@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node start.js",
     "dev": "nodemon src/index.js",
-    "seed": "node src/db/seed.js"
+    "seed": "node src/db/seed.js",
+    "check:notif-i18n": "node scripts/check-notif-i18n.js"
   },
   "dependencies": {
     "@node-rs/bcrypt": "^1.10.8",
