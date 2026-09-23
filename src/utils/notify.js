@@ -1,4 +1,5 @@
 const push = require('../services/push');
+const notifI18n = require('../i18n');
 
 // action_type dont le deep-link dépend du rôle du destinataire (chemin /oeil/... vs
 // /client/...) — seuls ceux-ci justifient un aller-retour DB supplémentaire avant le push
@@ -44,15 +45,36 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
   // même .catch qu'avant ce correctif). `tag` dédupe côté navigateur si l'utilisateur est
   // multi-appareils et déjà en train de lire.
   resolveDeepLink(db, userId, actionType, missionId, titleKey, params)
-    .then((url) => push.sendWebPush(userId, {
-      title,
-      body,
-      url,
-      tag: `notif-${r.rows[0].id}`,
-      urgent: type === 'error',
-      notificationId: r.rows[0].id,
-      eventKey: titleKey || null,
-    }))
+    .then(async (url) => {
+      // Langue (chantier langue des notifications push, 2026-09-23) : titre/corps localisés pour
+      // ce SEUL canal push — la ligne `notifications` ci-dessus (title/body) reste FRANÇAISE,
+      // inchangée : c'est elle que Topbar.jsx retraduit déjà via title_key/body_key pour
+      // l'affichage in-app (t('notif.'+title_key)), indépendamment de ce qui part en push. Repli
+      // strictement identique au comportement d'avant (title/body bruts) si la langue de
+      // l'utilisateur est inconnue (colonne users.language jamais renseignée) ou si la clé
+      // n'existe pas dans le catalogue backend/src/i18n — couvre nativement les appels sans
+      // titleKey/bodyKey (voir routes/missions.js) sans cas particulier à écrire ici.
+      let pushTitle = title;
+      let pushBody = body;
+      if (titleKey || bodyKey) {
+        try {
+          const { rows: [u] } = await db.query('SELECT language FROM users WHERE id=$1', [userId]);
+          if (u?.language) {
+            if (titleKey) pushTitle = notifI18n.t(titleKey, u.language, params) ?? title;
+            if (bodyKey) pushBody = notifI18n.t(bodyKey, u.language, params) ?? body;
+          }
+        } catch { /* résolution langue best-effort — jamais bloquant pour le push */ }
+      }
+      return push.sendWebPush(userId, {
+        title: pushTitle,
+        body: pushBody,
+        url,
+        tag: `notif-${r.rows[0].id}`,
+        urgent: type === 'error',
+        notificationId: r.rows[0].id,
+        eventKey: titleKey || null,
+      });
+    })
     .catch(() => {});
 }
 
