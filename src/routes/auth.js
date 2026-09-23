@@ -10,9 +10,10 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { body, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
 const { getDb } = require('../db/schema');
 const { getSetting } = require('../utils/settings');
-const { authenticate, invalidateAuthCache } = require('../middleware/auth');
+const { authenticate, requireRole, invalidateAuthCache } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const { sendPasswordResetEmail } = require('../services/email');
@@ -251,6 +252,39 @@ router.put('/password', authenticate, [
   // sans invalidation, l'ancien état (sans password_changed_at) resterait servi jusqu'au TTL.
   invalidateAuthCache(req.user.id);
   res.json({ message: 'Mot de passe modifié' });
+}));
+
+// byUserId recopié ici (même définition que routes/missions.js, pas d'export partagé) : monté
+// APRÈS authenticate sur la route, comme son homologue — req.user doit être posé pour que
+// keyGenerator le lise ; repli sur req.ip uniquement défensif (authenticate a déjà renvoyé 401
+// avant ce point sinon). Voir missions.js pour le même motif (interestLimiter, etc.).
+function byUserId(req) { return req.user?.id ?? req.ip; }
+// Action rare par compte (au plus quelques appels par session/appareil) : seuil large, simple
+// filet contre un compte compromis plutôt qu'une borne d'usage normal — même ordre de grandeur
+// que confirmPresenceLimiter/candidateConfirmLimiter (missions.js).
+const pwaInstalledLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  keyGenerator: byUserId,
+  message: { error: 'Trop de tentatives. Réessayez dans quelques minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Marque serveur "raccourci PWA déjà ajouté" (chantier InstallPwaBanner, 2026-09-23) — corrige le
+// bandeau qui reste affiché en permanence dans Safari iOS après installation, parce que le
+// stockage de Safari est séparé de celui de l'app ajoutée à l'écran d'accueil (un flag
+// localStorage ne traverse pas cette frontière ; une marque sur le compte, si). UPDATE idempotent
+// (COALESCE) : n'écrase jamais un horodatage déjà posé, un rappel répété reste un no-op. PAS
+// d'invalidateAuthCache — pwa_installed_at n'est ni lue par AUTH_USER_SQL ni exposée sur
+// req.user (middleware/auth.js), donc hors du chemin de données du cache A-3.
+router.post('/pwa-installed', authenticate, pwaInstalledLimiter, requireRole('client', 'oeil'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows: [row] } = await db.query(
+    `UPDATE users SET pwa_installed_at = COALESCE(pwa_installed_at, NOW()) WHERE id=$1 RETURNING pwa_installed_at`,
+    [req.user.id]
+  );
+  res.json({ pwa_installed_at: row.pwa_installed_at });
 }));
 
 // Message et code HTTP strictement IDENTIQUES que l'email corresponde à un compte ou non — même
