@@ -486,23 +486,10 @@ io.on('connection', (socket) => {
     } catch (e) { console.error('WS message error:', e.message); }
   });
 
-  // Oeil sends live GPS location
-  socket.on('location_update', async ({ missionId, lat, lng }) => {
-    if (!missionId || !lat || !lng) return;
-    try {
-      const db = getDb();
-      const result = await db.query(
-        `UPDATE missions SET oeil_lat=$1, oeil_lng=$2, oeil_location_at=NOW() WHERE id=$3 AND oeil_id=$4`,
-        [lat, lng, missionId, uid]
-      );
-      // Ne diffuser que si la ligne a réellement été mise à jour — sinon n'importe quel Œil
-      // authentifié pouvait injecter de fausses coordonnées GPS dans une room qui n'est pas la
-      // sienne (même correctif que POST /:id/location, routes/missions.js).
-      if (result.rowCount === 0) return;
-      // Broadcast to mission room (client sees it live)
-      io.to(`mission:${missionId}`).emit('location_update', { lat, lng, oeil_id: uid, timestamp: new Date() });
-    } catch (e) { console.error('WS location error:', e.message); }
-  });
+  // (Handler socket `location_update` — suivi GPS de l'Œil — supprimé le 2026-09-24 avec
+  // POST /missions/:id/location et les colonnes missions.oeil_lat/oeil_lng/oeil_location_at :
+  // code mort depuis l'Initial commit, aucun émetteur côté frontend. Décision BOSS Q6. Ne jamais
+  // diffuser une position dans une room mission : la room n'est pas quittée au désassignement.)
 
   // mission_status_changed n'est plus écouté depuis le client — uniquement émis
     // côté serveur (routes/missions.js), pour empêcher un client de falsifier un statut.

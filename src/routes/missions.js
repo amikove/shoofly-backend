@@ -19,7 +19,8 @@ const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
 const Sentry = require('@sentry/node');
 const { resolveQuartier, validateCityInput } = require('../constants/villes');
-const { isValidSubcategory } = require('../constants/missionCategories');
+const { isValidSubcategory, defaultIsPrivateResidence } = require('../constants/missionCategories');
+const { serializeMissionFor, serializeProposedChangesFor } = require('../utils/missionVisibility');
 const { getSubcategoryMinPrice, loadSubcategoryMinPricesMap } = require('../utils/subcategoryMinPrices');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
 const { checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins } = require('../utils/cashCommission');
@@ -371,6 +372,10 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
       property_type, visit_type, video_call, institution, purpose,
       company_name, audit_type, frequency, criteria, subcategory,
       promo_code, discount, replacement_preference, status, payment_method: paymentMethod,
+      // Posé côté serveur à partir du type (constants/missionCategories.js) — le formulaire n'a
+      // pas encore de case « logement privé », body.is_private_residence est donc ignoré. Voyage
+      // dans `insert`, donc aussi dans le mission_payload stocké par PayZone.
+      is_private_residence: defaultIsPrivateResidence(type),
     },
     freePromo,
   };
@@ -390,6 +395,11 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
     company_name, audit_type, frequency, criteria, subcategory,
     promo_code, discount, replacement_preference, status, payment_method,
   } = insertData;
+  // Un mission_payload PayZone stocké avant ce champ (tentative en cours au déploiement) ne le
+  // porte pas : même défaut que prepareMissionInsert, jamais FALSE implicite.
+  const isPrivateResidence = typeof insertData.is_private_residence === 'boolean'
+    ? insertData.is_private_residence
+    : defaultIsPrivateResidence(type);
 
   // C-3 (audit perf/concurrence 2026-09-19/21) — un code promo GRATUIT (Shoofly paie l'Œil,
   // platform_amount) pouvait être consommé plusieurs fois par le même client via 2 créations de
@@ -434,15 +444,17 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
       id,client_id,type,subcategory,status,title,description,address,city,quartier,scheduled_at,
       duration_est,price,commission,oeil_earning,is_urgent,
       property_type,visit_type,video_call,institution,purpose,
-      company_name,audit_type,frequency,criteria,oeil_id,replacement_preference,payment_method
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+      company_name,audit_type,frequency,criteria,oeil_id,replacement_preference,payment_method,
+      is_private_residence
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
     RETURNING *
   `, [
     id, clientId, type, subcategory||null, status, title, description||null, address, city, quartier,
     new Date(scheduled_at), duration_est||null, price, commission, oeil_earning,
     !!is_urgent, property_type||null, visit_type||null, !!video_call,
     institution||null, purpose||null, company_name||null, audit_type||null,
-    frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast', payment_method
+    frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast', payment_method,
+    isPrivateResidence
   ]);
 
   // Mission offerte via code promo gratuit : Shoofly paie l'Œil de sa poche, sans commission générée.
@@ -1057,22 +1069,18 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
   const clientValidationHours = await getSetting(db, 'client_validation_hours', 12);
   const refundPartialThresholdHours = await getSetting(db, 'refund_partial_threshold_hours', 2);
 
-  missions.forEach(m => {
-    if (!(req.user.role === 'admin' || m.oeil_id === req.user.id)) {
-      m.client_phone = null;
-    }
-    // Même règle que canSeeChat (GET /:id) — voir sa justification là-bas (POINT 2 audit
-    // sécurité global 08-09). role==='client' est sûr ici : le WHERE ci-dessus filtre déjà
-    // cette liste sur m.client_id=req.user.id pour ce rôle, chaque ligne lui appartient.
-    if (!(req.user.role === 'admin' || req.user.role === 'client' || m.oeil_id === req.user.id)) {
-      m.transfer_reason = null;
-      m.transferred_from = null;
-    }
-    m.chat_access_expires_at = chatAccessExpiresAt(m);
-    m.client_validation_hours = clientValidationHours;
-    m.refund_partial_threshold_hours = refundPartialThresholdHours;
+  // Masquage (client_phone, transfer_reason/transferred_from, address d'un logement privé,
+  // pending_edit_request.proposed_changes) : utils/missionVisibility.js — même sérialiseur que
+  // GET /:id. mode=available en dépendait le plus : avant, address partait en clair vers tout
+  // Œil de la ville.
+  const serialized = missions.map(m => {
+    const out = serializeMissionFor(req.user, m);
+    out.chat_access_expires_at = chatAccessExpiresAt(m);
+    out.client_validation_hours = clientValidationHours;
+    out.refund_partial_threshold_hours = refundPartialThresholdHours;
+    return out;
   });
-  res.json({ missions, total, page: +page, pages: Math.ceil(total / limit) });
+  res.json({ missions: serialized, total, page: +page, pages: Math.ceil(total / limit) });
 }));
 
 // Rate limit dédié sur la création de mission — 10 missions / 15min par IP,
@@ -1630,7 +1638,10 @@ router.post('/edit-requests/:id/approve', authenticate, requireRole('oeil'), asy
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: updated.status });
   io.to('room:admin').emit('mission_updated', updated);
 
-  res.json({ mission: updated, edit_request: { ...editRequest, status: 'approved' } });
+  res.json({
+    mission: serializeMissionFor(req.user, updated),
+    edit_request: { ...editRequest, status: 'approved', proposed_changes: serializeProposedChangesFor(req.user, updated, editRequest.proposed_changes) },
+  });
 }));
 
 // ── POST /missions/edit-requests/:id/reject ── Œil refuse la modification proposée ──
@@ -1703,7 +1714,13 @@ router.post('/edit-requests/:id/reject', authenticate, requireRole('oeil'), asyn
   // ("SANS pénalité ... ni une annulation ni un abandon").
   await advanceCandidateCascade(db, io, emitToUser, updatedMission, {});
 
-  res.json({ mission: updatedMission, edit_request: { ...editRequest, status: 'rejected' } });
+  // Sérialisé avec updatedMission (oeil_id=NULL APRÈS l'écriture) : l'Œil qui vient de refuser
+  // n'est plus retenu — il ne reçoit donc plus l'adresse d'un logement privé, ni dans la mission
+  // ni dans les proposed_changes de la demande qu'il vient de refuser.
+  res.json({
+    mission: serializeMissionFor(req.user, updatedMission),
+    edit_request: { ...editRequest, status: 'rejected', proposed_changes: serializeProposedChangesFor(req.user, updatedMission, editRequest.proposed_changes) },
+  });
 }));
 
 // ── POST /missions/edit-requests/:id/cancel ── Le client retire sa propre demande ──
@@ -1955,23 +1972,16 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
   // le seul garde-fou était `mission.status !== 'pending'`, sans lien avec l'appartenance).
   const canSeeChat = isAdmin || req.user.role === 'client' || mission.oeil_id === req.user.id;
 
-  // transfer_reason/transferred_from révèlent qu'un collègue précédent a été bloqué/suspendu,
-  // ou son motif d'urgence en texte libre — même cercle de confiance que canSeeChat ci-dessus
-  // (POINT 2 audit sécurité global 08-09 : jusqu'ici exposés à tout Œil via SELECT m.*, y
-  // compris un simple candidat à la reprise browsant le pool 'pending').
-  // address (RG10, audit régression 360° v4, 2026-08-31) : l'adresse postale complète n'est
-  // utile qu'une fois la mission acceptée. Le pool de missions disponibles est servi par
-  // GET /missions?mode=available, filtré à la ville de l'Œil (:773) et n'affichant côté
-  // frontend que ville/quartier ; GET /:id, lui, n'a pas ce filtre ville et laissait tout
-  // Œil (non vérifié, hors ville) énumérer des id de mission et lire l'adresse de n'importe
-  // quelle mission 'pending'. Aucun écran Œil ne consomme address depuis GET /:id pour une
-  // mission non assignée (candidature confirmée par traçage frontend) — on l'aligne donc sur
-  // le même cercle de confiance que le chat.
-  if (!canSeeChat) {
-    mission.transfer_reason = null;
-    mission.transferred_from = null;
-    mission.address = null;
-  }
+  // transfer_reason/transferred_from (POINT 2 audit sécurité global 08-09), client_phone/
+  // client_email et address : masqués par serializeMissionFor (utils/missionVisibility.js) au
+  // moment de répondre, plus bas — même sérialiseur que GET / et les routes d'écriture.
+  // address — RG10 (2026-08-31) la réservait au cercle du chat pour tout Œil non retenu ; règle
+  // remplacée le 2026-09-24 (décision BOSS, chantier « lieu de mission ») : l'adresse fait partie
+  // de l'annonce et reste visible par tout Œil avant candidature, y compris hors ville via cette
+  // route non filtrée, SAUF logement privé (missions.is_private_residence) → null pour tout
+  // appelant hors cercle (admin, client propriétaire, Œil actuellement assigné). L'ancien
+  // commentaire RG10 affirmait que mode=available n'exposait que ville/quartier : c'était faux,
+  // cette route-là renvoyait l'adresse en clair (corrigé par le même sérialiseur).
 
   // report = livrable d'audit de l'Œil (summary/score/notes/risk_points), rating = note libre
   // du client : même cercle d'appartenance que le chat (client-propriétaire, Œil ACTUELLEMENT
@@ -2019,12 +2029,7 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
     if (mission.is_new_oeil) mission.oeil_rating = null;
   }
 
-  if (!(req.user.role === 'admin' || mission.oeil_id === req.user.id)) {
-      mission.client_phone = null;
-      mission.client_email = null;
-    }
-
-    res.json({ mission, media, messages, report: report||null, rating: rating||null });
+  res.json({ mission: serializeMissionFor(req.user, mission), media, messages, report: report||null, rating: rating||null });
 }));
 
 // ── POST /missions/:id/accept ──────────────────────────────
@@ -2490,7 +2495,7 @@ router.post('/:id/status', authenticate, [
   if (['completed', 'cancelled'].includes(status)) closeMissionChatRoom(io, mission.id);
   io.to('room:admin').emit('mission_updated', updated);
 
-  res.json({ mission: updated });
+  res.json({ mission: serializeMissionFor(req.user, updated) });
 }));
 
 // ── POST /missions/:id/client-disabled-decision ── Honorer ou annuler (PROMPT 6) ───────────
@@ -2565,31 +2570,7 @@ router.post('/:id/client-disabled-decision', authenticate, requireRole('oeil'), 
   closeMissionChatRoom(io, mission.id);
   io.to('room:admin').emit('mission_updated', updated);
 
-  res.json({ ok: true, decision: 'cancel', mission: updated });
-}));
-
-// ── POST /missions/:id/location ────────────────────────────
-router.post('/:id/location', authenticate, requireRole('oeil'), [
-  body('lat').isFloat({ min: -90, max: 90 }),
-  body('lng').isFloat({ min: -180, max: 180 }),
-], asyncHandler(async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
-  const db = getDb();
-  const { lat, lng } = req.body;
-  const result = await db.query(
-    `UPDATE missions SET oeil_lat=$1, oeil_lng=$2, oeil_location_at=NOW() WHERE id=$3 AND oeil_id=$4`,
-    [lat, lng, req.params.id, req.user.id]
-  );
-  // Ne diffuser que si la ligne a réellement été mise à jour (mission existante ET appelant
-  // bien l'Œil assigné) — sinon n'importe quel Œil authentifié pouvait injecter de fausses
-  // coordonnées GPS dans une room qui n'est pas la sienne, la mise à jour DB étant silencieuse
-  // (0 ligne affectée) alors que la diffusion socket, elle, partait quand même.
-  if (result.rowCount === 0) return res.status(403).json({ error: 'Accès refusé' });
-  // Also broadcast via socket
-  req.app.get('io').to(`mission:${req.params.id}`).emit('location_update', { lat, lng, timestamp: new Date() });
-  res.json({ lat, lng });
+  res.json({ ok: true, decision: 'cancel', mission: serializeMissionFor(req.user, updated) });
 }));
 
 // ── POST /missions/:id/report ──────────────────────────────
@@ -3756,7 +3737,7 @@ router.post('/:id/resume-after-h30', authenticate, requireRole('oeil'), asyncHan
     io.to('room:admin').emit('mission_updated', updated);
   }
 
-  res.json({ ok: true, mission: updated });
+  res.json({ ok: true, mission: serializeMissionFor(req.user, updated) });
 }));
 
 // ── GET /:id/assignable-oeils ── Picker admin (assign-admin) : champs bruts ──

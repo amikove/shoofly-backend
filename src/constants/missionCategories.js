@@ -74,4 +74,16 @@ function isValidSubcategory(type, subcategory) {
 //     par type) et l'historique complet.
 // Il n'y a donc plus de table de prix à maintenir synchro à la main avec le frontend.
 
-module.exports = { MISSION_SUBCATEGORIES, isValidSubcategory };
+// Logement privé par défaut (chantier « lieu de mission », 2026-09-24, liste validée par BOSS) —
+// tant que le formulaire n'a pas de case « logement privé », le serveur pose
+// missions.is_private_residence à partir du type, toutes sous-catégories et sous-catégorie absente
+// comprises : `immobilier` = visite d'un logement ; `personnalisee` = présence, livraison,
+// accompagnement… souvent au domicile du client. `audit` et `file_attente` visent des lieux
+// publics ou commerciaux → FALSE. Source UNIQUE : db/schema.js lit aussi cette liste pour le
+// rattrapage des missions existantes à la création de la colonne.
+const PRIVATE_RESIDENCE_TYPES = ['immobilier', 'personnalisee'];
+function defaultIsPrivateResidence(type) {
+  return PRIVATE_RESIDENCE_TYPES.includes(type);
+}
+
+module.exports = { MISSION_SUBCATEGORIES, isValidSubcategory, PRIVATE_RESIDENCE_TYPES, defaultIsPrivateResidence };

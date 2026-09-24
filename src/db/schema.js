@@ -2,6 +2,7 @@ const { Pool } = require('pg');
 require('dotenv').config();
 const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
 const SUBCATEGORY_MIN_PRICES_SEED = require('../config/subcategoryMinPricesSeed');
+const { PRIVATE_RESIDENCE_TYPES } = require('../constants/missionCategories');
 
 let pool;
 
@@ -160,9 +161,6 @@ async function initDb() {
       audit_type    TEXT,
       frequency     TEXT,
       criteria      TEXT,
-      oeil_lat      NUMERIC(10,6),
-      oeil_lng      NUMERIC(10,6),
-      oeil_location_at TIMESTAMPTZ,
       assigned_at   TIMESTAMPTZ,
       started_at    TIMESTAMPTZ,
       completed_at  TIMESTAMPTZ,
@@ -354,6 +352,31 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS completed_by_oeil_at TIMESTAMPTZ;
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ;
     ALTER TABLE missions DROP COLUMN IF EXISTS claim_comment; -- colonne morte, jamais utilisée (le vrai commentaire de réclamation est dans claims.comment)
+
+    -- Chantier « lieu de mission » (2026-09-24, décisions BOSS). Suivi GPS de l'Œil : colonnes
+    -- jamais écrites par l'app depuis l'Initial commit (seuls écrivains : POST /missions/:id/
+    -- location et le handler socket location_update, supprimés avec elles, aucun appelant
+    -- frontend), mais servies à tout Œil du pool via SELECT m.* et jamais remises à NULL au
+    -- désassignement — Q6 : suppression plutôt que durcissement.
+    ALTER TABLE missions DROP COLUMN IF EXISTS oeil_lat;
+    ALTER TABLE missions DROP COLUMN IF EXISTS oeil_lng;
+    ALTER TABLE missions DROP COLUMN IF EXISTS oeil_location_at;
+    -- Logement privé : l'adresse (et plus tard la position exacte) n'est servie qu'au cercle
+    -- admin / client propriétaire / Œil assigné — voir utils/missionVisibility.js. Posé à la
+    -- création par le serveur (constants/missionCategories.js, defaultIsPrivateResidence) tant
+    -- que le formulaire n'a pas de case. Missions antérieures : rattrapage UNIQUE dans le même bloc
+    -- que la création de la colonne (décision BOSS, aucune fenêtre où une mission existante serait
+    -- servie non masquée) — jamais rejoué ensuite, une valeur remise à FALSE reste FALSE. Types lus
+    -- dans PRIVATE_RESIDENCE_TYPES (source unique, partagée avec la création). Ce bloc DDL est une
+    -- seule requête multi-instructions : ADD COLUMN et UPDATE sont validés ou annulés ensemble.
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = current_schema() AND table_name = 'missions' AND column_name = 'is_private_residence') THEN
+        ALTER TABLE missions ADD COLUMN is_private_residence BOOLEAN NOT NULL DEFAULT FALSE;
+        UPDATE missions SET is_private_residence = TRUE
+         WHERE type IN (${PRIVATE_RESIDENCE_TYPES.map((t) => `'${t}'`).join(', ')});
+      END IF;
+    END $$;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(10,2) NOT NULL DEFAULT 0;
 
     CREATE TABLE IF NOT EXISTS wallet_transactions (
