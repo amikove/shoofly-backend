@@ -193,7 +193,7 @@
   "cashplusExpiredOeilTitle": "⏳ انتهت صلاحية شحن CashPlus",
   "cashplusExpiredOeilBody": "انتهت صلاحية طلب شحن {{amount}} درهم دون تأكيد. يمكنك إعادة المحاولة.",
   "commissionShortfallAdminTitle": "⚠️ عمولة غير محصلة (دفع نقدي)",
-  "commissionShortfallAdminBody": "{{shortfall}} درهم من العمولة لم يتم تحصيلها على \"{{missionTitle}}\" (رصيد عين ميدانية غير كافٍ).",
+  "commissionShortfallAdminBody": "{{shortfall}} درهم من العمولة لم يتم تحصيلها على \"{{missionTitle}}\" (رصيد العين الميدانية غير كافٍ).",
   "missionEditedByAdminClientTitle": "تم تعديل المهمة",
   "missionEditedByAdminClientBody": "قام مسؤول بتعديل معلومات مهمتك \"{{missionTitle}}\".",
   "missionEditedByAdminOeilTitle": "تم تعديل المهمة",
