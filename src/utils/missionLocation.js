@@ -20,19 +20,21 @@
 //   θ = 2π·u2                               u2 ∈ [0,1)
 //   Δlat = d·cosθ / R_T                      (radians, R_T = rayon terrestre moyen)
 //   Δlng = d·sinθ / (R_T·cos(lat))
-// avec DMIN = 0,4 × 500 = 200 m et DMAX = 0,9 × 500 = 450 m :
-//   - le cercle de 500 m CONTIENT toujours le vrai point : d ≤ 450 m < 500 m. Marge de 50 m,
-//     très au-dessus des erreurs cumulées (approximation plane locale < 1 cm à 450 m ; arrondi
-//     à 6 décimales ≤ 0,08 m par coordonnée, sur le centre) ;
-//   - le centre n'est JAMAIS proche du vrai point : d ≥ 200 m.
-// Un Œil qui voit le cercle sait seulement que le lieu est dans une couronne de 200 à 450 m
-// autour du centre affiché (≈ 0,51 km²), sans direction privilégiée.
+// avec DMIN = 0,4 × R et DMAX = 0,9 × R. Rayon R = 100 m depuis le 2026-09-25 (décision BOSS,
+// 500 m auparavant ; migration unique des zones existantes dans db/schema.js) → DMIN = 40 m,
+// DMAX = 90 m :
+//   - le cercle de 100 m CONTIENT toujours le vrai point : d ≤ 90 m < 100 m. Marge de 10 m,
+//     très au-dessus des erreurs cumulées (approximation plane locale < 1 mm à 90 m ; arrondi
+//     à 6 décimales ≤ 0,08 m par coordonnée, sur le centre, et ≤ 0,08 m sur le point exact) ;
+//   - le centre n'est JAMAIS proche du vrai point : d ≥ 40 m.
+// Un Œil qui voit le cercle sait seulement que le lieu est dans une couronne de 40 à 90 m
+// autour du centre affiché (≈ 2 000 m²), sans direction privilégiée.
 
 const crypto = require('crypto');
 
-const APPROX_RADIUS_M = 500;
-const APPROX_MIN_OFFSET_M = 0.4 * APPROX_RADIUS_M; // 200 m
-const APPROX_MAX_OFFSET_M = 0.9 * APPROX_RADIUS_M; // 450 m
+const APPROX_RADIUS_M = 100; // 500 m jusqu'au 2026-09-25
+const APPROX_MIN_OFFSET_M = 0.4 * APPROX_RADIUS_M; // 40 m
+const APPROX_MAX_OFFSET_M = 0.9 * APPROX_RADIUS_M; // 90 m
 const EARTH_RADIUS_M = 6371008.8;
 
 // Boîte englobante du Maroc (Sahara compris), décision BOSS : rejette aussi l'inversion
@@ -89,7 +91,7 @@ function uniform01() {
 
 // `rand` injectable (tests déterministes) ; par défaut crypto.
 // Nouveau tirage si le centre reprend À L'IDENTIQUE (6 décimales) la latitude ou la longitude
-// exacte — cap quasi plein nord/sud ou est/ouest, probabilité ≈ 2·10⁻⁴ : la valeur exacte
+// exacte — cap quasi plein nord/sud ou est/ouest, probabilité ≈ 10⁻³ avec R = 100 m (2·10⁻⁴ à 500 m) : la valeur exacte
 // n'apparaît ainsi jamais telle quelle dans une réponse (audit textuel sans faux positif). Écarte
 // un ensemble de caps de mesure négligeable, sans effet sur la distribution utile. Borné à 8
 // tirages (un `rand` constant de test renvoie le dernier).

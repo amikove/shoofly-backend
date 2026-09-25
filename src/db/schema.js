@@ -3,6 +3,7 @@ require('dotenv').config();
 const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
 const SUBCATEGORY_MIN_PRICES_SEED = require('../config/subcategoryMinPricesSeed');
 const { PRIVATE_RESIDENCE_TYPES } = require('../constants/missionCategories');
+const { computeApproxCenter } = require('../utils/missionLocation');
 
 let pool;
 
@@ -381,12 +382,19 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
     -- position EXACTE posée par le client (obligatoire à la création côté serveur, voir
     -- prepareMissionInsert ; NULL pour les missions antérieures, aucun rattrapage : pas de
     -- géocodage de l'adresse texte). approx_lat/lng = CENTRE de la zone approximative (rayon
-    -- constant 500 m, utils/missionLocation.js) servie aux Œils non retenus d'un logement privé :
+    -- APPROX_RADIUS_M, utils/missionLocation.js) servie aux Œils non retenus d'un logement privé :
     -- tirée UNE fois à l'écriture de la position exacte, stockée, jamais recalculée par requête.
     -- Bornes : plage mondiale ici (la boîte Maroc est une règle applicative, et le centre
-    -- approximatif d'un point proche de la frontière peut en sortir de quelques centaines de
+    -- approximatif d'un point proche de la frontière peut en sortir de quelques dizaines de
     -- mètres). Chaque paire est complète ou absente, et une position exacte a TOUJOURS sa zone
     -- (aucun chemin d'écriture ne peut poser l'une sans l'autre).
+    -- Migrations de DONNÉES à exécuter une seule fois (voir runDataMigrationOnce, fin d'initDb) :
+    -- une ligne par migration appliquée. Le nom est la clé ; la ligne est écrite dans la MÊME
+    -- transaction que les données migrées (jamais de marqueur sans données, ni l'inverse).
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      name       TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS location_lat NUMERIC(9,6);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS location_lng NUMERIC(9,6);
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS approx_lat NUMERIC(9,6);
@@ -1787,6 +1795,56 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     console.error(`⚠️  I-9 (pg_trgm) indisponible sur cette base — recherche admin non accélérée mais fonctionnelle (Seq Scan) : ${err.message}`);
   }
 
+  // ═══ Zone approximative 500 m → 100 m (décision BOSS, 2026-09-25) ═══
+  // Les centres approx_lat/lng existants ont été tirés à 200–450 m du point (rayon 500 m) : servis
+  // avec approx_radius_m = 100, le cercle ne contiendrait plus le lieu. Recalcul UNIQUE de la zone
+  // de TOUTES les missions qui ont un lieu, avec la formule courante (40–90 m, utils/
+  // missionLocation.js). Jamais rejoué : marqueur dans schema_migrations, écrit dans la même
+  // transaction. Deux instances qui démarrent ensemble : la 2e attend le COMMIT de la 1re sur la
+  // clé primaire, puis ne fait rien. Une erreur fait échouer le démarrage (ROLLBACK : ni marqueur
+  // ni zone modifiée), comme le reste d'initDb.
+  const recomputed = await runDataMigrationOnce(db, 'approx_zone_radius_100m_2026_09_25', async (client) => {
+    const { rows } = await client.query(
+      'SELECT id, location_lat, location_lng FROM missions WHERE location_lat IS NOT NULL ORDER BY id FOR UPDATE'
+    );
+    if (rows.length === 0) return 0;
+    const ids = [], lats = [], lngs = [];
+    for (const r of rows) {
+      const a = computeApproxCenter(Number(r.location_lat), Number(r.location_lng));
+      ids.push(r.id); lats.push(a.lat); lngs.push(a.lng);
+    }
+    await client.query(
+      `UPDATE missions m SET approx_lat = z.lat, approx_lng = z.lng
+         FROM unnest($1::text[], $2::numeric[], $3::numeric[]) AS z(id, lat, lng)
+        WHERE m.id = z.id`,
+      [ids, lats, lngs]
+    );
+    return rows.length;
+  });
+  if (recomputed !== null) console.log(`✅ Zone approximative 100 m : ${recomputed} mission(s) recalculée(s) (migration unique)`);
+
   console.log('✅ PostgreSQL schema ready');
+}
+
+// Exécute fn(client) UNE seule fois pour toute la vie de la base : insère le marqueur « name » dans
+// schema_migrations et migre les données dans la même transaction. Renvoie le résultat de fn, ou
+// null si la migration était déjà appliquée.
+async function runDataMigrationOnce(db, name, fn) {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const { rowCount } = await client.query(
+      'INSERT INTO schema_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING', [name]
+    );
+    if (rowCount === 0) { await client.query('ROLLBACK'); return null; }
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 module.exports = { getDb, initDb, checkDbConnection };
