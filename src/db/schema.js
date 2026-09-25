@@ -377,6 +377,39 @@ CREATE INDEX IF NOT EXISTS idx_interests_mission ON mission_interests(mission_id
          WHERE type IN (${PRIVATE_RESIDENCE_TYPES.map((t) => `'${t}'`).join(', ')});
       END IF;
     END $$;
+    -- Lieu de mission (phase 1 backend, 2026-09-24, décisions BOSS Q1/Q3). location_lat/lng =
+    -- position EXACTE posée par le client (obligatoire à la création côté serveur, voir
+    -- prepareMissionInsert ; NULL pour les missions antérieures, aucun rattrapage : pas de
+    -- géocodage de l'adresse texte). approx_lat/lng = CENTRE de la zone approximative (rayon
+    -- constant 500 m, utils/missionLocation.js) servie aux Œils non retenus d'un logement privé :
+    -- tirée UNE fois à l'écriture de la position exacte, stockée, jamais recalculée par requête.
+    -- Bornes : plage mondiale ici (la boîte Maroc est une règle applicative, et le centre
+    -- approximatif d'un point proche de la frontière peut en sortir de quelques centaines de
+    -- mètres). Chaque paire est complète ou absente, et une position exacte a TOUJOURS sa zone
+    -- (aucun chemin d'écriture ne peut poser l'une sans l'autre).
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS location_lat NUMERIC(9,6);
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS location_lng NUMERIC(9,6);
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS approx_lat NUMERIC(9,6);
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS approx_lng NUMERIC(9,6);
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'missions_location_range_check') THEN
+        ALTER TABLE missions ADD CONSTRAINT missions_location_range_check
+          CHECK ((location_lat IS NULL OR location_lat BETWEEN -90 AND 90) AND (location_lng IS NULL OR location_lng BETWEEN -180 AND 180));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'missions_approx_range_check') THEN
+        ALTER TABLE missions ADD CONSTRAINT missions_approx_range_check
+          CHECK ((approx_lat IS NULL OR approx_lat BETWEEN -90 AND 90) AND (approx_lng IS NULL OR approx_lng BETWEEN -180 AND 180));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'missions_location_pair_check') THEN
+        ALTER TABLE missions ADD CONSTRAINT missions_location_pair_check CHECK ((location_lat IS NULL) = (location_lng IS NULL));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'missions_approx_pair_check') THEN
+        ALTER TABLE missions ADD CONSTRAINT missions_approx_pair_check CHECK ((approx_lat IS NULL) = (approx_lng IS NULL));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'missions_location_has_approx_check') THEN
+        ALTER TABLE missions ADD CONSTRAINT missions_location_has_approx_check CHECK ((location_lat IS NULL) = (approx_lat IS NULL));
+      END IF;
+    END $$;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(10,2) NOT NULL DEFAULT 0;
 
     CREATE TABLE IF NOT EXISTS wallet_transactions (
