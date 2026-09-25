@@ -5,7 +5,16 @@
 // (le client valide visuellement), le lien brut n'est jamais stocké, aucun géocodage de texte.
 //
 // Liens longs (google.<tld>/maps…, maps.google.<tld>/…) : décodés SANS réseau.
-// Liens courts (maps.app.goo.gl/…, goo.gl/maps/…) : on suit la redirection HTTP à la main.
+// Liens courts (maps.app.goo.gl/…, goo.gl/maps/…, share.google/…) : on suit la redirection HTTP
+// à la main. share.google (bouton « Partager » récent de Google, ajouté le 2026-09-25) passe par
+// www.google.com/share.google?q=… puis aboutit souvent à www.google.com/search?q=Nom : une
+// RECHERCHE, pas une carte — traitée comme « lieu nommé » (jamais suivie, aucune requête).
+//
+// Lieu nommé (NAMED_PLACE, 422) : URL Google valide qui désigne le lieu par son NOM sans aucune
+// coordonnée (?q=Nom, ?query=Nom, ftid=/cid=/kgmid=, /maps/place/Nom/data=…!1s<ftid>, recherche
+// google.com/search). La position n'est ni dans l'URL ni dans la page initiale (le centre de la
+// page est celui de l'IP qui la demande — diagnostic du 2026-09-25) : on ne devine jamais, le
+// client pose l'épingle lui-même.
 //
 // Garde-fous SSRF (le serveur ne doit jamais devenir un relais vers autre chose que Google) :
 //   - chaque URL (l'entrée ET chaque saut) passe par new URL() puis une liste blanche d'hôtes
@@ -37,10 +46,11 @@ class MapsLinkError extends Error {
   }
 }
 const ERR = {
-  invalid: () => new MapsLinkError('INVALID_LINK', 400, 'Lien invalide : collez un lien Google Maps (maps.app.goo.gl ou google.com/maps).'),
+  invalid: () => new MapsLinkError('INVALID_LINK', 400, 'Lien invalide : collez un lien Google Maps (maps.app.goo.gl, share.google ou google.com/maps).'),
   refused: () => new MapsLinkError('REDIRECT_REFUSED', 400, 'Lien refusé : la redirection sort de Google Maps.'),
   tooMany: () => new MapsLinkError('TOO_MANY_REDIRECTS', 400, 'Lien refusé : trop de redirections.'),
   unrecognized: () => new MapsLinkError('UNRECOGNIZED', 422, 'Lien non reconnu : placez l\'épingle sur la carte.'),
+  namedPlace: () => new MapsLinkError('NAMED_PLACE', 422, 'Ce lien désigne un lieu par son nom, sans position précise. Dans Google Maps, appuyez longuement sur l\'endroit exact pour poser une épingle, puis Partager ; ou placez directement l\'épingle sur la carte.'),
   timeout: () => new MapsLinkError('TIMEOUT', 504, 'Google Maps n\'a pas répondu à temps : placez l\'épingle sur la carte.'),
   upstream: () => new MapsLinkError('UPSTREAM', 502, 'Impossible de lire ce lien pour le moment : placez l\'épingle sur la carte.'),
 };
@@ -71,8 +81,14 @@ function classify(u) {
   const p = u.pathname;
   if (h === 'maps.app.goo.gl') return p.length > 1 ? 'short' : null;
   if (h === 'goo.gl') return /^\/maps\/./.test(p) ? 'short' : null;
+  if (h === 'share.google') return p.length > 1 ? 'short' : null;
   if (GOOGLE_MAPS_HOST_RE.test(h)) return 'maps';
-  if (GOOGLE_WWW_RE.test(h)) return /^\/maps(\/|$)/.test(p) ? 'maps' : null;
+  if (GOOGLE_WWW_RE.test(h)) {
+    if (/^\/maps(\/|$)/.test(p)) return 'maps';
+    if (p === '/share.google') return 'short'; // étape intermédiaire de share.google
+    if (p === '/search') return 'named';       // recherche web = lieu nommé, jamais suivie
+    return null;
+  }
   if (CONSENT_RE.test(h)) return 'consent';
   return null;
 }
@@ -132,6 +148,14 @@ function decodeMapsUrl(u) {
   return null;
 }
 
+// URL Google sans coordonnées qui désigne néanmoins un lieu (nom, identifiant de fiche) : le
+// client doit poser l'épingle lui-même (message NAMED_PLACE), ce n'est pas un lien cassé.
+function isNamedPlace(u) {
+  if (['q', 'query', 'ftid', 'cid', 'kgmid'].some((k) => u.searchParams.get(k))) return true;
+  if (/^\/maps\/(?:place|search)\/[^/@]+/.test(u.pathname)) return true;
+  return /!1s0x[0-9a-f]+:0x[0-9a-f]+/i.test(u.pathname);
+}
+
 // Le texte partagé par l'app mobile contient souvent un nom de lieu puis le lien : on garde le
 // premier jeton https:// (aucun autre traitement du texte).
 function extractUrl(raw) {
@@ -159,9 +183,10 @@ async function resolveMapsLink(raw, { fetchImpl = globalThis.fetch, timeoutMs = 
   for (;;) {
     if (kind === 'maps') {
       const c = decodeMapsUrl(u);
-      if (!c) throw ERR.unrecognized();
+      if (!c) throw isNamedPlace(u) ? ERR.namedPlace() : ERR.unrecognized();
       return c;
     }
+    if (kind === 'named') throw ERR.namedPlace();
     if (kind === 'consent') {
       if (consentUnwrapped) throw ERR.refused();
       consentUnwrapped = true;
