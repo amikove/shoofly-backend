@@ -3355,7 +3355,7 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
     }
 
     if (mission.payment_method === 'cash') {
-      await notify(db, mission.oeil_id, '✅ Déclaration confirmée', `Le client a confirmé votre déclaration sur "${mission.title}". La mission est clôturée ; un administrateur décidera de la commission (mission payée en espèces).`, 'info', mission.id, emitToUser, null, 'assistanceValidatedPendingCommissionOeilTitle', 'assistanceValidatedPendingCommissionOeilBody', { missionTitle: mission.title });
+      await notify(db, mission.oeil_id, '✅ Déclaration confirmée', `Le client a confirmé votre déclaration sur "${mission.title}". La mission est clôturée.`, 'info', mission.id, emitToUser, null, 'assistanceValidatedPendingCommissionOeilTitle', 'assistanceValidatedPendingCommissionOeilBody', { missionTitle: mission.title });
     } else {
       await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé votre déclaration d'assistance sur "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceValidatedOeilTitle', 'assistanceValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
     }
@@ -3660,7 +3660,7 @@ router.post('/assistance-requests/:id/commission', authenticate, requireRole('ad
       'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { missionTitle: mission.title, amount: cashSettlement.collected });
   } else {
     await notify(db, mission.oeil_id, 'Commission libérée',
-      `Un administrateur a décidé de ne pas prélever de commission sur "${mission.title}".`,
+      `Aucune commission n'est prélevée sur "${mission.title}".`,
       'info', mission.id, emitToUser, null, 'commissionReleasedOeilTitle', 'commissionReleasedOeilBody', { missionTitle: mission.title });
   }
   // Chantier notifications (2026-09-14), Partie C/G3 — no-op si decision==='release' (cashSettlement reste null) ou pas de manque à gagner.
@@ -5273,7 +5273,7 @@ async function checkAssistanceRequestExpiry(db, io, emitToUser) {
       if (mission.payment_method !== 'cash') {
         await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Délai écoulé sans réponse du client — "${mission.title}" clôturée, ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedOeilTitle', 'assistanceAutoValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
       } else {
-        await notify(db, mission.oeil_id, 'Mission clôturée automatiquement', `Délai écoulé sans réponse du client — "${mission.title}" clôturée. La décision concernant la commission (débitée ou libérée) vous sera communiquée séparément par un administrateur.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedPendingCommissionOeilTitle', 'assistanceAutoValidatedPendingCommissionOeilBody', { missionTitle: mission.title });
+        await notify(db, mission.oeil_id, 'Mission clôturée automatiquement', `Délai écoulé sans réponse du client — "${mission.title}" clôturée.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedPendingCommissionOeilTitle', 'assistanceAutoValidatedPendingCommissionOeilBody', { missionTitle: mission.title });
       }
       await notify(db, mission.client_id, 'Mission clôturée automatiquement', `Vous n'avez pas répondu à temps concernant "${mission.title}" — la déclaration de l'Œil a été considérée comme acceptée.`, 'info', mission.id, emitToUser, null, 'assistanceAutoValidatedClientTitle', 'assistanceAutoValidatedClientBody', { missionTitle: mission.title });
 

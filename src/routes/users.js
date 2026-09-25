@@ -2078,7 +2078,7 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
     if (cashSettlement) {
       await notify(mission.oeil_id, '✅ Réclamation résolue', `Résolue en votre faveur. ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { amount: cashSettlement.collected });
     } else if (isClientAbsent) {
-      await notify(mission.oeil_id, '✅ Réclamation résolue', "Résolue en votre faveur. La décision concernant la commission (débitée ou libérée) vous sera communiquée séparément par un administrateur.", 'claimResolvedOeilWinPendingCommissionTitle', 'claimResolvedOeilWinPendingCommissionBody', null);
+      await notify(mission.oeil_id, '✅ Réclamation résolue', "Résolue en votre faveur.", 'claimResolvedOeilWinPendingCommissionTitle', 'claimResolvedOeilWinPendingCommissionBody', null);
     } else {
       await notify(mission.oeil_id, '✅ Réclamation résolue', 'Résolue en votre faveur. Paiement crédité.', 'claimResolvedOeilWinTitle', 'claimResolvedOeilWinBody', null);
     }
@@ -2191,7 +2191,7 @@ router.post('/admin/claims/:missionId/commission', authenticate, requireRole('ad
       'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { missionTitle: mission.title, amount: cashSettlement.collected });
   } else {
     await missionRoutes.notify(db, mission.oeil_id, 'Commission libérée',
-      `Un administrateur a décidé de ne pas prélever de commission sur "${mission.title}".`,
+      `Aucune commission n'est prélevée sur "${mission.title}".`,
       'info', mission.id, emitToUser, null, 'commissionReleasedOeilTitle', 'commissionReleasedOeilBody', { missionTitle: mission.title });
   }
   // Chantier notifications (2026-09-14), Partie C/G3 — no-op si decision==='release' (cashSettlement reste null) ou pas de manque à gagner.
