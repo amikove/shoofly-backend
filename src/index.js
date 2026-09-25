@@ -280,13 +280,16 @@ app.use('/api/payments', paymentRoutes);
 app.use('/api/block-appeals', blockAppealRoutes);
 app.use('/api/push', pushRoutes);
 
+// Hash court du commit déployé (variable fournie par Render) — permet de vérifier quelle
+// version tourne en production. « local » hors Render.
+const DEPLOYED_VERSION = (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || 'local';
 app.get('/health', async (_, res) => {
   try {
     await checkDbConnection();
-    res.json({ status: 'ok', db: 'ok', timestamp: new Date().toISOString() });
+    res.json({ status: 'ok', db: 'ok', version: DEPLOYED_VERSION, timestamp: new Date().toISOString() });
   } catch (err) {
     console.error('❌ /health DB check failed:', err.message);
-    res.status(503).json({ status: 'error', db: 'unreachable', timestamp: new Date().toISOString() });
+    res.status(503).json({ status: 'error', db: 'unreachable', version: DEPLOYED_VERSION, timestamp: new Date().toISOString() });
   }
 });
 app.get('/api', (_, res) => res.json({ name: 'SHOOFLY API', version: '1.0.0' }));
