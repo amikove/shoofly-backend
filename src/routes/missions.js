@@ -21,6 +21,11 @@ const Sentry = require('@sentry/node');
 const { resolveQuartier, validateCityInput } = require('../constants/villes');
 const { isValidSubcategory, defaultIsPrivateResidence } = require('../constants/missionCategories');
 const { serializeMissionFor, serializeProposedChangesFor } = require('../utils/missionVisibility');
+const {
+  validateLocationPair, validatePrivateFlag, computeApproxCenter, withApproxZone,
+  PRIVACY_FLAG_LOCK_SQL, PRIVACY_FLAG_LOCKED_ERROR, isPrivacyFlagLocked,
+} = require('../utils/missionLocation');
+const { resolveMapsLink, MapsLinkError } = require('../utils/mapsLink');
 const { getSubcategoryMinPrice, loadSubcategoryMinPricesMap } = require('../utils/subcategoryMinPrices');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
 const { checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins } = require('../utils/cashCommission');
@@ -261,6 +266,16 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
     return { error: 'Sous-catégorie invalide pour ce type de mission' };
   }
 
+  // Lieu de mission (Q1, 2026-09-24) — OBLIGATOIRE à la création, sur les deux chemins qui
+  // passent ici (POST /missions et POST /payments/payzone/init). Paire validée et arrondie
+  // (utils/missionLocation.js) ; la zone approximative n'est PAS tirée ici mais à l'écriture
+  // (insertMissionRecord), une seule fois.
+  const location = validateLocationPair(body.location_lat, body.location_lng, { required: true });
+  if (location.error) return { error: location.error };
+  // Logement privé (Q4) : fourni par le client, booléen strict ; absent → règle par type.
+  const privateFlag = validatePrivateFlag(body.is_private_residence);
+  if (privateFlag.error) return { error: privateFlag.error };
+
   // oeil_id fourni par le client (réservation directe depuis sa fiche) — jamais fait confiance
   // sans revalidation serveur (audit croisé 2026-07-26, Partie E ; commit 25d88be). Logique
   // désormais partagée avec hireOeilCore et POST /:id/assign-admin via checkOeilAssignable
@@ -372,10 +387,12 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
       property_type, visit_type, video_call, institution, purpose,
       company_name, audit_type, frequency, criteria, subcategory,
       promo_code, discount, replacement_preference, status, payment_method: paymentMethod,
-      // Posé côté serveur à partir du type (constants/missionCategories.js) — le formulaire n'a
-      // pas encore de case « logement privé », body.is_private_residence est donc ignoré. Voyage
-      // dans `insert`, donc aussi dans le mission_payload stocké par PayZone.
-      is_private_residence: defaultIsPrivateResidence(type),
+      // Valeur du client si fournie (booléen strict), sinon défaut par type
+      // (constants/missionCategories.js). Voyage dans `insert`, donc aussi dans le
+      // mission_payload stocké par PayZone, avec la position exacte.
+      is_private_residence: privateFlag.value !== undefined ? privateFlag.value : defaultIsPrivateResidence(type),
+      location_lat: location.lat,
+      location_lng: location.lng,
     },
     freePromo,
   };
@@ -400,6 +417,12 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
   const isPrivateResidence = typeof insertData.is_private_residence === 'boolean'
     ? insertData.is_private_residence
     : defaultIsPrivateResidence(type);
+  // Lieu : revalidé ici (le payload PayZone est relu depuis la base) puis zone approximative
+  // tirée UNE fois, à cette écriture. Payload PayZone stocké avant le déploiement (sans lieu) :
+  // mission créée sans lieu, comme une mission ancienne — le paiement est déjà encaissé.
+  const location = validateLocationPair(insertData.location_lat ?? undefined, insertData.location_lng ?? undefined);
+  if (location.error) throw new Error(`insertMissionRecord: lieu invalide (${location.error})`);
+  const approx = location.lat !== null ? computeApproxCenter(location.lat, location.lng) : { lat: null, lng: null };
 
   // C-3 (audit perf/concurrence 2026-09-19/21) — un code promo GRATUIT (Shoofly paie l'Œil,
   // platform_amount) pouvait être consommé plusieurs fois par le même client via 2 créations de
@@ -445,8 +468,8 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
       duration_est,price,commission,oeil_earning,is_urgent,
       property_type,visit_type,video_call,institution,purpose,
       company_name,audit_type,frequency,criteria,oeil_id,replacement_preference,payment_method,
-      is_private_residence
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
+      is_private_residence, location_lat, location_lng, approx_lat, approx_lng
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
     RETURNING *
   `, [
     id, clientId, type, subcategory||null, status, title, description||null, address, city, quartier,
@@ -454,7 +477,7 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
     !!is_urgent, property_type||null, visit_type||null, !!video_call,
     institution||null, purpose||null, company_name||null, audit_type||null,
     frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast', payment_method,
-    isPrivateResidence
+    isPrivateResidence, location.lat, location.lng, approx.lat, approx.lng
   ]);
 
   // Mission offerte via code promo gratuit : Shoofly paie l'Œil de sa poche, sans commission générée.
@@ -1157,6 +1180,8 @@ function missionCreateFingerprint(insert) {
     insert.city, insert.quartier, new Date(insert.scheduled_at).toISOString(),
     insert.duration_est ?? null, +insert.price, insert.oeil_id || null,
     insert.subcategory || null, insert.payment_method,
+    // Lieu de mission (2026-09-24) : deux épingles différentes = deux créations différentes.
+    insert.location_lat ?? null, insert.location_lng ?? null,
   ];
   return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 }
@@ -1297,7 +1322,7 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), miss
 
   await db.query(`UPDATE mission_create_locks SET mission_id=$1 WHERE client_id=$2 AND fingerprint=$3`, [mission.id, req.user.id, fingerprint]);
 
-  res.status(201).json({ mission });
+  res.status(201).json({ mission: serializeMissionFor(req.user, mission) });
 
   // Mise en fond (audit santé technique 2026-09-18, §3.7) : notifyNewMission n'est plus attendue
   // avant la réponse — son coût (notifications à tous les Œils éligibles de la ville, désormais
@@ -1313,6 +1338,37 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), miss
       extra: { missionId: mission.id },
     });
   });
+}));
+
+// ── POST /missions/resolve-maps-link ── Lien Google Maps collé → { lat, lng } ──────────────
+// (chantier « lieu de mission », 2026-09-24, audit §3.3). Réservée au client authentifié (seul
+// rôle qui pose un lieu) et limitée PAR COMPTE — jamais un relais ouvert vers Google. Toute la
+// logique réseau (liste blanche, redirections manuelles ≤ 3, délai 5 s, corps jamais lu,
+// consent.google.com) vit dans utils/mapsLink.js. Réponse = { lat, lng } seulement, déjà passés
+// par la même validation qu'à la création (boîte Maroc, 6 décimales) ; rien n'est stocké.
+const mapsLinkLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  keyGenerator: byUserId,
+  message: { error: 'Trop de liens analysés depuis ce compte. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+router.post('/resolve-maps-link', authenticate, requireRole('client'), mapsLinkLimiter, asyncHandler(async (req, res) => {
+  const raw = req.body?.url;
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return res.status(400).json({ error: 'Lien manquant.', code: 'INVALID_LINK' });
+  }
+  let coords;
+  try {
+    coords = await resolveMapsLink(raw);
+  } catch (e) {
+    if (e instanceof MapsLinkError) return res.status(e.status).json({ error: e.message, code: e.code });
+    throw e;
+  }
+  const location = validateLocationPair(coords.lat, coords.lng, { required: true });
+  if (location.error) return res.status(422).json({ error: location.error, code: 'OUT_OF_AREA' });
+  res.json({ lat: location.lat, lng: location.lng });
 }));
 
 // ── PUT /missions/:id ── Client modifie sa mission après création ──────────
@@ -1375,6 +1431,28 @@ function validateMissionEditFields(body, mission) {
     if (!['fast', 'choose'].includes(body.replacement_preference)) return { error: 'Préférence de remplacement invalide' };
     changes.replacement_preference = body.replacement_preference;
   }
+  // Lieu de mission (2026-09-24) — FACULTATIF en modification (missions anciennes sans lieu),
+  // mais une fois envoyée la paire suit les mêmes règles qu'à la création ; null n'efface pas
+  // un lieu (400). Une position identique à l'actuelle n'est pas un changement : la zone
+  // approximative n'est tirée à nouveau que si la position exacte change (withApproxZone, à
+  // l'application — jamais stockée dans proposed_changes).
+  if ('location_lat' in body || 'location_lng' in body) {
+    const location = validateLocationPair(body.location_lat, body.location_lng, { required: true });
+    if (location.error) return { error: location.error };
+    const same = mission.location_lat != null
+      && Number(mission.location_lat) === location.lat && Number(mission.location_lng) === location.lng;
+    if (!same) {
+      changes.location_lat = location.lat;
+      changes.location_lng = location.lng;
+    }
+  }
+  // Logement privé (Q4) — booléen strict ; une valeur identique n'est pas un changement. Le
+  // verrou « un Œil a postulé » est appliqué par les routes (lecture DB), pas ici.
+  if ('is_private_residence' in body) {
+    const privateFlag = validatePrivateFlag(body.is_private_residence);
+    if (privateFlag.error) return { error: privateFlag.error };
+    if (privateFlag.value !== mission.is_private_residence) changes.is_private_residence = privateFlag.value;
+  }
 
   // type/subcategory : jamais atteints par le client (bloqués en amont par FORBIDDEN_EDIT_FIELDS
   // sur PUT /:id) — n'existent ici que pour PUT /:id/admin-edit (Super Admin, PROMPT 1 point 2,
@@ -1398,16 +1476,33 @@ function validateMissionEditFields(body, mission) {
 }
 
 // Applique un objet de changements validés sur la mission — réutilisé par l'application
-// directe (mission pending) et par l'approbation d'une demande de modification (mission assigned).
-async function applyMissionEditChanges(db, missionId, changes) {
-  const keys = Object.keys(changes);
+// directe (mission pending), par l'admin-edit et par l'approbation d'une demande de
+// modification (mission assigned). Une nouvelle position exacte y reçoit sa NOUVELLE zone
+// approximative (withApproxZone). opts.guardSql : condition AND-ée au WHERE (ex. statut, verrou
+// « logement privé ») — renvoie undefined si la ligne n'y satisfait plus.
+async function applyMissionEditChanges(db, missionId, changes, opts = {}) {
+  const full = withApproxZone(changes);
+  const keys = Object.keys(full);
   const setClauses = keys.map((k, i) => `${k}=$${i + 1}`);
-  const values = keys.map(k => changes[k]);
+  const values = keys.map(k => full[k]);
+  const guard = opts.guardSql ? ` AND ${opts.guardSql}` : '';
   const { rows: [updated] } = await db.query(
-    `UPDATE missions SET ${setClauses.join(', ')}, updated_at=NOW() WHERE id=$${values.length + 1} RETURNING *`,
+    `UPDATE missions SET ${setClauses.join(', ')}, updated_at=NOW() WHERE id=$${values.length + 1}${guard} RETURNING *`,
     [...values, missionId]
   );
   return updated;
+}
+
+// Verrou du caractère « logement privé » (Q4) pour PUT /:id et admin-edit : 400 explicite si un
+// Œil a déjà postulé (définition : utils/missionLocation.js, PRIVACY_FLAG_LOCK_SQL). Le même
+// prédicat garde ensuite l'UPDATE lui-même (candidature concurrente entre ce contrôle et
+// l'écriture) — voir privacyGuardSql.
+async function privacyFlagLockError(db, mission, changes) {
+  if (!('is_private_residence' in changes)) return null;
+  return (await isPrivacyFlagLocked(db, mission.id)) ? PRIVACY_FLAG_LOCKED_ERROR : null;
+}
+function privacyGuardSql(changes) {
+  return 'is_private_residence' in changes ? `NOT ${PRIVACY_FLAG_LOCK_SQL}` : null;
 }
 
 router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
@@ -1432,15 +1527,23 @@ router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req,
   if ('scheduled_at' in changes && isScheduledAtTooFarInPast(changes.scheduled_at)) {
     return res.status(400).json({ error: 'La date de la mission doit être dans le futur' });
   }
+  // Logement privé verrouillé dès qu'un Œil a postulé (Q4) — avant toute branche : une mission
+  // assignée l'est forcément, aucune demande de modification ne peut donc le porter.
+  const lockError = await privacyFlagLockError(db, mission, changes);
+  if (lockError) return res.status(400).json({ error: lockError, code: 'PRIVATE_RESIDENCE_LOCKED' });
 
   if (mission.status === 'pending') {
-    const { rows: [updated] } = await db.query(
-      `UPDATE missions SET ${Object.keys(changes).map((k, i) => `${k}=$${i + 1}`).join(', ')}, updated_at=NOW()
-       WHERE id=$${Object.keys(changes).length + 1} AND status='pending' RETURNING *`,
-      [...Object.values(changes), mission.id]
-    );
-    if (!updated) return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
-    return res.json({ mission: updated, applied: true });
+    // Même UPDATE qu'avant (garde status='pending'), via applyMissionEditChanges pour la zone
+    // approximative d'une nouvelle position ; + garde du verrou si le caractère privé change.
+    const guards = [`status='pending'`, privacyGuardSql(changes)].filter(Boolean);
+    const updated = await applyMissionEditChanges(db, mission.id, changes, { guardSql: guards.join(' AND ') });
+    if (!updated) {
+      if (await privacyFlagLockError(db, mission, changes)) {
+        return res.status(400).json({ error: PRIVACY_FLAG_LOCKED_ERROR, code: 'PRIVATE_RESIDENCE_LOCKED' });
+      }
+      return res.status(409).json({ error: 'Cette mission a changé de statut entre-temps, veuillez rafraîchir.' });
+    }
+    return res.json({ mission: serializeMissionFor(req.user, updated), applied: true });
   }
 
   if (mission.status === 'assigned') {
@@ -1541,6 +1644,10 @@ router.put('/:id/admin-edit', authenticate, requireRole('admin'), requireSuperAd
   const { error, changes } = validateMissionEditFields(req.body, mission);
   if (error) return res.status(400).json({ error });
   if (Object.keys(changes).length === 0) return res.status(400).json({ error: 'Aucun champ à modifier' });
+  // Verrou « logement privé » (Q4) : s'applique aussi au Super Admin — cocher après coup ne
+  // « dé-révèle » pas une position déjà servie, décocher révélerait l'exact à tout le pool.
+  const lockError = await privacyFlagLockError(db, mission, changes);
+  if (lockError) return res.status(400).json({ error: lockError, code: 'PRIVATE_RESIDENCE_LOCKED' });
 
   // Avant/après par champ, capturé sur la ligne encore non modifiée — from doit refléter la valeur
   // réellement remplacée, jamais une reconstruction après l'UPDATE.
@@ -1549,7 +1656,8 @@ router.put('/:id/admin-edit', authenticate, requireRole('admin'), requireSuperAd
     auditChanges[key] = { from: mission[key], to: changes[key] };
   }
 
-  const updated = await applyMissionEditChanges(db, mission.id, changes);
+  const updated = await applyMissionEditChanges(db, mission.id, changes, { guardSql: privacyGuardSql(changes) });
+  if (!updated) return res.status(400).json({ error: PRIVACY_FLAG_LOCKED_ERROR, code: 'PRIVATE_RESIDENCE_LOCKED' });
 
   await db.query(
     `INSERT INTO mission_admin_edits (mission_id, admin_id, changes) VALUES ($1,$2,$3)`,
@@ -1573,7 +1681,7 @@ router.put('/:id/admin-edit', authenticate, requireRole('admin'), requireSuperAd
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: updated.status });
   io.to('room:admin').emit('mission_updated', updated);
 
-  res.json({ mission: updated, changes: auditChanges });
+  res.json({ mission: serializeMissionFor(req.user, updated), changes: auditChanges });
 }));
 
 // ── GET /missions/:id/admin-edits ── Historique des éditions Super Admin sur une mission ──
@@ -1766,7 +1874,7 @@ router.post('/edit-requests/:id/cancel', authenticate, requireRole('client'), as
     'editRequestWithdrawnOeilTitle', 'editRequestWithdrawnOeilBody', { missionTitle: mission.title }
   );
 
-  res.json({ mission, edit_request: { ...editRequest, status: 'cancelled' } });
+  res.json({ mission: serializeMissionFor(req.user, mission), edit_request: { ...editRequest, status: 'cancelled' } });
 }));
 
 
