@@ -3328,18 +3328,18 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
   if (mission.status !== 'sous_reclamation') return res.status(409).json({ error: 'Cette demande a déjà été traitée' });
 
   if (action === 'validate') {
-    // Rempli uniquement pour payment_method='cash' — voir POST /:id/validate ci-dessus pour la
-    // même logique et sa justification détaillée.
-    let cashSettlement = null;
     try {
       await walletService.withTransaction(db, async (client) => {
         // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
         // symétrie NULL que POST /:id/validate ci-dessus (voir son commentaire détaillé).
         if (mission.payment_method !== 'cash') {
           await walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning, 'Assistance mission validée par le client (paiement intégral)', mission.id);
-        } else {
-          cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (assistance validée par le client)');
         }
+        // else (cash) — décision BOSS 2026-09-25 (option B.1) : AUCUN débit de commission ici.
+        // Une déclaration de « problème » laisse un doute sur le règlement réel en espèces : comme
+        // pour l'auto-validation (silence du client, checkAssistanceRequestExpiry), commission_decision
+        // reste NULL et la déclaration rejoint la file admin (POST /assistance-requests/:id/commission,
+        // qui accepte désormais validated ET auto_validated).
         await transitionMission(client, mission.id, 'sous_reclamation', 'completed', req.user.id, {
           extraFields: { validated_at: 'NOW()', is_priority: false },
           note: 'Assistance mission validée par le client',
@@ -3354,14 +3354,13 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
       throw e;
     }
 
-    if (cashSettlement) {
-      await notify(db, mission.oeil_id, '✅ Confirmé', `Le client a validé votre déclaration d'assistance sur "${mission.title}". ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { missionTitle: mission.title, amount: cashSettlement.collected });
+    if (mission.payment_method === 'cash') {
+      await notify(db, mission.oeil_id, '✅ Déclaration confirmée', `Le client a confirmé votre déclaration sur "${mission.title}". La mission est clôturée ; un administrateur décidera de la commission (mission payée en espèces).`, 'info', mission.id, emitToUser, null, 'assistanceValidatedPendingCommissionOeilTitle', 'assistanceValidatedPendingCommissionOeilBody', { missionTitle: mission.title });
     } else {
       await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé votre déclaration d'assistance sur "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'assistanceValidatedOeilTitle', 'assistanceValidatedOeilBody', { missionTitle: mission.title, amount: mission.oeil_earning });
     }
     await notify(db, mission.client_id, '✅ Confirmé', `Vous avez validé la déclaration de l'Œil pour "${mission.title}".`, 'info', mission.id, emitToUser, null, 'assistanceValidatedClientTitle', 'assistanceValidatedClientBody', { missionTitle: mission.title });
-    // Chantier notifications (2026-09-14), Partie C/G3 — no-op si pas de manque à gagner.
-    await notifyShortfallAdmins(db, mission, cashSettlement, emitToUser);
+    // (manque à gagner : notifié par POST /assistance-requests/:id/commission, au moment du débit)
 
     if (io) {
       io.to('room:admin').emit('mission_updated', { id: mission.id, status: 'completed' });
@@ -3610,7 +3609,9 @@ router.post('/assistance-requests/:id/requalify', authenticate, requireRole('adm
   });
 }));
 
-// ── POST /missions/assistance-requests/:id/commission ── Admin décide de la commission (auto-validation 12h, cash) ──
+// ── POST /missions/assistance-requests/:id/commission ── Admin décide de la commission (déclaration cash confirmée ou auto-validée) ──
+// Depuis le 2026-09-25 (décision BOSS, option B.1) : aussi pour une déclaration VALIDÉE par le
+// client (status='validated') — en cash, la validation client ne débite plus rien d'office.
 // (PROMPT 2, 2026-08-17, section 0) — pendant de POST /admin/claims/:missionId/commission
 // (routes/users.js) pour la voie SILENCIEUSE (checkAssistanceRequestExpiry plus bas) : une
 // mission cash auto-validée à 12h laisse volontairement la commission en attente
@@ -3628,8 +3629,8 @@ router.post('/assistance-requests/:id/commission', authenticate, requireRole('ad
 
   const { rows: [assistanceRequest] } = await db.query('SELECT * FROM mission_assistance_requests WHERE id=$1', [req.params.id]);
   if (!assistanceRequest) return res.status(404).json({ error: 'Déclaration d\'assistance introuvable' });
-  if (assistanceRequest.category !== 'mission' || assistanceRequest.status !== 'auto_validated') {
-    return res.status(400).json({ error: 'Décision commission réservée aux déclarations auto-validées après délai (silence du client).' });
+  if (assistanceRequest.category !== 'mission' || !['validated', 'auto_validated'].includes(assistanceRequest.status)) {
+    return res.status(400).json({ error: 'Décision commission réservée aux déclarations confirmées par le client ou auto-validées après délai.' });
   }
 
   const { rows: [mission] } = await db.query('SELECT * FROM missions WHERE id=$1', [assistanceRequest.mission_id]);
@@ -3646,14 +3647,16 @@ router.post('/assistance-requests/:id/commission', authenticate, requireRole('ad
   let cashSettlement = null;
   if (decision === 'debit') {
     await walletService.withTransaction(db, async (client) => {
-      cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (assistance auto-validée, décision admin différée)');
+      cashSettlement = await settleCashCommission(client, mission, assistanceRequest.status === 'validated'
+        ? 'Commission Shoofly — mission cash (assistance confirmée par le client, décision admin)'
+        : 'Commission Shoofly — mission cash (assistance auto-validée, décision admin différée)');
     });
   }
 
   const emitToUser = req.app.get('emitToUser');
   if (decision === 'debit') {
     await notify(db, mission.oeil_id, 'Commission débitée',
-      `Suite à l'auto-validation de votre déclaration sur "${mission.title}", ${cashSettlement.collected} MAD de commission ont été débités de votre wallet (mission cash).`,
+      `Suite à la clôture de votre déclaration sur "${mission.title}", ${cashSettlement.collected} MAD de commission ont été débités de votre wallet (mission cash).`,
       'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { missionTitle: mission.title, amount: cashSettlement.collected });
   } else {
     await notify(db, mission.oeil_id, 'Commission libérée',
@@ -3679,7 +3682,7 @@ router.get('/assistance-requests/commission-pending', authenticate, requireRole(
     FROM mission_assistance_requests ar
     JOIN missions m ON m.id = ar.mission_id
     JOIN users o ON o.id = m.oeil_id
-    WHERE ar.category='mission' AND ar.status='auto_validated' AND m.payment_method='cash' AND ar.commission_decision IS NULL
+    WHERE ar.category='mission' AND ar.status IN ('validated','auto_validated') AND m.payment_method='cash' AND ar.commission_decision IS NULL
     ORDER BY ar.responded_at ASC
   `);
   res.json({ assistance_requests: rows });

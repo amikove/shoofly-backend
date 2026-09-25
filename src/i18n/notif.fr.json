@@ -73,6 +73,8 @@
   "assistanceUrgenceRequalifiedOeilTitle": "Déclaration d'urgence requalifiée",
   "assistanceUrgenceRequalifiedOeilBody": "Un administrateur a examiné votre déclaration d'urgence sur la mission \"{{missionTitle}}\" et l'a jugée non légitime.",
   "commissionReleasedOeilTitle": "Commission libérée",
+  "assistanceValidatedPendingCommissionOeilTitle": "✅ Déclaration confirmée",
+  "assistanceValidatedPendingCommissionOeilBody": "Le client a confirmé votre déclaration sur \"{{missionTitle}}\". La mission est clôturée ; un administrateur décidera de la commission (mission payée en espèces).",
   "commissionReleasedOeilBody": "Un administrateur a décidé de ne pas prélever de commission sur \"{{missionTitle}}\".",
   "oeilResumedAfterH30ClientTitle": "✅ Votre Œil est de retour",
   "oeilResumedAfterH30ClientBody": "L'Œil initialement assigné à \"{{missionTitle}}\" est finalement arrivé et reprend la mission.",
