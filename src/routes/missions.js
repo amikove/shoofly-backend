@@ -3330,6 +3330,16 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
   if (action === 'validate') {
     try {
       await walletService.withTransaction(db, async (client) => {
+        // SC-4 / C-4 (audit scalabilité 2026-09-26) : la transaction COMMENCE par prendre la
+        // déclaration, gardée par status='pending' (même arbitre que la branche « contester »
+        // plus bas). Avant, « valider » ‖ « contester » réussissaient tous les deux (mesuré 4/6 :
+        // mission payée ET demande contestée). Le verrou de ligne sérialise les deux réponses ;
+        // la perdante ne voit plus 'pending' → 409, sans aucune écriture.
+        const { rows: [taken] } = await client.query(
+          `UPDATE mission_assistance_requests SET status='validated', responded_at=NOW(), client_comment=$1 WHERE id=$2 AND status='pending' RETURNING id`,
+          [comment?.trim() || null, assistanceRequest.id]
+        );
+        if (!taken) throw Object.assign(new Error('Cette demande a déjà été traitée'), { code: 'ASSISTANCE_ALREADY_HANDLED' });
         // CONSTAT 04 (audit-360) : !== 'cash' plutôt que === 'payzone' — même correctif de
         // symétrie NULL que POST /:id/validate ci-dessus (voir son commentaire détaillé).
         if (mission.payment_method !== 'cash') {
@@ -3344,13 +3354,9 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
           extraFields: { validated_at: 'NOW()', is_priority: false },
           note: 'Assistance mission validée par le client',
         });
-        await client.query(
-          `UPDATE mission_assistance_requests SET status='validated', responded_at=NOW(), client_comment=$1 WHERE id=$2`,
-          [comment?.trim() || null, assistanceRequest.id]
-        );
       });
     } catch (e) {
-      if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+      if (e instanceof MissionTransitionError || e.code === 'ASSISTANCE_ALREADY_HANDLED') return res.status(409).json({ error: e.message });
       throw e;
     }
 
@@ -3379,27 +3385,44 @@ router.post('/:id/assistance/respond', authenticate, requireRole('client'), asyn
 
   const ticketId = uuidv4();
   const reference = await generateUniqueReference(db);
-  const { rows: [ticket] } = await db.query(
-    `INSERT INTO support_tickets (id, reference, user_id, user_role, category, subcategory, mission_id, initial_message, is_urgent, last_user_message_at)
-     VALUES ($1,$2,$3,'client','mission',$4,$5,$6,false,NOW()) RETURNING *`,
-    [ticketId, reference, req.user.id, assistanceRequest.reason, mission.id,
-     `[Litige assistance mission] L'Œil a déclaré : "${assistanceRequest.reason}". Le client conteste : "${trimmedComment}"`]
-  );
-  await db.query(
-    `INSERT INTO ticket_messages (ticket_id, sender_id, sender_role, content) VALUES ($1,$2,'client',$3)`,
-    [ticket.id, req.user.id, trimmedComment]
-  );
-  await db.query(`UPDATE missions SET under_surveillance=true, updated_at=NOW() WHERE id=$1`, [mission.id]);
+  // SC-4 / C-4 (audit scalabilité 2026-09-26) : toutes les écritures en UNE transaction qui commence par
+  // prendre la déclaration (status='pending' → 'disputed', RETURNING). Avant : 5 écritures
+  // autonomes sans garde — double « contester » → 2 tickets + HTTP 500 (doublon claims), et
+  // « valider » ‖ « contester » → mission payée ET demande contestée. Le verrou de ligne sérialise
+  // toutes les réponses à cette déclaration ; la perdante sort en 409 sans rien écrire.
+  let ticket;
+  try {
+    ticket = await walletService.withTransaction(db, async (client) => {
+      const { rows: [taken] } = await client.query(
+        `UPDATE mission_assistance_requests SET status='disputed', responded_at=NOW(), client_comment=$1 WHERE id=$2 AND status='pending' RETURNING id`,
+        [trimmedComment, assistanceRequest.id]
+      );
+      if (!taken) throw Object.assign(new Error('Cette demande a déjà été traitée'), { code: 'ASSISTANCE_ALREADY_HANDLED' });
 
-  // Entrée claims — branche ce litige sur l'arbitrage admin existant (PUT /admin/claims/
-  // :missionId/resolve), déjà valable ici car cette route ne dépend que de
-  // mission.status='sous_reclamation', pas de l'origine de la réclamation.
-  await db.query(`INSERT INTO claims (mission_id, client_id, comment) VALUES ($1,$2,$3)`, [mission.id, req.user.id, trimmedComment]);
+      const { rows: [created] } = await client.query(
+        `INSERT INTO support_tickets (id, reference, user_id, user_role, category, subcategory, mission_id, initial_message, is_urgent, last_user_message_at)
+         VALUES ($1,$2,$3,'client','mission',$4,$5,$6,false,NOW()) RETURNING *`,
+        [ticketId, reference, req.user.id, assistanceRequest.reason, mission.id,
+         `[Litige assistance mission] L'Œil a déclaré : "${assistanceRequest.reason}". Le client conteste : "${trimmedComment}"`]
+      );
+      await client.query(
+        `INSERT INTO ticket_messages (ticket_id, sender_id, sender_role, content) VALUES ($1,$2,'client',$3)`,
+        [created.id, req.user.id, trimmedComment]
+      );
+      // Lien posé après l'INSERT du ticket (clé étrangère immédiate sur support_ticket_id).
+      await client.query(`UPDATE mission_assistance_requests SET support_ticket_id=$1 WHERE id=$2`, [created.id, assistanceRequest.id]);
+      await client.query(`UPDATE missions SET under_surveillance=true, updated_at=NOW() WHERE id=$1`, [mission.id]);
 
-  await db.query(
-    `UPDATE mission_assistance_requests SET status='disputed', responded_at=NOW(), client_comment=$1, support_ticket_id=$2 WHERE id=$3`,
-    [trimmedComment, ticket.id, assistanceRequest.id]
-  );
+      // Entrée claims — branche ce litige sur l'arbitrage admin existant (PUT /admin/claims/
+      // :missionId/resolve), déjà valable ici car cette route ne dépend que de
+      // mission.status='sous_reclamation', pas de l'origine de la réclamation.
+      await client.query(`INSERT INTO claims (mission_id, client_id, comment) VALUES ($1,$2,$3)`, [mission.id, req.user.id, trimmedComment]);
+      return created;
+    });
+  } catch (e) {
+    if (e.code === 'ASSISTANCE_ALREADY_HANDLED') return res.status(409).json({ error: e.message });
+    throw e;
+  }
 
   const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin'`);
   for (const admin of admins) {
