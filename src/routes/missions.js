@@ -4685,12 +4685,14 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
   // Un lot (ou une fenêtre de départage) est déjà en cours : les opts ci-dessus ont déjà été
   // appliqués si besoin, mais on ne redessine jamais un nouveau lot par-dessus un cycle en
   // cours — la priorité départage/lot-complet est gérée par les crons appelants (index.js).
+  // SC-2 / C-1 (audit scalabilité 2026-09-26) : `mission` est un INSTANTANÉ lu par l'appelant.
+  // Ce test n'est qu'un raccourci : N appels simultanés (rafale de candidatures sur une mission
+  // urgente) le passent tous. L'arbitre est l'UPDATE missions plus bas, qui re-vérifie la même
+  // condition (fenêtre de lot, fenêtre de départage, plafond de vagues) sur la ligne COURANTE ;
+  // tous les effets (ardoise vierge, sollicitations, notifications) n'ont lieu que si CET appel
+  // l'a emporté (rowCount = 1). Mesuré avant : 15 candidatures simultanées → 10 lots, 10
+  // sollicitations par Œil, plafond contourné.
   if (isBatchLive(mission)) return;
-
-  // Nouveau tirage de lot : ardoise vierge sur mission_interests pour cette mission — un cycle
-  // précédent résolu puis rouvert (refus, transfert, désactivation admin...) ne doit jamais
-  // laisser fuiter un solicited_at/confirmed_at périmé sur le cycle suivant.
-  await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
 
   // PROMPT 2 (2026-08-17) — plafond de lots successifs (candidate_batch_max_waves, défaut 2) :
   // une fois atteint, on route directement vers la recherche élargie (branche candidates.length
@@ -4718,18 +4720,31 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
     const confirmationMinutes = await getSetting(db, 'candidate_confirmation_minutes', 10);
     const windowEndsAt = new Date(Date.now() + confirmationMinutes * 60 * 1000);
 
-    // Garde optimiste : si la mission a changé de statut entre-temps (déjà assignée par un
-    // autre chemin, annulée...), on n'écrase rien. pending_candidate_id garde le mieux classé
-    // du lot à titre indicatif (affichage admin) uniquement — voir commentaire sur la colonne.
+    // Arbitre atomique (SC-2) : si la mission a changé de statut entre-temps (déjà assignée par
+    // un autre chemin, annulée...), si un autre appel vient d'ouvrir un lot ou si une fenêtre de
+    // départage est ouverte (même définition qu'isBatchLive, sur la ligne courante), ou si le
+    // plafond de vagues est atteint, on n'écrase rien et on ne sollicite personne.
+    // pending_candidate_id garde le mieux classé du lot à titre indicatif (affichage admin)
+    // uniquement — voir commentaire sur la colonne.
     const { rowCount } = await db.query(
       `UPDATE missions SET pending_candidate_id=$1, candidate_window_ends_at=$2, batch_tiebreak_ends_at=NULL, batch_wave_count=batch_wave_count+1, updated_at=NOW()
-       WHERE id=$3 AND status='pending' AND oeil_id IS NULL`,
-      [candidateIds[0], windowEndsAt, mission.id]
+       WHERE id=$3 AND status='pending' AND oeil_id IS NULL
+         AND (candidate_window_ends_at IS NULL OR candidate_window_ends_at <= NOW())
+         AND (batch_tiebreak_ends_at IS NULL OR batch_tiebreak_ends_at <= NOW())
+         AND batch_wave_count < $4`,
+      [candidateIds[0], windowEndsAt, mission.id, maxBatchWaves]
     );
     if (rowCount === 0) return;
 
+    // Nouveau tirage de lot gagné : ardoise vierge sur mission_interests pour cette mission — un
+    // cycle précédent résolu puis rouvert (refus, transfert, désactivation admin...) ne doit
+    // jamais laisser fuiter un solicited_at/confirmed_at périmé sur le cycle suivant — ET
+    // sollicitation du lot, en une seule instruction. Placé APRÈS l'arbitre : avant, un appel
+    // perdant remettait à zéro les sollicitations du lot que l'appel gagnant venait de poser.
     await db.query(
-      `UPDATE mission_interests SET solicited_at=NOW() WHERE mission_id=$1 AND oeil_id = ANY($2::text[])`,
+      `UPDATE mission_interests
+       SET solicited_at = CASE WHEN oeil_id = ANY($2::text[]) THEN NOW() ELSE NULL END, confirmed_at=NULL
+       WHERE mission_id=$1`,
       [mission.id, candidateIds]
     );
 
@@ -4761,12 +4776,19 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
 
     if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, pending_candidate_id: candidateIds[0], batch_candidate_count: candidateIds.length });
   } else {
+    // Même arbitre (SC-2), sans le plafond : ne jamais effacer un lot ou un départage qu'un
+    // appel concurrent vient d'ouvrir sur la ligne courante.
     const { rowCount } = await db.query(
       `UPDATE missions SET is_urgent=true, pending_candidate_id=NULL, candidate_window_ends_at=NULL, batch_tiebreak_ends_at=NULL, updated_at=NOW()
-       WHERE id=$1 AND status='pending' AND oeil_id IS NULL`,
+       WHERE id=$1 AND status='pending' AND oeil_id IS NULL
+         AND (candidate_window_ends_at IS NULL OR candidate_window_ends_at <= NOW())
+         AND (batch_tiebreak_ends_at IS NULL OR batch_tiebreak_ends_at <= NOW())`,
       [mission.id]
     );
     if (rowCount === 0) return;
+
+    // Ardoise vierge (voir branche lot ci-dessus) : plus aucun candidat sollicité.
+    await db.query(`UPDATE mission_interests SET solicited_at=NULL, confirmed_at=NULL WHERE mission_id=$1`, [mission.id]);
 
     await notify(db, mission.client_id,
       '🔎 Recherche élargie',
