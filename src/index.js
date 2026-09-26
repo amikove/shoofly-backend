@@ -353,8 +353,17 @@ io.use(async (socket, next) => {
     socket.userRole = payload.role;
     socket.tokenIat = payload.iat;
     next();
-  } catch {
-    next(new Error('Token invalide'));
+  } catch (e) {
+    // SC-1 (audit scalabilité 2026-09-26) : même partage qu'authenticate (middleware/auth.js).
+    // Jeton rejeté par jwt.verify → refus définitif (le client ne se reconnecte pas).
+    // Toute autre erreur (base/pool) → erreur DISTINCTE, marquée réessayable : le frontend
+    // (SocketContext.jsx) relance la connexion avec backoff au lieu de rester sans temps réel
+    // jusqu'au prochain rechargement de page.
+    if (e instanceof jwt.JsonWebTokenError) return next(new Error('Token invalide'));
+    console.error('Socket handshake : erreur d\'infrastructure (réessayable) :', e && e.message);
+    const unavailable = new Error('Service momentanément indisponible');
+    unavailable.data = { code: 'AUTH_UNAVAILABLE', retry_after: 2 }; // même valeur que AUTH_RETRY_AFTER_SECONDS (auth.js)
+    next(unavailable);
   }
 });
 

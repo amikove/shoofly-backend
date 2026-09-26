@@ -177,6 +177,11 @@ async function loadAuthUser(userId) {
   return load;
 }
 
+// Délai (s) annoncé au client sur une panne d'infrastructure pendant l'authentification (SC-1) —
+// en-tête Retry-After ET champ retry_after du corps (l'en-tête n'est pas lisible en CORS sans
+// exposedHeaders ; le frontend lit le corps).
+const AUTH_RETRY_AFTER_SECONDS = 2;
+
 async function authenticate(req, res, next) {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Token manquant' });
@@ -212,7 +217,17 @@ async function authenticate(req, res, next) {
       return res.status(403).json({ error: 'Votre compte est suspendu.' });
     }
     next();
-  } catch { return res.status(401).json({ error: 'Token invalide ou expiré' }); }
+  } catch (e) {
+    // SC-1 (audit scalabilité 2026-09-26) : 401 UNIQUEMENT pour un jeton rejeté par jwt.verify
+    // (JsonWebTokenError, dont TokenExpiredError/NotBeforeError héritent). Toute autre erreur
+    // (pool saturé, base redémarrée, timeout) est une panne d'infrastructure : un 401 ferait
+    // effacer la session par le frontend (api/client.js) → déconnexion de masse au moindre
+    // incident DB. 503 + Retry-After : la requête n'a pas été exécutée, le client peut la rejouer.
+    if (e instanceof jwt.JsonWebTokenError) return res.status(401).json({ error: 'Token invalide ou expiré' });
+    console.error('authenticate : erreur d\'infrastructure (503) :', e && e.message);
+    res.set('Retry-After', String(AUTH_RETRY_AFTER_SECONDS));
+    return res.status(503).json({ error: 'Service momentanément indisponible, veuillez réessayer.', code: 'AUTH_UNAVAILABLE', retry_after: AUTH_RETRY_AFTER_SECONDS });
+  }
 }
 
 function requireRole(...roles) {
