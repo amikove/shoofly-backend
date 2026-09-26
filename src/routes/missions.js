@@ -3638,20 +3638,27 @@ router.post('/assistance-requests/:id/commission', authenticate, requireRole('ad
   if (mission.payment_method !== 'cash') return res.status(400).json({ error: 'Décision commission réservée aux missions cash.' });
 
   // Garde d'idempotence posée sur l'UPDATE lui-même, même principe que le reste de cette session.
-  const { rowCount } = await db.query(
-    `UPDATE mission_assistance_requests SET commission_decision=$1, commission_decided_by=$2, commission_decided_at=NOW() WHERE id=$3 AND commission_decision IS NULL`,
-    [decision === 'debit' ? 'debited' : 'released', req.user.id, assistanceRequest.id]
-  );
-  if (rowCount === 0) return res.status(409).json({ error: 'La commission a déjà été décidée pour cette déclaration.' });
-
+  // SC-7 (audit scalabilité 2026-09-26) : décision ET débit dans la MÊME transaction. Avant, la
+  // décision était committée seule, puis le débit tournait dans une transaction distincte : un
+  // échec entre les deux (crash, timeout, erreur du débit) laissait commission_decision='debited'
+  // sans ligne de ledger, et la garde IS NULL interdisait de rejouer. Désormais un échec du débit
+  // annule aussi la décision (rejouable). Deux décisions simultanées : la 2e attend le verrou de
+  // ligne posé par l'UPDATE de la 1re, puis ne trouve plus commission_decision IS NULL → 409.
   let cashSettlement = null;
-  if (decision === 'debit') {
-    await walletService.withTransaction(db, async (client) => {
+  const decided = await walletService.withTransaction(db, async (client) => {
+    const { rowCount } = await client.query(
+      `UPDATE mission_assistance_requests SET commission_decision=$1, commission_decided_by=$2, commission_decided_at=NOW() WHERE id=$3 AND commission_decision IS NULL`,
+      [decision === 'debit' ? 'debited' : 'released', req.user.id, assistanceRequest.id]
+    );
+    if (rowCount === 0) return false;
+    if (decision === 'debit') {
       cashSettlement = await settleCashCommission(client, mission, assistanceRequest.status === 'validated'
         ? 'Commission Shoofly — mission cash (assistance confirmée par le client, décision admin)'
         : 'Commission Shoofly — mission cash (assistance auto-validée, décision admin différée)');
-    });
-  }
+    }
+    return true;
+  });
+  if (!decided) return res.status(409).json({ error: 'La commission a déjà été décidée pour cette déclaration.' });
 
   const emitToUser = req.app.get('emitToUser');
   if (decision === 'debit') {
