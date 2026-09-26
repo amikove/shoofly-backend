@@ -595,10 +595,15 @@ initDb().then(() => {
         // mission n'abandonne pas le reste du lot — même motif que la boucle lateH30 plus bas.
         try {
         const deadlineAt = new Date(Date.now() + deadlineMinutes * 60 * 1000);
-        await db.query(
-          `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1 WHERE id=$2`,
+        // SC-6 (audit scalabilité 2026-09-26) : garde IS NULL portée par l'UPDATE lui-même (le
+        // filtre du SELECT ci-dessus n'est qu'un instantané). Deux processus (2 instances, ou
+        // chevauchement de déploiement) tiquent à 20 h au même instant : seul celui dont l'UPDATE
+        // pose la sentinelle sollicite l'Œil (notification + WhatsApp), l'autre passe.
+        const { rowCount: j1Claimed } = await db.query(
+          `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1 WHERE id=$2 AND presence_confirmation_requested_at IS NULL`,
           [deadlineAt, m.id]
         );
+        if (j1Claimed === 0) continue;
         const missionTime = new Date(m.scheduled_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
         const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
