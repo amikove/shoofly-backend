@@ -1,7 +1,5 @@
 const { getSetting } = require('../utils/settings');
 const { notify } = require('../routes/missions');
-const { sendWhatsAppTemplate } = require('../services/wasel');
-const waselTemplates = require('../config/waselTemplates');
 
 // PROMPT 5 point 5 (2026-08-18) — extrait dans son propre module, même raison que
 // jobs/autoValidateMissions.js : testable indépendamment (appel direct de la fonction, sans
@@ -10,7 +8,8 @@ const waselTemplates = require('../config/waselTemplates');
 //
 // Suite du déclencheur candidature_whatsapp_sent_at (cron "Seuil WhatsApp candidatures", index.js) :
 // une fois la notification WhatsApp initiale envoyée, le client peut rester sans agir. Ce job
-// renvoie le même type de WhatsApp toutes les candidature_relance_interval_minutes (1er envoi
+// relance le client (notification in-app + push depuis le chantier 2 du 2026-09-26 — plus de
+// WhatsApp, décision D4) toutes les candidature_relance_interval_minutes (1er envoi
 // après candidature_relance_first_after_minutes), tant que la mission reste 'pending'. Dès que
 // scheduled_at passe sous candidature_relance_imminent_threshold_minutes, le relais est pris par
 // une alerte admin unique (onglet "Missions proches sans validation") au lieu d'un nouveau
@@ -22,10 +21,9 @@ async function runCandidatureRelance(db, emitToUser = null) {
   const imminentThresholdMinutes = await getSetting(db, 'candidature_relance_imminent_threshold_minutes', 120);
 
   const { rows: dueMissions } = await db.query(`
-    SELECT m.id, m.title, m.scheduled_at, m.candidature_relance_count, c.phone AS client_phone,
+    SELECT m.id, m.client_id, m.title, m.scheduled_at, m.candidature_relance_count,
       (SELECT COUNT(*)::int FROM mission_interests mi WHERE mi.mission_id = m.id) AS n
     FROM missions m
-    JOIN users c ON c.id = m.client_id
     WHERE m.status = 'pending'
       AND m.candidature_whatsapp_sent_at IS NOT NULL
       AND m.candidature_admin_alert_sent_at IS NULL
@@ -63,9 +61,16 @@ async function runCandidatureRelance(db, emitToUser = null) {
           `UPDATE missions SET candidature_relance_count = candidature_relance_count + 1, candidature_relance_last_sent_at = NOW() WHERE id=$1`,
           [m.id]
         );
-        if (rowCount > 0 && m.client_phone) {
-          await sendWhatsAppTemplate(waselTemplates.candidature_relance_client.template_name, m.client_phone, [String(m.n), m.title]);
-          console.log(`📲 Relance WhatsApp candidatures — mission ${m.id} (#${m.candidature_relance_count + 1}, ${m.n} candidature(s))`);
+        // Chantier 2 (2026-09-26, décision D4) : la relance n'est plus un WhatsApp mais une
+        // notification in-app + push au client (mêmes délais, même compteur). Ouvre la liste des
+        // candidats de la mission (même action que « Nouvel Œil intéressé »). Envoyée que le
+        // client ait un téléphone ou non.
+        if (rowCount > 0) {
+          await notify(db, m.client_id, 'Des Œils attendent votre choix 👁️',
+            `${m.n} candidature(s) pour "${m.title}". Choisissez votre Œil pour confirmer la mission.`,
+            'interest', m.id, emitToUser, 'interests_modal',
+            'candidatureRelanceClientTitle', 'candidatureRelanceClientBody', { missionTitle: m.title, count: m.n });
+          console.log(`🔔 Relance candidatures (notification) — mission ${m.id} (#${m.candidature_relance_count + 1}, ${m.n} candidature(s))`);
         }
       }
     } catch (e) {

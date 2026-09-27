@@ -59,6 +59,8 @@
   "fiveStarBonusBody": "+{{amount}} درهم كمكافأة على \"{{missionTitle}}\" — شكراً على عملك الممتاز!",
   "newOeilInterestTitle": "عين ميدانية جديدة مهتمة 👁️",
   "newOeilInterestBody": "عين ميدانية مهتمة : {{missionTitle}}",
+  "candidatureRelanceClientTitle": "عيون ميدانية بانتظار اختياركم 👁️",
+  "candidatureRelanceClientBody": "{{count}} ترشح للمهمة \"{{missionTitle}}\". اختاروا العين الميدانية لتأكيد المهمة.",
   "assistanceMissionRequestClientTitle": "🆘 العين الخاصة بك تبلغ عن مشكلة",
   "assistanceMissionRequestClientBody": "أبلغت العين: \"{{reason}}\" بخصوص المهمة \"{{missionTitle}}\". يرجى تأكيد ما إذا كنت توافق على تصريحها (لديك {{hours}} ساعة).",
   "assistanceValidatedOeilTitle": "💰 تم استلام الدفع!",
