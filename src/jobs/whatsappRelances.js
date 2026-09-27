@@ -20,7 +20,8 @@ const waselTemplates = require('../config/waselTemplates');
 //      /missions/:id/interests quand le client lui-même l'appelle — seul appelant : InterestsModal).
 //
 // Sûr à plusieurs processus (même méthode que SC-6, chantier 1) :
-//   - programmation : UNIQUE (mission_id, kind) + ON CONFLICT DO NOTHING → une relance par étape ;
+//   - programmation : UNIQUE (mission_id, kind, user_id) + ON CONFLICT DO NOTHING → une relance par
+//     étape, par mission et par destinataire (un Œil remplaçant a la sienne) ;
 //   - envoi : UN SEUL UPDATE décide ET réserve la ligne (garde decided_at IS NULL). Deux processus
 //     qui tiquent ensemble : un seul obtient la ligne (rowCount 1), l'autre passe. La décision lit
 //     l'état de la mission dans CE MÊME ordre SQL — pas d'instantané JS entre le contrôle et la
@@ -55,7 +56,7 @@ async function schedulePresenceRelance(db, kind, missionId, oeilId, notification
               m.presence_confirmation_requested_at + INTERVAL '1 minute' * $5::numeric
        FROM missions m
        WHERE m.id = $2 AND m.oeil_id = $3 AND m.presence_confirmation_requested_at IS NOT NULL
-       ON CONFLICT (mission_id, kind) DO NOTHING`,
+       ON CONFLICT (mission_id, kind, user_id) DO NOTHING`,
       [kind, missionId, oeilId, notificationId, delay]
     );
   } catch (e) {
@@ -70,7 +71,7 @@ async function scheduleClientAppliedRelance(db, missionId, clientId, notificatio
     await db.query(
       `INSERT INTO whatsapp_relances (kind, mission_id, user_id, notification_id, due_at)
        VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 minute' * $5::numeric)
-       ON CONFLICT (mission_id, kind) DO NOTHING`,
+       ON CONFLICT (mission_id, kind, user_id) DO NOTHING`,
       [CLIENT_KIND, missionId, clientId, notificationId, delay]
     );
   } catch (e) {

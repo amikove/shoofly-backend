@@ -1708,8 +1708,10 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- /missions/:id/interests appelé par le client lui-même — seul appelant : InterestsModal).
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS client_interests_viewed_at TIMESTAMPTZ;
     -- whatsapp_relances : un WhatsApp de RELANCE programmé (jobs/whatsappRelances.js). Une ligne
-    -- par (mission, étape) — UNIQUE : jamais deux relances pour la même étape d'une mission, quel
-    -- que soit le nombre de processus. decided_at posé par l'UPDATE qui décide ET réserve la ligne
+    -- par (mission, étape, destinataire) — index UNIQUE ci-dessous : jamais deux relances pour la
+    -- même étape d'une mission et le même Œil (ou client), quel que soit le nombre de processus ;
+    -- un Œil remplaçant qui repasse la même étape a la sienne (décision BOSS du 2026-09-27).
+    -- decided_at posé par l'UPDATE qui décide ET réserve la ligne
     -- (garde decided_at IS NULL : un seul processus gagne). outcome = raison enregistrée :
     --   sent | failed (Wasel a refusé : ligne whatsapp_send_failures, retentée par whatsappRetry)
     --   skipped_confirmed (présence confirmée) | skipped_read (notification lue)
@@ -1726,9 +1728,15 @@ CREATE TABLE IF NOT EXISTS identity_documents (
       due_at          TIMESTAMPTZ NOT NULL,
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       decided_at      TIMESTAMPTZ,
-      outcome         TEXT CHECK (outcome IN ('sending','sent','failed','skipped_confirmed','skipped_read','skipped_viewed','skipped_obsolete','skipped_no_phone')),
-      UNIQUE (mission_id, kind)
+      outcome         TEXT CHECK (outcome IN ('sending','sent','failed','skipped_confirmed','skipped_read','skipped_viewed','skipped_obsolete','skipped_no_phone'))
     );
+    -- Unicité (mission, étape, destinataire). Migration de la première version de la table
+    -- (contrainte UNIQUE (mission_id, kind), nom automatique whatsapp_relances_mission_id_kind_key) :
+    -- le nouvel index est créé AVANT de retirer l'ancienne contrainte — il est plus permissif, sa
+    -- création ne peut donc pas échouer sur des lignes existantes, et la table n'est jamais sans
+    -- unicité. Idempotent (IF NOT EXISTS / IF EXISTS).
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_relances_mission_kind_user ON whatsapp_relances (mission_id, kind, user_id);
+    ALTER TABLE whatsapp_relances DROP CONSTRAINT IF EXISTS whatsapp_relances_mission_id_kind_key;
     CREATE INDEX IF NOT EXISTS idx_whatsapp_relances_due ON whatsapp_relances (due_at) WHERE decided_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_whatsapp_relances_created_at ON whatsapp_relances (created_at);
 

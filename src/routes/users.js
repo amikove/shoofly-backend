@@ -1913,6 +1913,35 @@ const {
     }
   }
 
+  // Chantier 2 lot 1 bis (décision BOSS du 2026-09-27) — même modèle que C3 : chaque délai de
+  // relance WhatsApp de présence DOIT rester STRICTEMENT inférieur au délai de réponse de son étape.
+  // Sinon la relance tombe toujours après l'expiration de la demande (jobs/whatsappRelances.js la
+  // classe « sans objet ») : elle ne partirait jamais. Contrôlé que l'une ou l'autre valeur change ;
+  // valeur absente du corps → valeur en base, sinon défaut seedé. 400 + code/violations (le
+  // frontend affiche le message traduit FR/AR), rien n'est écrit.
+  const PRESENCE_RELANCE_PAIRS = [
+    { step: 'J-1', relance: 'presence_whatsapp_relance_j1_minutes', deadline: 'presence_confirmation_deadline_minutes' },
+    { step: 'H-2', relance: 'presence_whatsapp_relance_h2_minutes', deadline: 'presence_confirmation_deadline_minutes_sameday' },
+    { step: 'H-45', relance: 'presence_whatsapp_relance_h45_minutes', deadline: 'presence_confirmation_deadline_minutes_h45' },
+  ]
+  const touchedPairs = PRESENCE_RELANCE_PAIRS.filter((p) => updates[p.relance] !== undefined || updates[p.deadline] !== undefined)
+  if (touchedPairs.length > 0) {
+    const pairKeys = touchedPairs.flatMap((p) => [p.relance, p.deadline])
+    const { rows: curRows } = await db.query(`SELECT key, value FROM settings WHERE key = ANY($1::text[])`, [pairKeys])
+    const cur = Object.fromEntries(curRows.map(r => [r.key, r.value]))
+    const eff = (key) => Number(updates[key] ?? cur[key] ?? SETTINGS_DEFAULTS[key])
+    const violations = touchedPairs
+      .map((p) => ({ step: p.step, relance_key: p.relance, relance: eff(p.relance), deadline_key: p.deadline, deadline: eff(p.deadline) }))
+      .filter((v) => Number.isFinite(v.relance) && Number.isFinite(v.deadline) && v.relance >= v.deadline)
+    if (violations.length > 0) {
+      return res.status(400).json({
+        code: 'PRESENCE_RELANCE_NOT_BEFORE_DEADLINE',
+        violations,
+        error: `Configuration incohérente — aucune modification enregistrée : ${violations.map((v) => `relance WhatsApp ${v.step} (${v.relance_key} = ${v.relance} min) doit être strictement inférieure au délai de réponse de cette étape (${v.deadline_key} = ${v.deadline} min)`).join(' ; ')}. Sinon la relance partirait après l'expiration de la demande et ne serait jamais envoyée.`,
+      })
+    }
+  }
+
   // Historique (chantier "historique des réglages", 2026-09-04) — lecture de l'ancienne valeur
   // + écriture settings + settings_history dans la MÊME transaction (walletService.withTransaction,
   // déjà utilisé ailleurs dans ce fichier pour des écritures interdépendantes) : si l'UPDATE
