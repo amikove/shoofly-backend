@@ -2,20 +2,65 @@ const push = require('../services/push');
 const notifI18n = require('../i18n');
 
 // action_type dont le deep-link dépend du rôle du destinataire (chemin /oeil/... vs
-// /client/...) — seuls ceux-ci justifient un aller-retour DB supplémentaire avant le push
-// (lookup PK sur users.id, un seul indexé, négligeable). Tous les autres action_type gardent le
-// contrat existant : aucune requête additionnelle. Voir push.js deepLinkFor pour le détail des cas.
+// /client/...) — seuls ceux-ci (ou une notification traduisible, voir la langue plus bas)
+// justifient une lecture de la ligne users avant le push. Voir push.js deepLinkFor.
 const ROLE_AWARE_ACTION_TYPES = new Set(['mission_view', 'chat', 'ticket_view', 'mes_signalements']);
 
-// Résout le deep-link complet en repoussant le lookup de rôle (si nécessaire) après l'insertion
-// in-app — jamais sur le chemin critique de la réponse HTTP (voir contrat sendWebPush ci-dessous).
-async function resolveDeepLink(db, userId, actionType, missionId, titleKey, params) {
+// Limiteur de concurrence du canal push (chantier 2, 2026-09-26 — fan-out SC-5/C-13) : une
+// création de mission notifie tous les Œils éligibles de la ville d'un coup (Promise.all) ; sans
+// borne, chaque notification lançait aussitôt ses lectures + son POST push, en rafale sur le pool
+// et vers le fournisseur. Au plus PUSH_CONCURRENCY envois push en vol par processus ; les
+// suivants attendent leur tour (l'in-app et le socket, eux, ne sont jamais retardés).
+const PUSH_CONCURRENCY = 10;
+let pushActive = 0;
+const pushQueue = [];
+function limitPush(task) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      pushActive++;
+      Promise.resolve().then(task).then(resolve, reject).finally(() => {
+        pushActive--;
+        const next = pushQueue.shift();
+        if (next) next();
+      });
+    };
+    if (pushActive < PUSH_CONCURRENCY) run(); else pushQueue.push(run);
+  });
+}
+
+// Canal push d'une notification déjà insérée. UNE seule lecture de la ligne users (rôle pour le
+// deep-link + langue pour le texte), et seulement si l'un des deux sert. Langue (chantier langue
+// des notifications push, 2026-09-23) : titre/corps localisés pour ce SEUL canal — la ligne
+// `notifications` reste FRANÇAISE (Topbar.jsx la retraduit via title_key/body_key). Repli sur
+// title/body bruts si la langue est inconnue ou la clé absente du catalogue backend/src/i18n.
+// Lecture en échec : on pousse quand même (texte français, deep-link générique).
+async function sendPushFor(db, row, { userId, title, body, type, missionId, actionType, titleKey, bodyKey, params, pushOptions }) {
   let role = null;
-  if (ROLE_AWARE_ACTION_TYPES.has(actionType)) {
-    const { rows: [u] } = await db.query('SELECT role FROM users WHERE id=$1', [userId]);
-    role = u ? u.role : null;
+  let language = null;
+  if (ROLE_AWARE_ACTION_TYPES.has(actionType) || titleKey || bodyKey) {
+    try {
+      const { rows: [u] } = await db.query('SELECT role, language FROM users WHERE id=$1', [userId]);
+      role = u ? u.role : null;
+      language = u ? u.language : null;
+    } catch { /* best-effort — jamais bloquant pour le push */ }
   }
-  return push.deepLinkFor(actionType, missionId, { role, titleKey, params });
+  let pushTitle = title;
+  let pushBody = body;
+  if (language) {
+    if (titleKey) pushTitle = notifI18n.t(titleKey, language, params) ?? title;
+    if (bodyKey) pushBody = notifI18n.t(bodyKey, language, params) ?? body;
+  }
+  return push.sendWebPush(userId, {
+    title: pushTitle,
+    body: pushBody,
+    url: push.deepLinkFor(actionType, missionId, { role, titleKey, params }),
+    tag: `notif-${row.id}`,
+    urgent: type === 'error',
+    notificationId: row.id,
+    eventKey: titleKey || null,
+    urgency: pushOptions && pushOptions.urgency,
+    ttl: pushOptions && pushOptions.ttl,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -33,48 +78,24 @@ async function resolveDeepLink(db, userId, actionType, missionId, titleKey, para
 // Contrat push (voir services/push.js) : ne lève jamais, ne bloque pas la réponse HTTP
 // (pas de `await` sur le push), silencieux si aucun abonnement / VAPID non configuré.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null) {
+//
+// pushOptions (chantier 2, 2026-09-26) : { urgency?, ttl? } — options de LIVRAISON du push
+// (en-têtes Urgency / TTL), sans effet sur l'in-app. Utilisé par la sollicitation de cascade
+// (urgency 'high', ttl = délai de confirmation) ; absent partout ailleurs → comportement d'avant.
+async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null, pushOptions = null) {
   const r = await db.query(
     `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
     [userId, title, body, type, missionId, actionType, titleKey, bodyKey, params ? JSON.stringify(params) : null]
   );
   if (emitToUser) emitToUser(userId, 'notification', r.rows[0]);
 
-  // 3ᵉ canal — après l'in-app et le socket live. Jamais attendu, jamais bloquant, ne lève
-  // jamais (services/push.js avale tout, y compris un échec du lookup de rôle ci-dessous —
-  // même .catch qu'avant ce correctif). `tag` dédupe côté navigateur si l'utilisateur est
-  // multi-appareils et déjà en train de lire.
-  resolveDeepLink(db, userId, actionType, missionId, titleKey, params)
-    .then(async (url) => {
-      // Langue (chantier langue des notifications push, 2026-09-23) : titre/corps localisés pour
-      // ce SEUL canal push — la ligne `notifications` ci-dessus (title/body) reste FRANÇAISE,
-      // inchangée : c'est elle que Topbar.jsx retraduit déjà via title_key/body_key pour
-      // l'affichage in-app (t('notif.'+title_key)), indépendamment de ce qui part en push. Repli
-      // strictement identique au comportement d'avant (title/body bruts) si la langue de
-      // l'utilisateur est inconnue (colonne users.language jamais renseignée) ou si la clé
-      // n'existe pas dans le catalogue backend/src/i18n — couvre nativement les appels sans
-      // titleKey/bodyKey (voir routes/missions.js) sans cas particulier à écrire ici.
-      let pushTitle = title;
-      let pushBody = body;
-      if (titleKey || bodyKey) {
-        try {
-          const { rows: [u] } = await db.query('SELECT language FROM users WHERE id=$1', [userId]);
-          if (u?.language) {
-            if (titleKey) pushTitle = notifI18n.t(titleKey, u.language, params) ?? title;
-            if (bodyKey) pushBody = notifI18n.t(bodyKey, u.language, params) ?? body;
-          }
-        } catch { /* résolution langue best-effort — jamais bloquant pour le push */ }
-      }
-      return push.sendWebPush(userId, {
-        title: pushTitle,
-        body: pushBody,
-        url,
-        tag: `notif-${r.rows[0].id}`,
-        urgent: type === 'error',
-        notificationId: r.rows[0].id,
-        eventKey: titleKey || null,
-      });
-    })
+  // 3ᵉ canal — après l'in-app et le socket live. Push inerte (VAPID absentes) → rien de plus :
+  // plus aucune lecture users pour un envoi qui n'aurait pas lieu (SC-5). Sinon : jamais
+  // attendu, jamais bloquant, ne lève jamais ; concurrence bornée (limitPush). `tag` dédupe côté
+  // navigateur si l'utilisateur est multi-appareils et déjà en train de lire.
+  if (!push.isPushConfigured()) return;
+  const row = r.rows[0];
+  limitPush(() => sendPushFor(db, row, { userId, title, body, type, missionId, actionType, titleKey, bodyKey, params, pushOptions }))
     .catch(() => {});
 }
 

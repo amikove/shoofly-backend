@@ -104,15 +104,26 @@ function deepLinkFor(actionType, missionId = null, ctx = {}) {
   }
 }
 
+// Délai d'attente par envoi (chantier 2, 2026-09-26) : un fournisseur push qui ne répond pas ne
+// doit pas garder indéfiniment une promesse (et, via le limiteur de notify(), une place de
+// concurrence). Option `timeout` de web-push = délai d'inactivité du socket.
+const PUSH_SEND_TIMEOUT_MS = 8000;
+const DEFAULT_TTL_SECONDS = 3600;
+const URGENCIES = new Set(['very-low', 'low', 'normal', 'high']);
+
 // Un seul POST chiffré vers un endpoint. Ne lève jamais : renvoie une forme normalisée que
 // sendWebPush interprète pour journaliser + neutraliser les endpoints morts.
-async function sendToSubscription(sub, payloadJson) {
+// opts.ttl (s) / opts.urgency : transmis au service push (en-têtes TTL / Urgency). Par défaut,
+// comportement d'avant : TTL 3600 s, urgence « normal » (défaut web-push).
+async function sendToSubscription(sub, payloadJson, opts = {}) {
   const subscription = {
     endpoint: sub.endpoint,
     keys: sub.keys || {},
   };
+  const options = { TTL: Number.isFinite(opts.ttl) && opts.ttl >= 0 ? Math.round(opts.ttl) : DEFAULT_TTL_SECONDS, timeout: PUSH_SEND_TIMEOUT_MS };
+  if (URGENCIES.has(opts.urgency)) options.urgency = opts.urgency;
   try {
-    await webpush.sendNotification(subscription, payloadJson, { TTL: 3600 });
+    await webpush.sendNotification(subscription, payloadJson, options);
     return { ok: true };
   } catch (err) {
     const statusCode = err && typeof err.statusCode === 'number' ? err.statusCode : null;
@@ -143,7 +154,8 @@ async function logSend(db, row) {
 // Envoie une notification push à TOUS les abonnements actifs d'un utilisateur. Ne lève jamais.
 // Renvoie true si au moins un envoi a été accepté par le provider, false sinon (utile pour une
 // future escalade : « aucun push livré » → repli email/WhatsApp).
-//   payload : { title, body, url?, tag?, urgent?, notificationId?, eventKey? }
+//   payload : { title, body, url?, tag?, urgent?, notificationId?, eventKey?, urgency?, ttl? }
+//             urgency/ttl : options de livraison (non incluses dans le contenu chiffré).
 //   db      : pool partagé par défaut (même pattern que sendWhatsAppTemplate).
 async function sendWebPush(userId, payload, db = getDb()) {
   if (!vapidConfigured) return false;
@@ -179,7 +191,7 @@ async function sendWebPush(userId, payload, db = getDb()) {
 
   let anySent = false;
   for (const sub of subs) {
-    const result = await sendToSubscription(sub, payloadJson);
+    const result = await sendToSubscription(sub, payloadJson, { urgency: payload.urgency, ttl: payload.ttl });
     if (result.ok) {
       anySent = true;
       await db.query(
