@@ -1732,6 +1732,31 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     CREATE INDEX IF NOT EXISTS idx_whatsapp_relances_due ON whatsapp_relances (due_at) WHERE decided_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_whatsapp_relances_created_at ON whatsapp_relances (created_at);
 
+    -- ═══ Chantier 2 lot 1 bis (décisions BOSS du 2026-09-27) — mesure des notifications ═══════
+    -- AJOUT PUREMENT ADDITIF (colonnes nullables, index), idempotent.
+    -- notifications.read_at / read_via : QUAND et PAR QUEL CANAL une notification a été lue pour
+    -- la première fois. 'push_click' = clic sur le push (POST /api/push/ack, event clicked) ;
+    -- 'in_app' = marquée lue dans l'app (PUT /api/users/notifications/read : ouverture de la
+    -- cloche, clic sur la ligne, « tout marquer comme lu »). Lignes antérieures : NULL (non mesuré).
+    ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
+    ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_via TEXT CHECK (read_via IN ('push_click','in_app'));
+    -- Agrégats du tableau de bord « Notifications » bornés à la période (created_at).
+    CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications (created_at);
+    -- Appareil d'un abonnement push : 'android' | 'ios' | 'desktop' (services/push.js
+    -- deviceFromSubscription — indice envoyé par le navigateur, sinon déduit du user-agent).
+    -- Recopié dans push_send_log à chaque envoi : la mesure survit à la suppression de l'abonnement.
+    ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS device TEXT;
+    UPDATE push_subscriptions SET device = CASE
+        WHEN user_agent ~* 'android' THEN 'android'
+        WHEN user_agent ~* '(iphone|ipad|ipod)' THEN 'ios'
+        ELSE 'desktop' END
+      WHERE device IS NULL;
+    -- Accusés du service worker (POST /api/push/ack) sur la ligne d'envoi elle-même (une ligne =
+    -- un envoi accepté vers UN abonnement) : taux de réception = delivered_at / status='sent'.
+    ALTER TABLE push_send_log ADD COLUMN IF NOT EXISTS device TEXT;
+    ALTER TABLE push_send_log ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+    ALTER TABLE push_send_log ADD COLUMN IF NOT EXISTS clicked_at TIMESTAMPTZ;
+
     -- ═══ Planchers tarifaires par sous-catégorie — chantier « planchers éditables », 2026-09-10 ═══
     -- Remplace la table en dur SUBCATEGORY_MIN_PRICES (constants/missionCategories.js, chantier D1)
     -- ET son jumeau MIN_PRICES côté frontend (NewMissionModal.jsx), qui étaient maintenus synchro

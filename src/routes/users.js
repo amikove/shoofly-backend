@@ -178,10 +178,13 @@ router.get('/notifications', authenticate, asyncHandler(async (req, res) => {
 router.put('/notifications/read', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
   const { ids } = req.body;
+  // Chantier 2 lot 1 bis : première lecture horodatée + canal 'in_app' (cloche ouverte, clic sur
+  // la ligne, « tout marquer comme lu »). Filtre is_read=false : une notification déjà lue (par
+  // exemple via un clic sur le push, read_via='push_click') garde sa première lecture.
   if (ids?.length) {
-    await db.query(`UPDATE notifications SET is_read=true WHERE user_id=$1 AND id=ANY($2)`, [req.user.id, ids]);
+    await db.query(`UPDATE notifications SET is_read=true, read_at=NOW(), read_via='in_app' WHERE user_id=$1 AND id=ANY($2) AND is_read=false`, [req.user.id, ids]);
   } else {
-    await db.query(`UPDATE notifications SET is_read=true WHERE user_id=$1`, [req.user.id]);
+    await db.query(`UPDATE notifications SET is_read=true, read_at=NOW(), read_via='in_app' WHERE user_id=$1 AND is_read=false`, [req.user.id]);
   }
   res.json({ message: 'Lu' });
 }));
@@ -1386,6 +1389,107 @@ router.get('/admin/dashboard/experience-utilisateur', authenticate, requireRole(
       open: openSnapshot.open,
       in_progress: openSnapshot.in_progress,
     },
+  });
+}));
+
+// ── GET /users/admin/dashboard/notifications — efficacité des notifications (chantier 2 lot 1 bis) ──
+// Paramètres : days (7 | 30), role (client | oeil | admin), type (title_key), device
+// (android | ios | desktop) — tous optionnels sauf days (défaut 7). Uniquement des AGRÉGATS,
+// chaque requête bornée à la période par un index (notifications.created_at,
+// push_send_log(status, created_at), whatsapp_relances.created_at, notifications(user_id,
+// created_at)) ; requêtes en séquence (une connexion du pool), sous le statement_timeout du pool.
+//   push       : envois acceptés par le fournisseur (status 'sent') → reçus (accusé delivered du
+//                service worker) → cliqués. Seul bloc filtré par l'appareil. Seuls les envois
+//                MESURÉS comptent (device renseigné = envoyés par le code du lot 1 bis) ; un appareil
+//                dont le service worker n'est pas encore mis à jour n'accuse pas (sous-estimation
+//                transitoire, le navigateur recharge sw.js au plus tard sous 24 h).
+//   reads      : notifications créées sur la période → lues (is_read), dont via le push / via
+//                l'app (read_via, NULL = lue avant la mesure), délai médian de lecture par canal.
+//   subscriptions : par rôle, comptes actifs (actifs, non suspendus) ayant reçu au moins une
+//                notification sur la période, et combien ont un abonnement push actif AUJOURD'HUI.
+//   relances   : relances WhatsApp programmées sur la période, par étape et raison (outcome).
+const NOTIF_DASH_ROLES = new Set(['client', 'oeil', 'admin']);
+const NOTIF_DASH_DEVICES = new Set(['android', 'ios', 'desktop']);
+router.get('/admin/dashboard/notifications', authenticate, requireRole('admin'), requirePermission('stats'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const days = Number(req.query.days) === 30 ? 30 : 7;
+  const role = NOTIF_DASH_ROLES.has(req.query.role) ? req.query.role : null;
+  const device = NOTIF_DASH_DEVICES.has(req.query.device) ? req.query.device : null;
+  const type = typeof req.query.type === 'string' && /^[A-Za-z0-9_]{1,80}$/.test(req.query.type) ? req.query.type : null;
+  const { rows: [{ since }] } = await db.query(`SELECT NOW() - INTERVAL '1 day' * $1::int AS since`, [days]);
+
+  const { rows: pushRows } = await db.query(`
+    SELECT l.device, COUNT(*)::int AS sent,
+           COUNT(l.delivered_at)::int AS delivered, COUNT(l.clicked_at)::int AS clicked
+    FROM push_send_log l
+    JOIN users u ON u.id = l.user_id
+    LEFT JOIN notifications n ON n.id = l.notification_id
+    WHERE l.status = 'sent' AND l.created_at >= $1 AND l.device IS NOT NULL
+      AND ($2::text IS NULL OR u.role = $2)
+      AND ($3::text IS NULL OR n.title_key = $3)
+      AND ($4::text IS NULL OR l.device = $4)
+    GROUP BY 1 ORDER BY 1
+  `, [since, role, type, device]);
+  const push = pushRows.reduce((acc, r) => ({
+    sent: acc.sent + r.sent, delivered: acc.delivered + r.delivered, clicked: acc.clicked + r.clicked,
+  }), { sent: 0, delivered: 0, clicked: 0 });
+  push.by_device = pushRows;
+
+  const { rows: [reads] } = await db.query(`
+    SELECT COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE n.is_read)::int AS read,
+           COUNT(*) FILTER (WHERE n.read_via = 'push_click')::int AS read_push,
+           COUNT(*) FILTER (WHERE n.read_via = 'in_app')::int AS read_in_app,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (n.read_at - n.created_at)))
+             FILTER (WHERE n.read_via = 'push_click') AS median_s_push,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (n.read_at - n.created_at)))
+             FILTER (WHERE n.read_via = 'in_app') AS median_s_in_app
+    FROM notifications n
+    JOIN users u ON u.id = n.user_id
+    WHERE n.created_at >= $1
+      AND ($2::text IS NULL OR u.role = $2)
+      AND ($3::text IS NULL OR n.title_key = $3)
+  `, [since, role, type]);
+
+  const { rows: subscriptions } = await db.query(`
+    SELECT u.role, COUNT(*)::int AS users,
+           COUNT(*) FILTER (WHERE EXISTS (
+             SELECT 1 FROM push_subscriptions s
+             WHERE s.user_id = u.id AND s.disabled_at IS NULL AND ($3::text IS NULL OR s.device = $3)
+           ))::int AS with_push
+    FROM users u
+    WHERE u.is_active = true AND u.is_suspended = false
+      AND ($2::text IS NULL OR u.role = $2)
+      AND EXISTS (SELECT 1 FROM notifications n WHERE n.user_id = u.id AND n.created_at >= $1)
+    GROUP BY u.role ORDER BY u.role
+  `, [since, role, device]);
+
+  const { rows: relances } = await db.query(`
+    SELECT r.kind, COALESCE(r.outcome, 'pending') AS outcome, COUNT(*)::int AS n
+    FROM whatsapp_relances r
+    JOIN users u ON u.id = r.user_id
+    WHERE r.created_at >= $1 AND ($2::text IS NULL OR u.role = $2)
+    GROUP BY 1, 2 ORDER BY 1, 2
+  `, [since, role]);
+
+  const { rows: types } = await db.query(`
+    SELECT n.title_key, COUNT(*)::int AS n
+    FROM notifications n
+    WHERE n.created_at >= $1 AND n.title_key IS NOT NULL
+    GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 80
+  `, [since]);
+
+  const num = (v) => (v === null || v === undefined ? null : Number(v));
+  res.json({
+    days, filters: { role, type, device },
+    push,
+    reads: {
+      total: reads.total, read: reads.read, read_push: reads.read_push, read_in_app: reads.read_in_app,
+      median_s: { push_click: num(reads.median_s_push), in_app: num(reads.median_s_in_app) },
+    },
+    subscriptions,
+    relances,
+    types,
   });
 }));
 

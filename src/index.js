@@ -136,10 +136,14 @@ app.set('trust proxy', 1);
 // ci-dessous, restent inchangés et s'appliquent en plus de celui-ci) continue de compter
 // normalement contre ce plafond global.
 const USER_KEYED_LIMITER_PATHS = /^\/api\/missions\/[^/]+\/(confirm-presence|candidate-confirm|interest)$/;
+// Chantier 2 lot 1 bis : POST /api/push/ack (accusés du service worker, 1 à 2 par push reçu) est
+// lui aussi exempté — sinon, derrière une IP partagée, les accusés de tous les appareils
+// épuiseraient ce plafond global au détriment des vraies actions. Il a son propre limiteur
+// (routes/push.js) et n'accepte qu'un jeton signé.
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
-  skip: (req) => req.path === '/health' || (req.method === 'POST' && USER_KEYED_LIMITER_PATHS.test(req.path)),
+  skip: (req) => req.path === '/health' || (req.method === 'POST' && (USER_KEYED_LIMITER_PATHS.test(req.path) || req.path === '/api/push/ack')),
   message: { error: 'Trop de requêtes, réessayez dans 15 minutes.' },
   standardHeaders: true,
   legacyHeaders: false,

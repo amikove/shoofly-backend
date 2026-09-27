@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const webpush = require('web-push');
 const Sentry = require('@sentry/node');
 const { getDb } = require('../db/schema');
@@ -104,6 +105,42 @@ function deepLinkFor(actionType, missionId = null, ctx = {}) {
   }
 }
 
+// ── Mesure (chantier 2 lot 1 bis, 2026-09-27) ─────────────────────────────────────────────────
+// Appareil d'un abonnement : 'android' | 'ios' | 'desktop'. L'indice du navigateur (envoyé par
+// le frontend à l'abonnement, détection iPadOS comprise) prime ; sinon déduit du user-agent. Un
+// abonnement Web Push n'existe que sur ces 3 familles (iOS : PWA installée uniquement).
+const DEVICES = new Set(['android', 'ios', 'desktop']);
+function deviceFromSubscription(userAgent, hint) {
+  if (DEVICES.has(hint)) return hint;
+  const ua = String(userAgent || '');
+  if (/android/i.test(ua)) return 'android';
+  if (/iphone|ipad|ipod/i.test(ua)) return 'ios';
+  return 'desktop';
+}
+
+// Jeton d'accusé d'un push : HMAC(notificationId.subscriptionId), clé dérivée de JWT_SECRET
+// (aucune nouvelle variable d'environnement). Glissé dans le contenu CHIFFRÉ du push (seul
+// l'appareil destinataire le lit) : le service worker n'a pas accès au JWT de l'app (stocké dans
+// localStorage), il prouve donc avec ce jeton qu'il a bien reçu CE push sur CET abonnement.
+// Aucune donnée personnelle : deux identifiants numériques + une signature.
+let ackKey = null;
+function getAckKey() {
+  if (!ackKey && process.env.JWT_SECRET) {
+    ackKey = crypto.createHmac('sha256', process.env.JWT_SECRET).update('shoofly-push-ack-v1').digest();
+  }
+  return ackKey;
+}
+function ackToken(notificationId, subscriptionId) {
+  const key = getAckKey();
+  if (!key) return null;
+  return crypto.createHmac('sha256', key).update(`${notificationId}.${subscriptionId}`).digest('base64url');
+}
+function verifyAckToken(notificationId, subscriptionId, token) {
+  const expected = ackToken(notificationId, subscriptionId);
+  if (!expected || typeof token !== 'string' || token.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+}
+
 // Délai d'attente par envoi (chantier 2, 2026-09-26) : un fournisseur push qui ne répond pas ne
 // doit pas garder indéfiniment une promesse (et, via le limiteur de notify(), une place de
 // concurrence). Option `timeout` de web-push = délai d'inactivité du socket.
@@ -141,10 +178,11 @@ async function logSend(db, row) {
   try {
     await db.query(
       `INSERT INTO push_send_log
-        (subscription_id, user_id, notification_id, event_key, status, provider_status, error_message)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        (subscription_id, user_id, notification_id, event_key, status, provider_status, error_message, device)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [row.subscription_id || null, row.user_id, row.notification_id || null,
-       row.event_key || null, row.status, row.provider_status || null, row.error_message || null]
+       row.event_key || null, row.status, row.provider_status || null, row.error_message || null,
+       row.device || null]
     );
   } catch (err) {
     console.error('[push] Échec écriture push_send_log :', err.message);
@@ -164,7 +202,7 @@ async function sendWebPush(userId, payload, db = getDb()) {
   let subs;
   try {
     const { rows } = await db.query(
-      `SELECT id, endpoint, keys FROM push_subscriptions WHERE user_id=$1 AND disabled_at IS NULL`,
+      `SELECT id, endpoint, keys, device FROM push_subscriptions WHERE user_id=$1 AND disabled_at IS NULL`,
       [userId]
     );
     subs = rows;
@@ -181,27 +219,36 @@ async function sendWebPush(userId, payload, db = getDb()) {
     return false;
   }
 
-  const payloadJson = JSON.stringify({
+  const baseContent = {
     title: payload.title,
     body: payload.body || '',
     url: payload.url || '/',
     tag: payload.tag || 'shoofly',
     urgent: !!payload.urgent,
-  });
+  };
 
   let anySent = false;
   for (const sub of subs) {
+    // Contenu PAR abonnement (lot 1 bis) : nid/sid/ack permettent au service worker d'accuser
+    // réception puis clic (POST /api/push/ack). Sans notification source (ou sans clé) : contenu
+    // d'avant, aucun accusé.
+    const content = { ...baseContent };
+    const token = payload.notificationId ? ackToken(payload.notificationId, sub.id) : null;
+    if (token) { content.nid = payload.notificationId; content.sid = sub.id; content.ack = token; }
+    const payloadJson = JSON.stringify(content);
     const result = await sendToSubscription(sub, payloadJson, { urgency: payload.urgency, ttl: payload.ttl });
     if (result.ok) {
       anySent = true;
+      // Ligne 'sent' écrite AVANT la mise à jour de l'abonnement (lot 1 bis) : l'accusé
+      // « delivered » du service worker vient la compléter et peut arriver très vite.
+      await logSend(db, {
+        subscription_id: sub.id, user_id: userId, notification_id: payload.notificationId,
+        event_key: payload.eventKey, status: 'sent', provider_status: 200, device: sub.device,
+      });
       await db.query(
         `UPDATE push_subscriptions SET last_push_at=NOW(), last_success_at=NOW(), failure_count=0 WHERE id=$1`,
         [sub.id]
       ).catch((e) => console.error('[push] MAJ succès abonnement échouée :', e.message));
-      await logSend(db, {
-        subscription_id: sub.id, user_id: userId, notification_id: payload.notificationId,
-        event_key: payload.eventKey, status: 'sent', provider_status: 200,
-      });
     } else if (result.gone) {
       await db.query(
         `UPDATE push_subscriptions SET last_push_at=NOW(), last_failure_at=NOW(), disabled_at=NOW() WHERE id=$1`,
@@ -209,7 +256,7 @@ async function sendWebPush(userId, payload, db = getDb()) {
       ).catch((e) => console.error('[push] Neutralisation abonnement échouée :', e.message));
       await logSend(db, {
         subscription_id: sub.id, user_id: userId, notification_id: payload.notificationId,
-        event_key: payload.eventKey, status: 'expired_endpoint', provider_status: result.statusCode,
+        event_key: payload.eventKey, status: 'expired_endpoint', provider_status: result.statusCode, device: sub.device,
         error_message: result.errorMessage,
       });
     } else {
@@ -219,7 +266,7 @@ async function sendWebPush(userId, payload, db = getDb()) {
       ).catch((e) => console.error('[push] Incrément échec abonnement échoué :', e.message));
       await logSend(db, {
         subscription_id: sub.id, user_id: userId, notification_id: payload.notificationId,
-        event_key: payload.eventKey, status: 'provider_error', provider_status: result.statusCode,
+        event_key: payload.eventKey, status: 'provider_error', provider_status: result.statusCode, device: sub.device,
         error_message: result.errorMessage,
       });
     }
@@ -249,4 +296,4 @@ async function checkPushHealth(db = getDb()) {
   }
 }
 
-module.exports = { sendWebPush, checkPushHealth, deepLinkFor, isPushConfigured };
+module.exports = { sendWebPush, checkPushHealth, deepLinkFor, isPushConfigured, deviceFromSubscription, ackToken, verifyAckToken };
