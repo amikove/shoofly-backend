@@ -2,6 +2,7 @@ const Sentry = require('@sentry/node');
 const { getSetting } = require('../utils/settings');
 const { sendWhatsAppTemplateRaw } = require('../services/wasel');
 const { withTransaction } = require('../services/walletService');
+const { RETIRED_TEMPLATE_NAMES } = require('../config/whatsappPolicy');
 
 // Seuil d'alerte de santé WhatsApp (voir checkWhatsAppHealth ci-dessous) — nombre d'échecs
 // distincts encore non résolus sur la dernière heure au-delà duquel on suspecte une panne
@@ -64,12 +65,17 @@ const RETRY_BATCH_LIMIT = 50;
 
 async function runWhatsAppRetry(db) {
   const maxAttempts = await getSetting(db, 'whatsapp_retry_max_attempts', 3);
+  // Chantier 2 (D9) : les échecs d'un modèle retiré par la politique d'envoi (Œils, clients hors
+  // « des Œils ont postulé », blocage anti-fraude — config/whatsappPolicy.js) ne sont plus retentés :
+  // un message dont l'envoi a été arrêté par décision ne doit pas repartir par la relance. Les
+  // lignes restent visibles telles quelles dans l'écran admin des échecs.
   const { rows: candidates } = await db.query(
     `SELECT id, retry_count FROM whatsapp_send_failures
      WHERE resolved_at IS NULL AND retry_count < $1
+       AND NOT (template_name = ANY($3::text[]))
      ORDER BY created_at ASC
      LIMIT $2`,
-    [maxAttempts, RETRY_BATCH_LIMIT]
+    [maxAttempts, RETRY_BATCH_LIMIT, [...RETIRED_TEMPLATE_NAMES]]
   );
 
   for (const candidate of candidates) {

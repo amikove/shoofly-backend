@@ -172,11 +172,7 @@ async function reassignMissionsOnSuspension(db, io, emitToUser, oeilId, opts = {
       const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la suspension de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`;
       await notify(db, oeilId, reassignTitle, reassignBody,
         'mission', mission.id, emitToUser, null, 'missionReassignedNoPenaltyTitle', 'missionReassignedNoPenaltyBody', { missionTitle: mission.title });
-
-      const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [oeilId]);
-      if (oeilContact?.phone) {
-        await sendWhatsAppTemplate(waselTemplates.oeil_reassigned_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
-      }
+      // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
     } catch (e) {
       // Groupe 3 point 3.4 (audit exhaustif backend 2026-09-05 §2.4) : l'échec de réattribution
       // d'UNE mission d'un Œil suspendu reste isolé — le lot continue, résilience DÉLIBÉRÉE
@@ -547,7 +543,7 @@ async function sendUrgentWhatsAppWave(db, mission, emitToUser = null) {
   const delayMinutes = await getSetting(db, 'urgent_mission_whatsapp_batch_delay_minutes', 30);
 
   const { rows: pool } = await db.query(
-    `SELECT u.id, u.phone FROM users u JOIN oeil_profiles p ON p.user_id=u.id
+    `SELECT u.id FROM users u JOIN oeil_profiles p ON p.user_id=u.id
      WHERE u.role='oeil' AND u.is_active=true AND u.is_suspended=false AND p.is_verified=true AND p.is_available=true
        AND u.city=$1
        AND u.id NOT IN (SELECT oeil_id FROM mission_whatsapp_contacts WHERE mission_id=$2)
@@ -566,11 +562,9 @@ async function sendUrgentWhatsAppWave(db, mission, emitToUser = null) {
       `INSERT INTO mission_whatsapp_contacts (mission_id, oeil_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
       [mission.id, o.id]
     );
-    if (o.phone) {
-      await sendWhatsAppTemplate(waselTemplates.urgent_mission_whatsapp_wave.template_name, o.phone, [mission.title, `${mission.price} MAD`]);
-    } else {
-      console.warn(`[wasel] Œil ${o.id} sans téléphone renseigné — envoi ignoré (urgent-mission-wave)`);
-    }
+    // Chantier 2 (2026-09-26, décision A) : le WhatsApp de la vague est retiré — la vague reste
+    // (même pool, mêmes lots, même anti-doublon mission_whatsapp_contacts, noms conservés) et ne
+    // passe plus que par la notification in-app + push ci-dessous.
     // Chantier notifications (2026-09-14), Partie A/C14 : en complément du WhatsApp ci-dessus
     // (100% mort tant que G5 n'est pas résolu, voir waselTemplates.js), jamais à sa place — c'est
     // le seul filet IA+push pour ce pool précis (Œils pas encore candidats, aucun autre chemin ne
@@ -1604,13 +1598,7 @@ router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req,
       'mission', mission.id, emitToUser, 'mission_view', 'editRequestPendingOeilTitle', 'editRequestPendingOeilBody',
       { missionTitle: mission.title, delayLabel }
     );
-
-    const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.oeil_id]);
-    if (oeilContact?.phone) {
-      await sendWhatsAppTemplate(waselTemplates.edit_proposed_to_oeil.template_name, oeilContact.phone, [mission.title, 'Modification proposée par le client']);
-    } else {
-      console.warn(`[wasel] Œil ${mission.oeil_id} sans téléphone renseigné — envoi ignoré (edit-request)`);
-    }
+    // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
 
     return res.status(202).json({
       edit_request: editRequest,
@@ -1738,10 +1726,7 @@ router.post('/edit-requests/:id/approve', authenticate, requireRole('oeil'), asy
     { missionTitle: mission.title }
   );
 
-  const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-  if (clientContact?.phone) {
-    await sendWhatsAppTemplate(waselTemplates.edit_request_approved.template_name, clientContact.phone, [mission.title, 'Modification acceptée par l\'Œil']);
-  }
+  // WhatsApp client retiré (chantier 2, décision D3 — config/whatsappPolicy.js).
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: updated.status });
   io.to('room:admin').emit('mission_updated', updated);
@@ -1805,10 +1790,7 @@ router.post('/edit-requests/:id/reject', authenticate, requireRole('oeil'), asyn
     { missionTitle: mission.title }
   );
 
-  const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-  if (clientContact?.phone) {
-    await sendWhatsAppTemplate(waselTemplates.edit_request_rejected.template_name, clientContact.phone, [mission.title, 'Mission remise en recherche']);
-  }
+  // WhatsApp client retiré (chantier 2, décision D3 — config/whatsappPolicy.js).
 
   io.to(`mission:${mission.id}`).emit('mission_status_changed', { missionId: mission.id, status: 'pending' });
   io.to('room:admin').emit('mission_updated', updatedMission);
@@ -2461,10 +2443,7 @@ router.post('/:id/status', authenticate, [
       await notify(db, mission.client_id, '💰 Remboursement', `${refund} MAD crédités sur votre portefeuille suite à l'annulation de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'fullRefundTitle', 'fullRefundBody', {amount: refund});
       if (mission.oeil_id) {
         await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
-        const { rows: [oeilContactCancel1] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.oeil_id]);
-        if (oeilContactCancel1?.phone) {
-          await sendWhatsAppTemplate(waselTemplates.mission_cancelled_oeil.template_name, oeilContactCancel1.phone, [mission.title, 'Annulée par l\'administrateur']);
-        }
+        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
       }
     } else {
       // Le client est traité comme "à l'origine" de l'annulation dans 2 cas :
@@ -2491,10 +2470,7 @@ router.post('/:id/status', authenticate, [
       // exclut sa propre notification, même logique que la branche admin/système ci-dessous).
       if (mission.oeil_id && mission.oeil_id !== req.user.id) {
         await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
-        const { rows: [oeilContactCancelCash] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.oeil_id]);
-        if (oeilContactCancelCash?.phone) {
-          await sendWhatsAppTemplate(waselTemplates.mission_cancelled_oeil.template_name, oeilContactCancelCash.phone, [mission.title, 'Annulée']);
-        }
+        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
       }
     } else if (initiatedByClient) {
       if (!mission.oeil_id) {
@@ -2506,19 +2482,13 @@ router.post('/:id/status', authenticate, [
       }
       if (mission.oeil_id) {
         await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
-        const { rows: [oeilContactCancel2] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.oeil_id]);
-        if (oeilContactCancel2?.phone) {
-          await sendWhatsAppTemplate(waselTemplates.mission_cancelled_oeil.template_name, oeilContactCancel2.phone, [mission.title, 'Annulée par le client']);
-        }
+        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
       }
     } else {
       await notify(db, mission.client_id, '💰 Remboursement intégral', `${refund} MAD crédités sur votre portefeuille suite à l'annulation de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'fullRefundTitle', 'fullRefundBody', {amount: refund});
       if (mission.oeil_id && mission.oeil_id !== req.user.id) {
         await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
-        const { rows: [oeilContactCancel3] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.oeil_id]);
-        if (oeilContactCancel3?.phone) {
-          await sendWhatsAppTemplate(waselTemplates.mission_cancelled_oeil.template_name, oeilContactCancel3.phone, [mission.title, 'Annulée par l\'administrateur']);
-        }
+        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
       }
     }
     }
@@ -2560,30 +2530,8 @@ router.post('/:id/status', authenticate, [
     await notify(db, mission.client_id, 'Mission terminée ✅', `"${mission.title}" est terminée. Vous avez 12h pour réclamer si nécessaire.`, 'mission', mission.id, emitToUser, null, 'missionCompletedClientTitle', 'missionCompletedClientBody', {missionTitle: mission.title});
     await notify(db, mission.oeil_id, 'Mission terminée', `"${mission.title}" marquée comme terminée. Paiement en attente de validation.`, 'mission', mission.id, emitToUser, null, 'missionCompletedOeilTitle', 'missionCompletedOeilBody', {missionTitle: mission.title});
 
-    // WhatsApp sur le numéro personnel du client — {{1}} nom de l'Œil, {{2}} titre de la mission.
-    // X-1/E-1 (audit perf/concurrence 2026-09-19/21, décision validée) — l'Œil qui clique
-    // « Terminer » attendait jusqu'ici cet appel Wasel (≤ 10 s) avant sa réponse, alors que la
-    // mission est DÉJÀ enregistrée 'completed' en base à ce stade (transitionMission, tout en
-    // haut de cette route). Même patron déjà validé pour notifyNewMission (POST /missions) :
-    // l'appel part en tâche de fond, sans jamais faire attendre l'action déjà actée ni jamais
-    // faire échouer la réponse déjà en cours de construction. sendWhatsAppTemplate ne lève de
-    // toute façon jamais (services/wasel.js) et journalise déjà tout échec réel dans
-    // whatsapp_send_failures (retenté par jobs/whatsappRetry.js) — le .catch() ici est un filet
-    // supplémentaire contre un bug futur dans cette fonction, jamais silencieux (log + Sentry).
-    // Contenu du message strictement inchangé (mêmes variables, même template) : seul le moment
-    // où il part change.
-    const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-    if (clientContact?.phone) {
-      const { rows: [oeilContact] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [mission.oeil_id]);
-      const oeilName = oeilContact ? `${oeilContact.first_name} ${oeilContact.last_name}`.trim() : 'Œil';
-      sendWhatsAppTemplate(waselTemplates.mission_completed_client.template_name, clientContact.phone, [oeilName, mission.title])
-        .catch((e) => {
-          console.error(`❌ WhatsApp completed (fond, mission ${mission.id}) :`, e.message);
-          Sentry.captureException(e, { level: 'error', tags: { area: 'whatsapp_completed_background' }, extra: { missionId: mission.id } });
-        });
-    } else {
-      console.warn(`[wasel] Client ${mission.client_id} sans téléphone renseigné — envoi ignoré (completed)`);
-    }
+    // WhatsApp client « mission terminée » retiré (chantier 2, décision D3 —
+    // config/whatsappPolicy.js) : la notification in-app + push ci-dessus est le canal.
   }
   
 
@@ -2990,10 +2938,19 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), interestLimiter,
           [req.params.id]
         );
         if (rowCount > 0) {
-          const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-          if (clientContact?.phone) {
-            await sendWhatsAppTemplate(waselTemplates.oeil_applied.template_name, clientContact.phone, [String(interestCount), mission.title]);
-          }
+          // Chantier 2 (2026-09-26) : envoi en ARRIÈRE-PLAN — la candidature de l'Œil n'attend
+          // plus jamais Wasel (jusqu'à 10 s si le fournisseur ne répond pas). La garde atomique
+          // ci-dessus reste dans la requête : un seul envoi par mission, comme avant.
+          // sendWhatsAppTemplate ne lève jamais ; le .catch couvre la lecture du téléphone.
+          (async () => {
+            const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
+            if (clientContact?.phone) {
+              await sendWhatsAppTemplate(waselTemplates.oeil_applied.template_name, clientContact.phone, [String(interestCount), mission.title]);
+            }
+          })().catch((e) => {
+            console.error(`❌ WhatsApp candidatures (fond, mission ${mission.id}) :`, e.message);
+            Sentry.captureException(e, { level: 'error', tags: { area: 'whatsapp_oeil_applied_background' }, extra: { missionId: mission.id } });
+          });
         }
       }
     }
@@ -3975,7 +3932,7 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
       });
     }
 
-  const { rows: [oeil] } = await db.query('SELECT first_name, last_name, phone FROM users WHERE id=$1', [oeil_id]);
+  const { rows: [oeil] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [oeil_id]);
 
   // Trace de l'override — si l'admin a dû passer outre suspension/anti-fraude/cooldown, consigné
   // dans mission_status_history.note (même mécanisme que toute transition, voir transitionMission
@@ -4053,19 +4010,13 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     `L'admin vous a assigné la mission "${mission.title}". Vérifiez les détails.`,
     'mission', mission.id, emitToUser, null, 'missionAssignedByAdminTitle', 'missionAssignedByAdminBody', {missionTitle: mission.title}
   );
-  if (oeil.phone) {
-    await sendWhatsAppTemplate(waselTemplates.mission_assigned_by_admin_oeil.template_name, oeil.phone, [mission.title]);
-  }
+  // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
   await notify(db, mission.client_id,
     '✅ Œil trouvé',
     `Un Œil a été assigné à votre mission "${mission.title}".`,
     'mission', mission.id, emitToUser, null, 'oeilFoundClientTitle', 'oeilFoundClientBody', {missionTitle: mission.title}
   );
-  const { rows: [clientContactAssign] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-  if (clientContactAssign?.phone) {
-    const oeilNameAssign = `${oeil.first_name} ${oeil.last_name}`;
-    await sendWhatsAppTemplate(waselTemplates.oeil_assigned_client.template_name, clientContactAssign.phone, [oeilNameAssign, mission.title]);
-  }
+  // WhatsApp client retiré (chantier 2, décision D3 — config/whatsappPolicy.js).
 
   // Notifier les Œils non retenus — même bloc que hireOeilCore (CONSTAT 14, audit-360) :
   // une affectation manuelle admin court-circuite la cascade au même titre qu'une sélection
@@ -4279,15 +4230,7 @@ async function checkTransferDeadlines(db, io, emitToUser) {
       'error', mission.id, emitToUser, 'mission_view', 'missionCancelledNoReplacementTitle',
       'missionCancelledNoReplacementBody', null);
 
-    // Gabarit WhatsApp approuvé affirme explicitement un montant remboursé ({{2}}) — texte figé
-    // côté Wasel/Meta. Aucun remboursement n'existant pour une mission cash, sauté pour 'cash'
-    // plutôt qu'envoyé avec un montant trompeur (0 MAD).
-    if (mission.payment_method === 'payzone') {
-      const { rows: [clientContactNoReplacement] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-      if (clientContactNoReplacement?.phone) {
-        await sendWhatsAppTemplate(waselTemplates.mission_cancelled_no_replacement_client.template_name, clientContactNoReplacement.phone, [mission.title, `${refund} MAD`]);
-      }
-    }
+    // WhatsApp client retiré (chantier 2, décision D3 — config/whatsappPolicy.js).
     } catch (e) {
       console.error(`❌ checkTransferDeadlines: mission ${mission.id} error:`, e.message);
     }
@@ -4397,10 +4340,7 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
       { missionTitle: mission.title }
     );
 
-    const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [oeilId]);
-    if (oeilContact?.phone) {
-      await sendWhatsAppTemplate(waselTemplates.presence_not_confirmed_no_penalty.template_name, oeilContact.phone, [mission.title, 'Aucune pénalité']);
-    }
+    // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
 
     for (const admin of admins) {
       await notify(db, admin.id,
@@ -4637,15 +4577,7 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   // Notifier l'Œil embauché
   await notify(db, oeilId, oeilNotifTitle, oeilNotifBody, 'hired', mission.id, emitToUser, null, oeilNotifTitleKey, oeilNotifBodyKey, oeilNotifParams);
 
-  // WhatsApp sur le numéro personnel de l'Œil embauché — {{1}} nom du client qui l'a choisi.
-  const { rows: [oeilContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [oeilId]);
-  if (oeilContact?.phone) {
-    const { rows: [clientContact] } = await db.query('SELECT first_name, last_name FROM users WHERE id=$1', [mission.client_id]);
-    const clientName = clientContact ? `${clientContact.first_name} ${clientContact.last_name}`.trim() : 'Client';
-    await sendWhatsAppTemplate(waselTemplates.oeil_hired.template_name, oeilContact.phone, [clientName]);
-  } else {
-    console.warn(`[wasel] Œil ${oeilId} sans téléphone renseigné — envoi ignoré (hire)`);
-  }
+  // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
 
   // Notifier les Œils non retenus
   const { rows: others } = await db.query(
@@ -4778,31 +4710,19 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
       [mission.id, candidateIds]
     );
 
-    // Sollicitation SIMULTANÉE de tout le lot (notification in-app + WhatsApp à chacun).
-    // Téléphones résolus en un seul aller-retour (au lieu d'un SELECT par candidat, jusqu'à
-    // candidate_batch_size — audit perf 2026-07-26) : la liste ne bouge pas pendant la boucle.
-    const { rows: candidateContacts } = await db.query(
-      'SELECT id, phone FROM users WHERE id = ANY($1::text[])', [candidateIds]
-    );
-    const phoneById = new Map(candidateContacts.map(c => [c.id, c.phone]));
-    // Audit santé technique 2026-09-18, §3.7 : le commentaire ci-dessus promettait déjà une
-    // sollicitation "SIMULTANÉE", mais l'implémentation était un for...await séquentiel — jusqu'à
-    // candidate_batch_size (défaut 10) × ~10s de timeout WhatsApp dans le pire cas (~100s
-    // cumulés). Promise.all fait enfin correspondre le code à ce que ce commentaire annonçait
-    // depuis toujours : chaque candidat est indépendant des autres, aucun ordre à préserver.
-    await Promise.all(candidateIds.map(async (nextOeilId) => {
-      await notify(db, nextOeilId,
-        '🎯 Confirmez votre disponibilité',
-        `Vous êtes parmi les candidats les mieux classés pour "${mission.title}". Confirmez votre disponibilité sous ${confirmationMinutes} min pour être considéré.`,
-        'mission', mission.id, emitToUser, 'mission_view', 'candidateConfirmRequestTitle', 'candidateConfirmRequestBody',
-        { missionTitle: mission.title, minutes: confirmationMinutes }
-      );
-
-      const candidatePhone = phoneById.get(nextOeilId);
-      if (candidatePhone) {
-        await sendWhatsAppTemplate(waselTemplates.candidate_confirmation_request.template_name, candidatePhone, [mission.title, String(confirmationMinutes)]);
-      }
-    }));
+    // Sollicitation SIMULTANÉE de tout le lot : notification in-app + push à chacun (Promise.all,
+    // chaque candidat est indépendant — audit santé technique 2026-09-18, §3.7).
+    // Chantier 2 (2026-09-26, décision A) : plus de WhatsApp. Le push porte l'urgence « high » et
+    // un TTL égal au délai de confirmation : il doit réveiller l'appareil tout de suite, et ne
+    // présente plus d'intérêt (ni ne doit être livré) une fois la fenêtre du lot fermée. Le repli
+    // par e-mail des sollicitations non lues (jobs/unreadWhatsappEmailFallback.js) est inchangé.
+    await Promise.all(candidateIds.map((nextOeilId) => notify(db, nextOeilId,
+      '🎯 Confirmez votre disponibilité',
+      `Vous êtes parmi les candidats les mieux classés pour "${mission.title}". Confirmez votre disponibilité sous ${confirmationMinutes} min pour être considéré.`,
+      'mission', mission.id, emitToUser, 'mission_view', 'candidateConfirmRequestTitle', 'candidateConfirmRequestBody',
+      { missionTitle: mission.title, minutes: confirmationMinutes },
+      { urgency: 'high', ttl: confirmationMinutes * 60 }
+    )));
 
     if (io) io.to('room:admin').emit('mission_updated', { id: mission.id, pending_candidate_id: candidateIds[0], batch_candidate_count: candidateIds.length });
   } else {
@@ -5227,10 +5147,7 @@ async function checkMissionEditRequestExpiry(db, io, emitToUser) {
         { missionTitle: mission.title }
       );
 
-      const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-      if (clientContact?.phone) {
-        await sendWhatsAppTemplate(waselTemplates.edit_request_expired.template_name, clientContact.phone, [mission.title, 'Mission remise en recherche']);
-      }
+      // WhatsApp client retiré (chantier 2, décision D3 — config/whatsappPolicy.js).
 
       // Relance la cascade — transfer_type/transferred_from volontairement NULL, même
       // justification que POST /edit-requests/:id/reject (éviter la pénalité -10 de

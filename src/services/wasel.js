@@ -1,4 +1,5 @@
 const { getDb } = require('../db/schema');
+const { isTemplateRetired } = require('../config/whatsappPolicy');
 
 const WASEL_BASE_URL = 'https://wasel-api.wasel.ma/external/v1';
 
@@ -24,6 +25,12 @@ function sanitizeTemplateVariable(value) {
 // d'erreur. `skipped:true` distingue un envoi jamais tenté (config/donnée manquante, pas un
 // échec réseau/API) d'un vrai échec d'envoi — seul ce dernier doit être journalisé/retenté.
 async function sendWhatsAppTemplateRaw(templateName, phone, variables) {
+  // Politique d'envoi (chantier 2, config/whatsappPolicy.js) : modèle retiré → jamais envoyé,
+  // ni journalisé comme échec (skipped), quel que soit l'appelant (route, cron ou relance).
+  if (isTemplateRetired(templateName)) {
+    console.warn(`[wasel] Modèle retiré par la politique d'envoi — envoi refusé (template=${templateName})`);
+    return { ok: false, skipped: true, retired: true };
+  }
   const apiKey = process.env.WASEL_API_KEY;
   if (!apiKey) {
     console.warn(`[wasel] WASEL_API_KEY non configurée — envoi ignoré (template=${templateName})`);

@@ -609,7 +609,7 @@ initDb().then(() => {
 
         // Migré vers notify() (chantier push, Phase 1.1) : in-app + socket live (l'emit partiel
         // devient la ligne complète, deep-link + marquage lu possibles) + canal push. P1 —
-        // l'Œil perd la mission à la deadline s'il ne voit rien (matrice L2). WA inchangé.
+        // l'Œil perd la mission à la deadline s'il ne voit rien (matrice L2). WhatsApp retiré (chantier 2).
         await notify(
           db, m.oeil_id,
           '✅ Confirmez votre présence — mission demain',
@@ -618,11 +618,8 @@ initDb().then(() => {
           'presenceConfirmationRequestJ1Title', 'presenceConfirmationRequestJ1Body',
           { missionTitle: m.title, time: missionTime, deadlineTime }
         );
-        if (m.phone) {
-          await sendWhatsAppTemplate(waselTemplates.presence_confirmation_request_j1.template_name, m.phone, [m.title, deadlineTime]);
-        } else {
-          console.warn(`[wasel] Œil ${m.oeil_id} sans téléphone renseigné — envoi ignoré (presence_confirmation_request_j1)`);
-        }
+        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js) : la
+        // notification in-app + push ci-dessus est le canal.
         console.log(`⏰ Confirmation de présence demandée (J-1) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
         } catch (e) { console.error(`❌ Cron J-1 (Œil) — mission ${m.id} :`, e.message); }
       }
@@ -668,7 +665,7 @@ initDb().then(() => {
         // Migré vers notify() (chantier push, Phase 1.1) : in-app + socket live (ligne complète)
         // + canal push. P3 informatif (aucune confirmation attendue du client). Inclus par
         // cohérence avec C7 (rappel client H-2) et parce qu'il partage ce tick avec C1.
-        // type='mission' conservé tel quel. WA inchangé.
+        // type='mission' conservé tel quel. WhatsApp retiré (chantier 2).
         await notify(
           db, m.client_id,
           '📅 Rappel — mission demain',
@@ -677,11 +674,8 @@ initDb().then(() => {
           'clientReminderJ1Title', 'clientReminderJ1Body',
           { missionTitle: m.title, time: missionTimeClient }
         );
-        if (m.phone) {
-          await sendWhatsAppTemplate(waselTemplates.mission_reminder_j1_client.template_name, m.phone, [m.title, missionTimeClient]);
-        } else {
-          console.warn(`[wasel] Client ${m.client_id} sans téléphone renseigné — envoi ignoré (mission_reminder_j1_client)`);
-        }
+        // WhatsApp client retiré (chantier 2, décision D3 — config/whatsappPolicy.js) :
+        // notification in-app + push ci-dessus.
         console.log(`📅 Rappel J-1 envoyé au client pour mission ${m.id}`);
         } catch (e) { console.error(`❌ Cron J-1 (client) — mission ${m.id} :`, e.message); }
       }
@@ -811,7 +805,7 @@ initDb().then(() => {
         // nom de l'Œil) au lieu du sien (« Votre mission a commencé ») — la ligne DB de l'Œil
         // était déjà correcte, seul le payload socket live était le mauvais. Le
         // `ON CONFLICT DO NOTHING` d'origine était inopérant (notifications n'a aucune
-        // contrainte unique). WA inchangé.
+        // contrainte unique). WhatsApp retiré (chantier 2).
         await notify(
           db, m.oeil_id,
           '🚨 Votre mission a commencé !',
@@ -819,9 +813,7 @@ initDb().then(() => {
           'error', m.id, emitToUser, 'mission_view',
           'missionStartedAlertTitle', 'missionStartedAlertBody', { missionTitle: m.title }
         );
-        if (m.phone) {
-          await sendWhatsAppTemplate(waselTemplates.mission_late_alert_oeil.template_name, m.phone, [m.title]);
-        }
+        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
         // Alerte admin (liste récupérée une seule fois par tick) — migré vers notify() : passe
         // en socket live (emitToUser en scope, corrige L13) + canal push.
         for (const admin of admins) {
@@ -1104,7 +1096,7 @@ initDb().then(() => {
         const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
         // Migré vers notify() (chantier push, Phase 1.1) : + socket live (emit partiel → ligne
-        // complète) + canal push. P1 (matrice L2/L6 : l'Œil perd la mission à la deadline). WA inchangé.
+        // complète) + canal push. P1 (matrice L2/L6 : l'Œil perd la mission à la deadline). WhatsApp retiré (chantier 2).
         await notify(
           db, m.oeil_id,
           '✅ Confirmez votre présence — mission bientôt',
@@ -1113,11 +1105,7 @@ initDb().then(() => {
           'presenceConfirmationRequestSamedayTitle', 'presenceConfirmationRequestSamedayBody',
           { missionTitle: m.title, deadlineTime }
         );
-        if (m.phone) {
-          await sendWhatsAppTemplate(waselTemplates.presence_confirmation_request_sameday.template_name, m.phone, [m.title, deadlineTime]);
-        } else {
-          console.warn(`[wasel] Œil ${m.oeil_id} sans téléphone renseigné — envoi ignoré (presence_confirmation_request_sameday)`);
-        }
+        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
         console.log(`⏰ Confirmation de présence demandée (H-2) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
         } catch (e) { console.error(`❌ Cron H-2 — mission ${m.id} :`, e.message); }
       }
@@ -1162,7 +1150,7 @@ initDb().then(() => {
 
         // Migré vers notify() (chantier push, Phase 1.1) : + socket live (emit partiel → ligne
         // complète) + canal push. P1. Le repli email (C17, presence_confirmation_h45_email_sent_at)
-        // reste le filet — inchangé, il lit is_read sur cette même ligne. WA inchangé.
+        // reste le filet — inchangé, il lit is_read sur cette même ligne. WhatsApp retiré (chantier 2).
         await notify(
           db, m.oeil_id,
           '✅ Confirmez votre présence — mission imminente',
@@ -1171,11 +1159,7 @@ initDb().then(() => {
           'presenceConfirmationRequestH45Title', 'presenceConfirmationRequestH45Body',
           { missionTitle: m.title, lateMinutes: reminderLateMinutes, deadlineTime }
         );
-        if (m.phone) {
-          await sendWhatsAppTemplate(waselTemplates.presence_confirmation_request_h45.template_name, m.phone, [m.title, deadlineTime]);
-        } else {
-          console.warn(`[wasel] Œil ${m.oeil_id} sans téléphone renseigné — envoi ignoré (presence_confirmation_request_h45)`);
-        }
+        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
         console.log(`⏰ Confirmation de présence demandée (H-45) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
 
         // Alerte admin passive (inchangée dans son principe — informe qu'une mission approche
@@ -1246,7 +1230,7 @@ initDb().then(() => {
         );
         if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
         // Migré vers notify() (chantier push, Phase 1.1) : + socket live (ligne complète) +
-        // canal push. P3 informatif. type='mission' conservé tel quel. WA inchangé.
+        // canal push. P3 informatif. type='mission' conservé tel quel. WhatsApp retiré (chantier 2).
         await notify(
           db, m.client_id,
           '📅 Rappel — mission bientôt',
@@ -1255,11 +1239,7 @@ initDb().then(() => {
           'clientReminderH2Title', 'clientReminderH2Body',
           { missionTitle: m.title, minutes: reminderEarlyMinutes }
         );
-        if (m.phone) {
-          await sendWhatsAppTemplate(waselTemplates.mission_reminder_h2_client.template_name, m.phone, [m.title, String(reminderEarlyMinutes)]);
-        } else {
-          console.warn(`[wasel] Client ${m.client_id} sans téléphone renseigné — envoi ignoré (mission_reminder_h2_client)`);
-        }
+        // WhatsApp client retiré (chantier 2, décision D3 — config/whatsappPolicy.js).
         console.log(`📅 Rappel H-2 envoyé au client pour mission ${m.id}`);
         } catch (e) { console.error(`❌ Cron rappel client H-2 — mission ${m.id} :`, e.message); }
       }

@@ -5,8 +5,6 @@ const { requirePermission } = require('../middleware/permissions');
 const { getSetting } = require('../utils/settings');
 const asyncHandler = require('../middleware/asyncHandler');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
-const { sendWhatsAppTemplate } = require('../services/wasel');
-const waselTemplates = require('../config/waselTemplates');
 const Sentry = require('@sentry/node');
 // Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
 // de dupliquer la logique de sélection de candidat — même approche que
@@ -437,7 +435,7 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
     if (reason.length > 500) {
       return res.status(400).json({ error: 'La raison ne doit pas dépasser 500 caractères.' });
     }
-    const { rows: [target] } = await db.query('SELECT role, phone FROM users WHERE id=$1', [req.params.userId]);
+    const { rows: [target] } = await db.query('SELECT role FROM users WHERE id=$1', [req.params.userId]);
     if (!target) return res.status(404).json({ error: 'Introuvable' });
     if (target.role === 'admin' && !req.user.is_super_admin) {
       return res.status(403).json({ error: 'Seul le Super Admin peut bloquer un compte administrateur.' });
@@ -464,13 +462,9 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
     `INSERT INTO notifications (user_id,title,body,type,action_type,title_key,body_key,params) VALUES ($1,'Compte suspendu',$2,'info','none',$3,$4,$5)`,
     [req.params.userId, suspensionReason, 'accountSuspendedTitle', reason ? null : 'accountSuspendedDefaultBody', null]
   );
-  // Cas particulier (voir waselTemplates.js) : seul canal encore capable d'atteindre cet
-  // utilisateur puisqu'il ne peut plus se connecter à l'app (is_active=false). Ne s'applique
-  // QU'à cette route précise — jamais à PUT /users/admin/:id/toggle-active (désactivation
-  // générique, accès conservé, aucun WhatsApp).
-  if (target.phone) {
-    await sendWhatsAppTemplate(waselTemplates.account_blocked_fraud_oeil.template_name, target.phone, [suspensionReason]);
-  }
+  // Chantier 2 (2026-09-26, décision D7) : plus de WhatsApp au blocage, quel que soit le rôle
+  // (config/whatsappPolicy.js). Le compte bloqué découvre le motif à sa prochaine ouverture de
+  // l'app (403 + écran /compte-bloque, chantier L4) et via la notification in-app ci-dessus.
 
   // Si l'utilisateur bloqué est un Œil avec des missions en cours, réattribution automatique
   // via la cascade de confirmation séquentielle partagée (transitionMission + advanceCandidateCascade),
