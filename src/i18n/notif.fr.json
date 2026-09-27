@@ -61,6 +61,8 @@
   "newOeilInterestBody": "Un Œil est intéressé par votre mission : {{missionTitle}}",
   "candidatureRelanceClientTitle": "Des Œils attendent votre choix 👁️",
   "candidatureRelanceClientBody": "{{count}} candidature(s) pour \"{{missionTitle}}\". Choisissez votre Œil pour confirmer la mission.",
+  "candidatureSeuilClientTitle": "Des Œils ont postulé 👁️",
+  "candidatureSeuilClientBody": "Candidatures reçues pour \"{{missionTitle}}\" : {{count}}. Choisissez votre Œil pour confirmer la mission.",
   "assistanceMissionRequestClientTitle": "🆘 Votre Œil signale un problème",
   "assistanceMissionRequestClientBody": "Votre Œil a signalé : \"{{reason}}\" sur la mission \"{{missionTitle}}\". Merci de confirmer si vous validez sa déclaration (vous avez {{hours}}h).",
   "assistanceValidatedOeilTitle": "💰 Paiement reçu !",

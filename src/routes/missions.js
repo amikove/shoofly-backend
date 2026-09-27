@@ -14,8 +14,6 @@ const { casablancaYMD } = require('../utils/schedule');
 const { logStatus } = require('../utils/missionHistory');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const walletService = require('../services/walletService');
-const { sendWhatsAppTemplate } = require('../services/wasel');
-const waselTemplates = require('../config/waselTemplates');
 const asyncHandler = require('../middleware/asyncHandler');
 const Sentry = require('@sentry/node');
 const { resolveQuartier, validateCityInput } = require('../constants/villes');
@@ -35,6 +33,7 @@ const { parsePagination } = require('../utils/pagination');
 // Extrait ici (il y vivait, dupliqué à l'identique dans routes/tickets.js) sans changer sa
 // signature ni ses appelants ; router.notify = notify plus bas reste l'export lu par index.js.
 const { notify } = require('../utils/notify');
+const { scheduleClientAppliedRelance } = require('../jobs/whatsappRelances');
 
 
 async function getCommissionRate(db) {
@@ -2153,6 +2152,13 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
     return res.status(403).json({ error: 'Accès refusé' });
   }
 
+  // Chantier 2 lot 1 bis (décision BOSS B) : « le client a ouvert la liste des candidats » —
+  // critère d'annulation de la relance WhatsApp oeil_applied (jobs/whatsappRelances.js). Seul le
+  // client de la mission compte (pas un admin) ; seul appelant frontend : InterestsModal.
+  if (mission.client_id === req.user.id) {
+    await db.query('UPDATE missions SET client_interests_viewed_at = NOW() WHERE id = $1', [mission.id]);
+  }
+
   const { rows } = await db.query(
       `SELECT u.id, u.first_name, u.last_name, u.city, u.avatar_url,
               p.rating_avg, p.rating_count, p.total_missions, p.bio, p.coverage_zone,
@@ -2938,19 +2944,20 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), interestLimiter,
           [req.params.id]
         );
         if (rowCount > 0) {
-          // Chantier 2 (2026-09-26) : envoi en ARRIÈRE-PLAN — la candidature de l'Œil n'attend
-          // plus jamais Wasel (jusqu'à 10 s si le fournisseur ne répond pas). La garde atomique
-          // ci-dessus reste dans la requête : un seul envoi par mission, comme avant.
-          // sendWhatsAppTemplate ne lève jamais ; le .catch couvre la lecture du téléphone.
-          (async () => {
-            const { rows: [clientContact] } = await db.query('SELECT phone FROM users WHERE id=$1', [mission.client_id]);
-            if (clientContact?.phone) {
-              await sendWhatsAppTemplate(waselTemplates.oeil_applied.template_name, clientContact.phone, [String(interestCount), mission.title]);
-            }
-          })().catch((e) => {
-            console.error(`❌ WhatsApp candidatures (fond, mission ${mission.id}) :`, e.message);
-            Sentry.captureException(e, { level: 'error', tags: { area: 'whatsapp_oeil_applied_background' }, extra: { missionId: mission.id } });
-          });
+          // Chantier 2 lot 1 bis (décision BOSS B) : au seuil, notification + push au client. Le
+          // WhatsApp oeil_applied n'est plus qu'une RELANCE, envoyée en arrière-plan par le cron
+          // des relances (jobs/whatsappRelances.js) après candidature_whatsapp_relance_minutes,
+          // seulement si le client n'a ni lu cette notification ni ouvert la liste des candidats.
+          // La garde atomique ci-dessus reste l'anti-doublon du seuil (un par mission) ; la
+          // candidature n'attend jamais Wasel.
+          const seuilNotif = await notify(
+            db, mission.client_id,
+            'Des Œils ont postulé 👁️',
+            `Candidatures reçues pour "${mission.title}" : ${interestCount}. Choisissez votre Œil pour confirmer la mission.`,
+            'interest', mission.id, emitToUser, 'interests_modal',
+            'candidatureSeuilClientTitle', 'candidatureSeuilClientBody', { missionTitle: mission.title, count: interestCount }
+          );
+          await scheduleClientAppliedRelance(db, mission.id, mission.client_id, seuilNotif && seuilNotif.id);
         }
       }
     }

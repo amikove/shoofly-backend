@@ -127,6 +127,15 @@ module.exports = {
   // confirmation de présence H-45) reste non lue ce délai après l'envoi — voir cron dédié,
   // index.js, et services/email.js.
   unread_whatsapp_email_fallback_minutes: '5',
+  // Chantier 2 lot 1 bis (décisions BOSS du 2026-09-27) — WhatsApp en RELANCE seulement
+  // (jobs/whatsappRelances.js). Présence Œil : délai après chaque demande de confirmation (J-1,
+  // H-2, H-45) au-delà duquel, si la présence n'est toujours pas confirmée, le WhatsApp part.
+  // Client : délai après la notification « des Œils ont postulé » au-delà duquel, si le client
+  // n'a ni lu cette notification ni ouvert la liste des candidats, le WhatsApp oeil_applied part.
+  presence_whatsapp_relance_j1_minutes: '60',
+  presence_whatsapp_relance_h2_minutes: '20',
+  presence_whatsapp_relance_h45_minutes: '10',
+  candidature_whatsapp_relance_minutes: '30',
   // ── Anti-fraude (routes/antiFraud.js) ────────────────────────────────────────────────────
   // Fenêtres de détection du moteur de score de risque (analyzeUser) et de l'écran admin
   // Anti-fraude. Défauts = valeurs exactes précédemment codées en dur (audit

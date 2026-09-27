@@ -61,6 +61,8 @@
   "newOeilInterestBody": "عين ميدانية مهتمة : {{missionTitle}}",
   "candidatureRelanceClientTitle": "عيون ميدانية بانتظار اختيارك 👁️",
   "candidatureRelanceClientBody": "عدد الترشحات لمهمة \"{{missionTitle}}\": {{count}}. اختر العين الميدانية لتأكيد المهمة.",
+  "candidatureSeuilClientTitle": "عيون ميدانية ترشحت لمهمتك 👁️",
+  "candidatureSeuilClientBody": "عدد الترشحات لمهمة \"{{missionTitle}}\": {{count}}. اختر العين الميدانية لتأكيد المهمة.",
   "assistanceMissionRequestClientTitle": "🆘 العين الخاصة بك تبلغ عن مشكلة",
   "assistanceMissionRequestClientBody": "أبلغت العين: \"{{reason}}\" بخصوص المهمة \"{{missionTitle}}\". يرجى تأكيد ما إذا كنت توافق على تصريحها (لديك {{hours}} ساعة).",
   "assistanceValidatedOeilTitle": "💰 تم استلام الدفع!",

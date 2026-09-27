@@ -82,6 +82,10 @@ async function sendPushFor(db, row, { userId, title, body, type, missionId, acti
 // pushOptions (chantier 2, 2026-09-26) : { urgency?, ttl? } — options de LIVRAISON du push
 // (en-têtes Urgency / TTL), sans effet sur l'in-app. Utilisé par la sollicitation de cascade
 // (urgency 'high', ttl = délai de confirmation) ; absent partout ailleurs → comportement d'avant.
+//
+// Valeur de retour (chantier 2 lot 1 bis, 2026-09-27) : la ligne de la table notifications insérée — les
+// relances WhatsApp (jobs/whatsappRelances.js) s'y rattachent (lecture, mesure). Les appelants
+// existants l'ignorent.
 async function notify(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null, pushOptions = null) {
   const r = await db.query(
     `INSERT INTO notifications (user_id,title,body,type,mission_id,action_type,title_key,body_key,params) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
@@ -93,10 +97,11 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
   // plus aucune lecture users pour un envoi qui n'aurait pas lieu (SC-5). Sinon : jamais
   // attendu, jamais bloquant, ne lève jamais ; concurrence bornée (limitPush). `tag` dédupe côté
   // navigateur si l'utilisateur est multi-appareils et déjà en train de lire.
-  if (!push.isPushConfigured()) return;
   const row = r.rows[0];
+  if (!push.isPushConfigured()) return row;
   limitPush(() => sendPushFor(db, row, { userId, title, body, type, missionId, actionType, titleKey, bodyKey, params, pushOptions }))
     .catch(() => {});
+  return row;
 }
 
 module.exports = { notify };

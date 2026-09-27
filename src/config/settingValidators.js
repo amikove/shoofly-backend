@@ -116,6 +116,10 @@ const SETTING_RULES = {
   candidature_relance_interval_minutes:        { min: 0 }, // jobs/candidatureRelance.js:21/35
   candidature_relance_imminent_threshold_minutes:{ min: 0 }, // jobs/candidatureRelance.js:22
   unread_whatsapp_email_fallback_minutes:      { min: 0 }, // jobs/unreadWhatsappEmailFallback.js:13/24
+  presence_whatsapp_relance_j1_minutes:        { min: 0 }, // jobs/whatsappRelances.js  due_at = demande + INTERVAL '1 minute' * $n
+  presence_whatsapp_relance_h2_minutes:        { min: 0 }, // jobs/whatsappRelances.js
+  presence_whatsapp_relance_h45_minutes:       { min: 0 }, // jobs/whatsappRelances.js
+  candidature_whatsapp_relance_minutes:        { min: 0 }, // jobs/whatsappRelances.js  due_at = NOW() + INTERVAL '1 minute' * $n
   whatsapp_retry_max_attempts:                 { min: 0 }, // jobs/whatsappRetry.js:49  retry_count < $1 (0 = plus de retente)
   payment_attempt_abandoned_minutes:           { min: 0 }, // payments.js:194/202
   no_show_h30_debit_cap_mad:                   { min: 0 }, // index.js:786  Math.min(cap, balance) (0 = pas de débit)

@@ -1702,6 +1702,36 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- Analytics par type d'événement / lien vers la ligne in-app source.
     CREATE INDEX IF NOT EXISTS idx_push_send_log_notification ON push_send_log(notification_id) WHERE notification_id IS NOT NULL;
 
+    -- ═══ Chantier 2 lot 1 bis (décisions BOSS du 2026-09-27) — WhatsApp en relance seulement ═══
+    -- AJOUT PUREMENT ADDITIF (colonne nullable, table neuve, index), idempotent.
+    -- Relance « des Œils ont postulé » : le client a ouvert la liste des candidats (GET
+    -- /missions/:id/interests appelé par le client lui-même — seul appelant : InterestsModal).
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS client_interests_viewed_at TIMESTAMPTZ;
+    -- whatsapp_relances : un WhatsApp de RELANCE programmé (jobs/whatsappRelances.js). Une ligne
+    -- par (mission, étape) — UNIQUE : jamais deux relances pour la même étape d'une mission, quel
+    -- que soit le nombre de processus. decided_at posé par l'UPDATE qui décide ET réserve la ligne
+    -- (garde decided_at IS NULL : un seul processus gagne). outcome = raison enregistrée :
+    --   sent | failed (Wasel a refusé : ligne whatsapp_send_failures, retentée par whatsappRetry)
+    --   skipped_confirmed (présence confirmée) | skipped_read (notification lue)
+    --   skipped_viewed (liste des candidats ouverte) | skipped_obsolete (Œil changé, point de
+    --   contrôle rouvert, délai de réponse expiré, mission plus en attente)
+    --   skipped_no_phone | sending (réservée, envoi en cours ou interrompu : jamais renvoyée).
+    CREATE TABLE IF NOT EXISTS whatsapp_relances (
+      id              BIGSERIAL PRIMARY KEY,
+      kind            TEXT NOT NULL CHECK (kind IN ('presence_j1','presence_h2','presence_h45','client_oeil_applied')),
+      mission_id      TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      notification_id INTEGER REFERENCES notifications(id) ON DELETE SET NULL,
+      request_at      TIMESTAMPTZ,
+      due_at          TIMESTAMPTZ NOT NULL,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      decided_at      TIMESTAMPTZ,
+      outcome         TEXT CHECK (outcome IN ('sending','sent','failed','skipped_confirmed','skipped_read','skipped_viewed','skipped_obsolete','skipped_no_phone')),
+      UNIQUE (mission_id, kind)
+    );
+    CREATE INDEX IF NOT EXISTS idx_whatsapp_relances_due ON whatsapp_relances (due_at) WHERE decided_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_whatsapp_relances_created_at ON whatsapp_relances (created_at);
+
     -- ═══ Planchers tarifaires par sous-catégorie — chantier « planchers éditables », 2026-09-10 ═══
     -- Remplace la table en dur SUBCATEGORY_MIN_PRICES (constants/missionCategories.js, chantier D1)
     -- ET son jumeau MIN_PRICES côté frontend (NewMissionModal.jsx), qui étaient maintenus synchro

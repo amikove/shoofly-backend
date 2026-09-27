@@ -48,6 +48,7 @@ const { runWalletReconciliation } = require('./jobs/walletReconciliation');
 const { runCashplusExpiry } = require('./jobs/cashplusExpiry');
 const { runCandidatureRelance } = require('./jobs/candidatureRelance');
 const { runUnreadWhatsappEmailFallback } = require('./jobs/unreadWhatsappEmailFallback');
+const { runWhatsappRelances, schedulePresenceRelance, scheduleClientAppliedRelance } = require('./jobs/whatsappRelances');
 const { sendWhatsAppTemplate } = require('./services/wasel');
 const waselTemplates = require('./config/waselTemplates');
 
@@ -556,6 +557,7 @@ initDb().then(() => {
   let cronCandidatureRelanceRunning = false;
   let cronUnreadEmailFallbackRunning = false;
   let cronPushHealthRunning = false;
+  let cronWhatsappRelancesRunning = false;
 
 // ── Cron J-1 20h — Rappel mission demain + confirmation active de présence ──
   // Anciennement purement informatif ; demande désormais une confirmation active de l'Œil
@@ -610,7 +612,7 @@ initDb().then(() => {
         // Migré vers notify() (chantier push, Phase 1.1) : in-app + socket live (l'emit partiel
         // devient la ligne complète, deep-link + marquage lu possibles) + canal push. P1 —
         // l'Œil perd la mission à la deadline s'il ne voit rien (matrice L2). WhatsApp retiré (chantier 2).
-        await notify(
+        const j1Notif = await notify(
           db, m.oeil_id,
           '✅ Confirmez votre présence — mission demain',
           `Confirmez votre présence pour "${m.title}" prévue demain à ${missionTime}. Vous avez jusqu'à ${deadlineTime} ce soir pour confirmer, sinon nous chercherons un remplaçant.`,
@@ -618,8 +620,10 @@ initDb().then(() => {
           'presenceConfirmationRequestJ1Title', 'presenceConfirmationRequestJ1Body',
           { missionTitle: m.title, time: missionTime, deadlineTime }
         );
-        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js) : la
-        // notification in-app + push ci-dessus est le canal.
+        // WhatsApp Œil : RELANCE seulement (chantier 2 lot 1 bis) — part après
+        // presence_whatsapp_relance_j1_minutes si la présence n'est toujours pas confirmée par le
+        // même Œil (jobs/whatsappRelances.js). La notification in-app + push ci-dessus reste le canal.
+        await schedulePresenceRelance(db, 'presence_j1', m.id, m.oeil_id, j1Notif && j1Notif.id);
         console.log(`⏰ Confirmation de présence demandée (J-1) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
         } catch (e) { console.error(`❌ Cron J-1 (Œil) — mission ${m.id} :`, e.message); }
       }
@@ -1089,15 +1093,23 @@ initDb().then(() => {
         try {
         const deadlineSamedayMinutes = await getSetting(db, 'presence_confirmation_deadline_minutes_sameday', 45);
         const deadlineAt = new Date(Date.now() + deadlineSamedayMinutes * 60 * 1000);
-        await db.query(
-          `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1, presence_confirmed_at=NULL WHERE id=$2`,
-          [deadlineAt, m.id]
+        // Garde portée par l'UPDATE lui-même (même méthode que SC-6, chantier 1 — lot 1 bis) : le
+        // filtre du SELECT n'est qu'un instantané. Deux processus qui tiquent ensemble : seul celui
+        // dont l'UPDATE ouvre le point de contrôle notifie et programme la relance WhatsApp ; sans
+        // cette garde, le second réécrivait presence_confirmation_requested_at et la relance du
+        // premier se croyait obsolète.
+        const { rowCount: h2Claimed } = await db.query(
+          `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1, presence_confirmed_at=NULL
+           WHERE id=$2 AND status='assigned' AND oeil_id=$3
+             AND (presence_confirmation_requested_at IS NULL OR presence_confirmation_requested_at < NOW() - INTERVAL '33 minutes')`,
+          [deadlineAt, m.id, m.oeil_id]
         );
+        if (h2Claimed === 0) continue;
         const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
         // Migré vers notify() (chantier push, Phase 1.1) : + socket live (emit partiel → ligne
         // complète) + canal push. P1 (matrice L2/L6 : l'Œil perd la mission à la deadline). WhatsApp retiré (chantier 2).
-        await notify(
+        const h2Notif = await notify(
           db, m.oeil_id,
           '✅ Confirmez votre présence — mission bientôt',
           `Confirmez votre présence pour "${m.title}" prévue dans ~2 heures. Vous avez jusqu'à ${deadlineTime} pour confirmer, sinon nous chercherons un remplaçant en urgence.`,
@@ -1105,7 +1117,9 @@ initDb().then(() => {
           'presenceConfirmationRequestSamedayTitle', 'presenceConfirmationRequestSamedayBody',
           { missionTitle: m.title, deadlineTime }
         );
-        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
+        // WhatsApp Œil : RELANCE seulement (chantier 2 lot 1 bis) — après
+        // presence_whatsapp_relance_h2_minutes si toujours non confirmée (jobs/whatsappRelances.js).
+        await schedulePresenceRelance(db, 'presence_h2', m.id, m.oeil_id, h2Notif && h2Notif.id);
         console.log(`⏰ Confirmation de présence demandée (H-2) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
         } catch (e) { console.error(`❌ Cron H-2 — mission ${m.id} :`, e.message); }
       }
@@ -1142,16 +1156,20 @@ initDb().then(() => {
         // presence_confirmation_h45_email_sent_at remis à NULL à chaque nouvelle ouverture de ce
         // point de contrôle (PROMPT 5, relance email) — sinon une mission repassant par H-45 après
         // une réattribution resterait bloquée sur le fallback déjà envoyé au tour précédent.
-        await db.query(
-          `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1, presence_confirmed_at=NULL, presence_confirmation_h45_email_sent_at=NULL WHERE id=$2`,
-          [deadlineAt, m.id]
+        // Même garde portée par l'UPDATE que H-2 ci-dessus (lot 1 bis).
+        const { rowCount: h45Claimed } = await db.query(
+          `UPDATE missions SET presence_confirmation_requested_at=NOW(), presence_confirmation_deadline_at=$1, presence_confirmed_at=NULL, presence_confirmation_h45_email_sent_at=NULL
+           WHERE id=$2 AND status='assigned' AND oeil_id=$3
+             AND (presence_confirmation_requested_at IS NULL OR presence_confirmation_requested_at < NOW() - INTERVAL '33 minutes')`,
+          [deadlineAt, m.id, m.oeil_id]
         );
+        if (h45Claimed === 0) continue;
         const deadlineTime = deadlineAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Casablanca' });
 
         // Migré vers notify() (chantier push, Phase 1.1) : + socket live (emit partiel → ligne
         // complète) + canal push. P1. Le repli email (C17, presence_confirmation_h45_email_sent_at)
         // reste le filet — inchangé, il lit is_read sur cette même ligne. WhatsApp retiré (chantier 2).
-        await notify(
+        const h45Notif = await notify(
           db, m.oeil_id,
           '✅ Confirmez votre présence — mission imminente',
           `Confirmez votre présence pour "${m.title}" prévue dans environ ${reminderLateMinutes} minutes. Vous avez jusqu'à ${deadlineTime} pour confirmer, sinon nous chercherons un remplaçant en urgence.`,
@@ -1159,7 +1177,9 @@ initDb().then(() => {
           'presenceConfirmationRequestH45Title', 'presenceConfirmationRequestH45Body',
           { missionTitle: m.title, lateMinutes: reminderLateMinutes, deadlineTime }
         );
-        // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
+        // WhatsApp Œil : RELANCE seulement (chantier 2 lot 1 bis) — après
+        // presence_whatsapp_relance_h45_minutes si toujours non confirmée (jobs/whatsappRelances.js).
+        await schedulePresenceRelance(db, 'presence_h45', m.id, m.oeil_id, h45Notif && h45Notif.id);
         console.log(`⏰ Confirmation de présence demandée (H-45) pour mission ${m.id}, deadline ${deadlineAt.toISOString()}`);
 
         // Alerte admin passive (inchangée dans son principe — informe qu'une mission approche
@@ -1508,13 +1528,12 @@ initDb().then(() => {
       const db = getDb();
       const seuilMinutes = await getSetting(db, 'candidature_whatsapp_seuil_minutes', 60);
       const { rows: dueMissions } = await db.query(`
-        SELECT m.id, m.title, c.phone AS client_phone, COUNT(mi.id)::int AS n
+        SELECT m.id, m.title, m.client_id, COUNT(mi.id)::int AS n
         FROM missions m
         JOIN mission_interests mi ON mi.mission_id = m.id
         JOIN oeil_profiles p ON p.user_id = mi.oeil_id AND p.is_verified = true
-        JOIN users c ON c.id = m.client_id
         WHERE m.status = 'pending' AND m.candidature_whatsapp_sent_at IS NULL
-        GROUP BY m.id, m.title, c.phone
+        GROUP BY m.id, m.title, m.client_id
         HAVING MIN(mi.created_at) <= NOW() - INTERVAL '1 minute' * $1::numeric
       `, [seuilMinutes]);
 
@@ -1526,9 +1545,21 @@ initDb().then(() => {
           `UPDATE missions SET candidature_whatsapp_sent_at=NOW() WHERE id=$1 AND candidature_whatsapp_sent_at IS NULL`,
           [m.id]
         );
-        if (rowCount > 0 && m.client_phone) {
-          await sendWhatsAppTemplate(waselTemplates.oeil_applied.template_name, m.client_phone, [String(m.n), m.title]);
-          console.log(`📲 Seuil WhatsApp candidatures (délai) déclenché pour mission ${m.id} — ${m.n} candidature(s)`);
+        if (rowCount > 0) {
+          // Chantier 2 lot 1 bis (décision BOSS B) : au seuil, notification + push au client ; le
+          // WhatsApp oeil_applied n'est plus qu'une RELANCE, envoyée après
+          // candidature_whatsapp_relance_minutes seulement si le client n'a ni lu cette
+          // notification ni ouvert la liste des candidats (jobs/whatsappRelances.js). La colonne
+          // candidature_whatsapp_sent_at garde son rôle d'anti-doublon du SEUIL (un par mission).
+          const seuilNotif = await notify(
+            db, m.client_id,
+            'Des Œils ont postulé 👁️',
+            `Candidatures reçues pour "${m.title}" : ${m.n}. Choisissez votre Œil pour confirmer la mission.`,
+            'interest', m.id, app.get('emitToUser'), 'interests_modal',
+            'candidatureSeuilClientTitle', 'candidatureSeuilClientBody', { missionTitle: m.title, count: m.n }
+          );
+          await scheduleClientAppliedRelance(db, m.id, m.client_id, seuilNotif && seuilNotif.id);
+          console.log(`📲 Seuil candidatures (délai) déclenché pour mission ${m.id} — ${m.n} candidature(s), notification envoyée, relance WhatsApp programmée`);
         }
         } catch (e) { console.error(`❌ Cron seuil WhatsApp candidatures — mission ${m.id} :`, e.message); }
       }
@@ -1546,6 +1577,19 @@ initDb().then(() => {
       await runCandidatureRelance(getDb(), app.get('emitToUser'));
     } catch (e) { console.error('❌ Cron relance candidatures error:', e.message); }
     finally { cronCandidatureRelanceRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron chaque minute — Relances WhatsApp (chantier 2 lot 1 bis, décisions BOSS du
+  // 2026-09-27) ── Présence Œil (J-1/H-2/H-45) et client « des Œils ont postulé » : le WhatsApp
+  // ne part à échéance que si l'utilisateur n'a pas réagi à la notification. Logique et garde
+  // multi-processus dans jobs/whatsappRelances.js (même raison d'extraction que ci-dessus).
+  cron.schedule('* * * * *', async () => {
+    if (cronWhatsappRelancesRunning) { console.warn('⏭️ Cron relances WhatsApp déjà en cours, tick ignoré'); return; }
+    cronWhatsappRelancesRunning = true;
+    try {
+      await runWhatsappRelances(getDb());
+    } catch (e) { console.error('❌ Cron relances WhatsApp error:', e.message); }
+    finally { cronWhatsappRelancesRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 2 min — Relance par email des WhatsApp à délai court non lus (PROMPT 5,
