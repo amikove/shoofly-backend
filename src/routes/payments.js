@@ -12,6 +12,7 @@ const walletService = require('../services/walletService');
 const { getSetting } = require('../utils/settings');
 const { buildPaywallPayload, verifyCallbackSignature } = require('../services/payzone');
 const cashplusService = require('../services/cashplus');
+const { requireOnlinePayment } = require('../config/onlinePayment');
 
 // Réutilise les validateurs, la tarification (pricing()) et la logique de création de
 // mission déjà écrites pour POST /missions (routes/missions.js) — jamais dupliquées ici.
@@ -33,7 +34,9 @@ const {
 // POST /payments/payzone/callback, avec exactement ces données — jamais re-validées ni
 // re-tarifées à ce moment-là (garantit que le montant facturé via PayZone correspond
 // exactement à la mission créée, même si le taux de commission change entre-temps).
-router.post('/payzone/init', missionCreateLimiter, authenticate, requireRole('client'), missionCreateValidators, asyncHandler(async (req, res) => {
+// requireOnlinePayment (config/onlinePayment.js) : 403 ONLINE_PAYMENT_DISABLED tant que le paiement
+// en ligne est coupé — après authenticate (sans jeton : 401 comme avant).
+router.post('/payzone/init', missionCreateLimiter, authenticate, requireRole('client'), requireOnlinePayment, missionCreateValidators, asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -204,7 +207,7 @@ router.get('/payzone/status/:attemptId', authenticate, asyncHandler(async (req, 
 }));
 
 // ── GET /payments/payzone/failed-attempts ── Tentatives à proposer en nouvel essai ──
-router.get('/payzone/failed-attempts', authenticate, requireRole('client'), asyncHandler(async (req, res) => {
+router.get('/payzone/failed-attempts', authenticate, requireRole('client'), requireOnlinePayment, asyncHandler(async (req, res) => {
   const db = getDb();
   const abandonedMinutes = await getSetting(db, 'payment_attempt_abandoned_minutes', 30);
 
@@ -223,7 +226,7 @@ router.get('/payzone/failed-attempts', authenticate, requireRole('client'), asyn
 }));
 
 // ── POST /payments/payzone/retry/:attemptId ── Relance une tentative déclinée/abandonnée ──
-router.post('/payzone/retry/:attemptId', missionCreateLimiter, authenticate, requireRole('client'), asyncHandler(async (req, res) => {
+router.post('/payzone/retry/:attemptId', missionCreateLimiter, authenticate, requireRole('client'), requireOnlinePayment, asyncHandler(async (req, res) => {
   const db = getDb();
   const { rows: [attempt] } = await db.query(
     `SELECT * FROM mission_payment_attempts WHERE charge_id=$1`, [req.params.attemptId]
