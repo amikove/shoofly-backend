@@ -26,7 +26,10 @@ const {
 const { resolveMapsLink, MapsLinkError } = require('../utils/mapsLink');
 const { getSubcategoryMinPrice, loadSubcategoryMinPricesMap } = require('../utils/subcategoryMinPrices');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
-const { checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins } = require('../utils/cashCommission');
+const {
+  checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins,
+  requiredCashBalance, cashBalanceShortSet, OEIL_UNAVAILABLE_CODE, OEIL_UNAVAILABLE_MESSAGE,
+} = require('../utils/cashCommission');
 const { generateUniqueReference } = require('../utils/ticketReference');
 const { parsePagination } = require('../utils/pagination');
 // notify() — point d'insertion unique in-app + socket live + push (voir utils/notify.js).
@@ -368,9 +371,15 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
   // rien pour 'payzone' (checkCashCommissionBalance court-circuite déjà sur commission<=0, mais
   // la garde explicite ci-dessous documente l'intention et évite un appel DB inutile pour le cas
   // de très loin le plus fréquent).
+  // Appelant = le CLIENT (POST /missions) : message neutre, jamais le détail chiffré du solde de
+  // l'Œil (chantier CashPlus 2026-09-27, point 2).
   if (oeil_id && paymentMethod === 'cash') {
     const balanceCheck = await checkCashCommissionBalance(db, oeil_id, commission);
-    if (balanceCheck.error) return { error: balanceCheck.error };
+    if (balanceCheck.error) {
+      return balanceCheck.code === 'insufficient_cash_commission_balance'
+        ? { error: OEIL_UNAVAILABLE_MESSAGE, code: OEIL_UNAVAILABLE_CODE }
+        : { error: balanceCheck.error };
+    }
   }
 
   const status = oeil_id ? 'assigned' : 'pending';
@@ -1261,8 +1270,8 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), miss
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
 
-  const { error, insert, freePromo } = await prepareMissionInsert(db, req.user.id, req.body);
-  if (error) return res.status(400).json({ error });
+  const { error, code, insert, freePromo } = await prepareMissionInsert(db, req.user.id, req.body);
+  if (error) return res.status(400).json({ error, ...(code ? { code } : {}) });
 
   // Création directe réservée aux missions gratuites (price=0, promo 'free' ou aucune) et,
   // depuis le modèle cash (2026-08-13), à toute mission payment_method='cash' — le client y
@@ -2196,13 +2205,18 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
     // tous les candidats (voir computeAvgResponseMinutesBulk) plutôt qu'en boucle.
     const avgResponseByOeil = await computeAvgResponseMinutesBulk(db, visibleRows.map(o => o.id));
     const newOeilThreshold = await getSetting(db, 'new_oeil_mission_threshold', 10);
+    // Chantier CashPlus (2026-09-27, point 3) : candidat que le client ne peut pas retenir faute de
+    // solde (mission cash) → `unavailable: true`, SANS motif ni donnée financière (ni solde, ni
+    // commission) : le client voit « Indisponible pour cette mission », bouton désactivé.
+    const shortSet = await cashBalanceShortSet(db, visibleRows.map(o => o.id), mission);
     const interests = visibleRows.map(o => {
       const is_new_oeil = isNewOeil(o.total_missions, newOeilThreshold);
       const avg_response_minutes = avgResponseByOeil[o.id] ?? null;
+      const unavailable = shortSet.has(o.id);
       if (req.user.role === 'client' && is_new_oeil) {
-        return { ...o, is_new_oeil, rating_avg: null, rating_count: null, avg_response_minutes };
+        return { ...o, is_new_oeil, rating_avg: null, rating_count: null, avg_response_minutes, unavailable };
       }
-      return { ...o, is_new_oeil, avg_response_minutes };
+      return { ...o, is_new_oeil, avg_response_minutes, unavailable };
     });
 
     res.json({ interests });
@@ -4493,10 +4507,16 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   // par les deux appelants exactement comme un échec de checkOeilAssignable (index.js retente au
   // prochain tick, POST /:id/hire/:oeilId renvoie l'erreur telle quelle). N'exécute rien pour
   // 'payzone'.
+  //
+  // Chantier CashPlus (2026-09-27, point 2) : l'erreur remonte au CLIENT (POST /:id/hire/:oeilId) —
+  // message neutre + code, AUCUNE information financière sur l'Œil. `reason` (jamais sérialisé
+  // dans une réponse) permet à la cascade (index.js) de passer au candidat suivant.
   if (mission.payment_method === 'cash') {
     const balanceCheck = await checkCashCommissionBalance(db, oeilId, mission.commission);
     if (balanceCheck.error) {
-      return { ok: false, status: 400, error: balanceCheck.error };
+      return balanceCheck.code === 'insufficient_cash_commission_balance'
+        ? { ok: false, status: 400, error: OEIL_UNAVAILABLE_MESSAGE, code: OEIL_UNAVAILABLE_CODE, reason: balanceCheck.code }
+        : { ok: false, status: 400, error: balanceCheck.error };
     }
   }
 
@@ -4673,6 +4693,10 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
   const maxBatchWaves = await getSetting(db, 'candidate_batch_max_waves', 2);
   const capReached = mission.batch_wave_count >= maxBatchWaves;
 
+  // Chantier CashPlus (2026-09-27, point 1) : mission cash à commission > 0 → un candidat dont le
+  // wallet ne couvre pas la commission n'est pas sollicité (il ne pourrait pas être retenu,
+  // hireOeilCore le refuserait). requiredCashBalance = 0 hors cash : filtre sans effet (balance ≥ 0).
+  // Non définitif : il redevient sollicitable au tirage suivant s'il a rechargé entre-temps.
   const batchSize = await getSetting(db, 'candidate_batch_size', 10);
   const { rows: candidates } = capReached ? { rows: [] } : await db.query(`
     SELECT u.id
@@ -4680,9 +4704,10 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
     JOIN users u ON u.id = mi.oeil_id
     LEFT JOIN oeil_profiles p ON p.user_id = u.id
     WHERE mi.mission_id = $1 AND mi.declined = false
+      AND COALESCE(p.balance, 0) >= $3::numeric
     ORDER BY u.reliability_score DESC, p.rating_avg DESC
     LIMIT $2
-  `, [mission.id, batchSize]);
+  `, [mission.id, batchSize, requiredCashBalance(mission)]);
 
   if (candidates.length > 0) {
     const candidateIds = candidates.map(c => c.id);
@@ -4782,7 +4807,7 @@ router.post('/:id/hire/:oeilId', authenticate, requireRole('client'), asyncHandl
     oeilNotifBodyKey: 'oeilSelectedBody',
     oeilNotifParams: {missionTitle: mission.title},
   });
-  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  if (!result.ok) return res.status(result.status).json({ error: result.error, ...(result.code ? { code: result.code } : {}) });
 
   res.json({ mission: result.mission });
 }));

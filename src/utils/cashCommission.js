@@ -38,6 +38,36 @@ async function checkCashCommissionBalance(db, oeilId, commission) {
   return { ok: true };
 }
 
+// ── Solde exigé pour être retenu sur une mission (chantier CashPlus, 2026-09-27) ──
+// Montant que le wallet de l'Œil doit couvrir pour pouvoir être affecté : la commission d'une
+// mission cash, 0 sinon (payzone, NULL historique, mission gratuite/promo). Même règle que
+// checkCashCommissionBalance ci-dessus, sous forme de nombre utilisable dans un filtre SQL
+// (`p.balance >= $n`) : cascade par lot (tirage et départage) et liste des candidats côté client.
+function requiredCashBalance(mission) {
+  if (!mission || mission.payment_method !== 'cash') return 0;
+  const amount = parseFloat(mission.commission) || 0;
+  return amount > 0 ? amount : 0;
+}
+
+// Parmi oeilIds, ceux dont le wallet NE couvre PAS le solde exigé par la mission — en une requête.
+// Set vide si la mission n'exige rien. Un Œil sans profil est compté comme non couvert.
+async function cashBalanceShortSet(db, oeilIds, mission) {
+  const required = requiredCashBalance(mission);
+  if (required <= 0 || oeilIds.length === 0) return new Set();
+  const { rows } = await db.query(
+    `SELECT user_id FROM oeil_profiles WHERE user_id = ANY($1::text[]) AND balance >= $2::numeric`,
+    [oeilIds, required]
+  );
+  const covered = new Set(rows.map((r) => r.user_id));
+  return new Set(oeilIds.filter((id) => !covered.has(id)));
+}
+
+// Message et code renvoyés à un TIERS (le client) quand un Œil ne peut pas être retenu faute de
+// solde : aucune information financière sur l'Œil (ni solde, ni commission, ni motif). Le détail
+// chiffré de checkCashCommissionBalance reste réservé à l'admin (POST /:id/assign-admin).
+const OEIL_UNAVAILABLE_CODE = 'OEIL_UNAVAILABLE_FOR_MISSION';
+const OEIL_UNAVAILABLE_MESSAGE = "Cet Œil n'est pas disponible pour cette mission, choisissez-en un autre.";
+
 // ── Règlement à la validation — mission cash uniquement ────────────────────
 // Contrepartie cash de walletService.credit(client, mission.oeil_id, 'oeil', mission.oeil_earning,
 // ...) : au lieu de créditer l'Œil (le client l'a déjà payé directement en espèces), débite la
@@ -111,4 +141,7 @@ async function notifyShortfallAdmins(db, mission, cashSettlement, emitToUser = n
   }
 }
 
-module.exports = { checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins };
+module.exports = {
+  checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins,
+  requiredCashBalance, cashBalanceShortSet, OEIL_UNAVAILABLE_CODE, OEIL_UNAVAILABLE_MESSAGE,
+};

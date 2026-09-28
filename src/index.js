@@ -41,6 +41,7 @@ const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
 const { casablancaYMD } = require('./utils/schedule');
 const { transitionMission } = require('./utils/missionStateMachine');
+const { requiredCashBalance } = require('./utils/cashCommission');
 const walletService = require('./services/walletService');
 const { runAutoValidateMissions, runValidationReminders, runAssistanceReminders } = require('./jobs/autoValidateMissions');
 const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
@@ -1385,6 +1386,10 @@ initDb().then(() => {
         // cette garde, une exception sur un départage gelait l'avancement de TOUTE la cascade
         // de recrutement du tick. Les `continue` internes existants sont conservés tels quels.
         try {
+        // Chantier CashPlus (2026-09-27, point 1) : TOUS les confirmés, dans l'ordre du classement,
+        // et — mission cash à commission > 0 — seulement ceux dont le wallet couvre la commission
+        // (un insolvable n'est jamais retenu comme gagnant). Avant : LIMIT 1 sans filtre, et le
+        // même gagnant insolvable était retenté à chaque tick, indéfiniment (mission bloquée).
         const { rows: confirmed } = await db.query(`
           SELECT mi.oeil_id
           FROM mission_interests mi
@@ -1392,34 +1397,52 @@ initDb().then(() => {
           LEFT JOIN oeil_profiles p ON p.user_id = u.id
           WHERE mi.mission_id=$1 AND mi.declined=false
             AND mi.confirmed_at IS NOT NULL AND mi.confirmed_at <= $2
+            AND COALESCE(p.balance, 0) >= $3::numeric
           ORDER BY u.reliability_score DESC, p.rating_avg DESC
-          LIMIT 1
-        `, [mission.id, mission.batch_tiebreak_ends_at]);
+        `, [mission.id, mission.batch_tiebreak_ends_at, requiredCashBalance(mission)]);
 
         if (confirmed.length === 0) {
-          // Ne devrait pas arriver (batch_tiebreak_ends_at n'est posée que par une
-          // confirmation) mais on ne laisse jamais la mission bloquée sur une échéance passée.
-          console.warn(`⚠️ Fenêtre de départage expirée sans candidat confirmé retrouvé — mission ${mission.id}, réinitialisation`);
+          // Aucun confirmé retenable (tous insolvables sur une mission cash — ou, cas théorique,
+          // aucune confirmation retrouvée) : on lève la fenêtre de départage, la mission ne reste
+          // jamais bloquée sur une échéance passée. À l'échéance du lot (candidate_window_ends_at),
+          // le cron ci-dessous tire le lot suivant, sans les insolvables (advanceCandidateCascade).
+          console.warn(`⚠️ Fenêtre de départage expirée sans candidat confirmé retenable — mission ${mission.id}, réinitialisation`);
           await db.query(`UPDATE missions SET batch_tiebreak_ends_at=NULL WHERE id=$1`, [mission.id]);
           continue;
         }
 
-        const winnerId = confirmed[0].oeil_id;
-        const result = await hireOeilCore(db, io, emitToUser, mission, winnerId, {
-          historyNote: 'Meilleur candidat confirmé retenu à l\'issue de la fenêtre de départage (cascade par lot)',
-          oeilNotifTitle: '🎉 Vous avez été sélectionné !',
-          oeilNotifBody: `Vous avez été retenu pour : ${mission.title}`,
-          oeilNotifTitleKey: 'oeilSelectedTitle',
-          oeilNotifBodyKey: 'oeilSelectedBody',
-          oeilNotifParams: { missionTitle: mission.title },
-        });
-
-        if (!result.ok) {
-          // Le candidat le mieux classé confirmé n'est plus assignable (suspendu, cooldown,
-          // conflit de créneau survenu entre-temps) — on retente au prochain tick plutôt que
-          // de choisir arbitrairement un autre confirmé ; auto-guérit si la cause se résorbe,
-          // sinon reste visible pour une affectation manuelle admin (POST /:id/assign-admin).
-          console.warn(`⚠️ Résolution départage: hireOeilCore a échoué pour mission ${mission.id} / candidat ${winnerId} (${result.error}) — nouvelle tentative au prochain tick`);
+        let winnerId = null;
+        let blocked = false;
+        for (const { oeil_id: candidateId } of confirmed) {
+          const result = await hireOeilCore(db, io, emitToUser, mission, candidateId, {
+            historyNote: 'Meilleur candidat confirmé retenu à l\'issue de la fenêtre de départage (cascade par lot)',
+            oeilNotifTitle: '🎉 Vous avez été sélectionné !',
+            oeilNotifBody: `Vous avez été retenu pour : ${mission.title}`,
+            oeilNotifTitleKey: 'oeilSelectedTitle',
+            oeilNotifBodyKey: 'oeilSelectedBody',
+            oeilNotifParams: { missionTitle: mission.title },
+          });
+          if (result.ok) { winnerId = candidateId; break; }
+          if (result.reason === 'insufficient_cash_commission_balance') {
+            // Solde passé sous la commission entre la sélection ci-dessus et l'embauche : jamais
+            // de nouvelle tentative sur lui, candidat confirmé suivant dans le même passage.
+            console.warn(`⚠️ Résolution départage: solde insuffisant pour mission ${mission.id} / candidat ${candidateId} — candidat suivant`);
+            continue;
+          }
+          // Autre cause (suspendu, cooldown, conflit de créneau survenu entre-temps) — comportement
+          // inchangé : on retente au prochain tick plutôt que de choisir arbitrairement un autre
+          // confirmé ; auto-guérit si la cause se résorbe, sinon reste visible pour une affectation
+          // manuelle admin (POST /:id/assign-admin).
+          console.warn(`⚠️ Résolution départage: hireOeilCore a échoué pour mission ${mission.id} / candidat ${candidateId} (${result.error}) — nouvelle tentative au prochain tick`);
+          blocked = true;
+          break;
+        }
+        if (!winnerId) {
+          // Tous les confirmés ont échoué pour solde insuffisant : même sortie que la liste vide.
+          if (!blocked) {
+            console.warn(`⚠️ Départage : aucun confirmé solvable — mission ${mission.id}, réinitialisation`);
+            await db.query(`UPDATE missions SET batch_tiebreak_ends_at=NULL WHERE id=$1`, [mission.id]);
+          }
           continue;
         }
         console.log(`🏆 Départage tranché — mission ${mission.id}, candidat retenu ${winnerId}`);
