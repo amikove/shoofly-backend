@@ -1926,9 +1926,61 @@ CREATE TABLE IF NOT EXISTS identity_documents (
   });
   if (recomputed !== null) console.log(`✅ Zone approximative 100 m : ${recomputed} mission(s) recalculée(s) (migration unique)`);
 
+  // Téléphone unique (décision BOSS D1, 2026-09-28) — fonction de normalisation puis index unique
+  // sur le numéro NORMALISÉ (les numéros déjà en base restent tels quels, dans leurs anciens
+  // formats : aucune donnée réécrite ni supprimée).
+  await db.query(PHONE_E164_FUNCTION_SQL);
+  await ensurePhoneUniqueIndex(db);
+
   console.log('✅ PostgreSQL schema ready');
 }
 
+// Jumelle SQL de utils/phone.js normalizeMoroccanMobile (MÊME règle, voir son commentaire) :
+// renvoie +2126XXXXXXXX / +2127XXXXXXXX, ou NULL si le numéro n'est pas un mobile marocain.
+// IMMUTABLE : requis pour servir d'expression d'index.
+const PHONE_E164_FUNCTION_SQL = `
+  CREATE OR REPLACE FUNCTION shoofly_phone_e164(p TEXT) RETURNS TEXT
+  LANGUAGE plpgsql IMMUTABLE AS $fn$
+  DECLARE s TEXT;
+  BEGIN
+    IF p IS NULL THEN RETURN NULL; END IF;
+    s := regexp_replace(btrim(p), '[[:space:].()/-]', '', 'g');
+    IF s = '' THEN RETURN NULL; END IF;
+    IF left(s, 2) = '00' THEN s := '+' || substr(s, 3); END IF;
+    IF left(s, 4) = '+212' THEN s := substr(s, 5);
+    ELSIF left(s, 3) = '212' AND length(s) = 12 THEN s := substr(s, 4);
+    END IF;
+    IF s ~ '^0[67][0-9]{8}$' THEN RETURN '+212' || substr(s, 2); END IF;
+    IF s ~ '^[67][0-9]{8}$' THEN RETURN '+212' || s; END IF;
+    RETURN NULL;
+  END
+  $fn$;
+`;
+
+// Index unique uq_users_phone_e164 — JAMAIS bloquant pour le démarrage : si la base contient déjà
+// deux comptes au même numéro normalisé, l'index n'est PAS créé (avertissement dans les logs ;
+// requête d'audit des doublons dans le rapport du chantier 2026-09-28) et le contrôle applicatif de l'inscription /
+// de la modification reste seul actif ; il sera créé au premier démarrage qui suit la résolution
+// des doublons. Toute autre erreur est elle aussi journalisée sans interrompre le démarrage.
+async function ensurePhoneUniqueIndex(db) {
+  try {
+    const { rows: [existing] } = await db.query(`SELECT 1 FROM pg_indexes WHERE indexname = 'uq_users_phone_e164'`);
+    if (existing) return;
+    const { rows: dups } = await db.query(
+      `SELECT shoofly_phone_e164(phone) AS phone_e164, COUNT(*)::int AS n FROM users
+       WHERE shoofly_phone_e164(phone) IS NOT NULL GROUP BY 1 HAVING COUNT(*) > 1`
+    );
+    if (dups.length > 0) {
+      const accounts = dups.reduce((s, d) => s + d.n, 0);
+      console.warn(`⚠️ Index unique du téléphone NON créé : ${dups.length} numéro(s) partagé(s) par ${accounts} comptes — contrôle applicatif seul actif (audit des doublons : rapport du chantier 2026-09-28)`);
+      return;
+    }
+    await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_users_phone_e164 ON users (shoofly_phone_e164(phone)) WHERE shoofly_phone_e164(phone) IS NOT NULL`);
+    console.log('✅ Index unique du téléphone (numéro normalisé E.164) créé');
+  } catch (e) {
+    console.warn('⚠️ Index unique du téléphone non créé :', e.message);
+  }
+}
 
 // Exécute fn(client) UNE seule fois pour toute la vie de la base : insère le marqueur « name » dans
 // schema_migrations et migre les données dans la même transaction. Renvoie le résultat de fn, ou

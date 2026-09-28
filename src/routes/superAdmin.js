@@ -4,6 +4,9 @@ const { getDb } = require('../db/schema');
 const { authenticate, invalidateAuthCache } = require('../middleware/auth');
 const { requireSuperAdmin, ALL_PERMISSIONS, PROFILES } = require('../middleware/permissions');
 const asyncHandler = require('../middleware/asyncHandler');
+const {
+  normalizeMoroccanMobile, phoneProvided, isPhoneUniqueViolation, PHONE_INVALID_MESSAGE, PHONE_TAKEN_MESSAGE,
+} = require('../utils/phone');
 
 // ── GET /super-admin/admins — liste des admins ────────────
 router.get('/admins', authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
@@ -37,12 +40,28 @@ router.post('/admins', authenticate, requireSuperAdmin, asyncHandler(async (req,
     finalPermissions = permissions.filter(p => ALL_PERMISSIONS.includes(p));
   }
 
+  // Téléphone (décision BOSS D1) : même normalisation E.164 et même unicité que l'inscription
+  // (facultatif pour un admin). L'index unique porte sur TOUS les comptes.
+  let phoneE164 = null;
+  if (phoneProvided(phone)) {
+    phoneE164 = normalizeMoroccanMobile(phone);
+    if (!phoneE164) return res.status(400).json({ error: PHONE_INVALID_MESSAGE, code: 'INVALID_PHONE' });
+    const { rows: [taken] } = await db.query('SELECT id FROM users WHERE shoofly_phone_e164(phone)=$1', [phoneE164]);
+    if (taken) return res.status(409).json({ error: PHONE_TAKEN_MESSAGE, code: 'PHONE_TAKEN' });
+  }
+
   const hash = await bcrypt.hash(password, 12);
-  const { rows: [admin] } = await db.query(
-    `INSERT INTO users (id, first_name, last_name, email, password, role, phone, permissions, is_active)
-     VALUES (gen_random_uuid(), $1, $2, $3, $4, 'admin', $5, $6, true) RETURNING id, first_name, last_name, email, permissions`,
-    [first_name, last_name, email, hash, phone || null, JSON.stringify(finalPermissions)]
-  );
+  let admin;
+  try {
+    ({ rows: [admin] } = await db.query(
+      `INSERT INTO users (id, first_name, last_name, email, password, role, phone, permissions, is_active)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, 'admin', $5, $6, true) RETURNING id, first_name, last_name, email, permissions`,
+      [first_name, last_name, email, hash, phoneE164, JSON.stringify(finalPermissions)]
+    ));
+  } catch (e) {
+    if (isPhoneUniqueViolation(e)) return res.status(409).json({ error: PHONE_TAKEN_MESSAGE, code: 'PHONE_TAKEN' });
+    throw e;
+  }
 
   res.status(201).json({ admin });
 }));

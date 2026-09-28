@@ -16,6 +16,10 @@ const { getSetting } = require('../utils/settings');
 const { authenticate, requireRole, invalidateAuthCache } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
+const {
+  normalizeMoroccanMobile, phoneProvided, isPhoneUniqueViolation,
+  PHONE_INVALID_MESSAGE, PHONE_REQUIRED_MESSAGE, PHONE_TAKEN_MESSAGE,
+} = require('../utils/phone');
 const { sendPasswordResetEmail } = require('../services/email');
 // notify() — in-app + socket live + push (utils/notify.js). Inscription : pas d'emitToUser en
 // scope → null. Le push sera quasi toujours skipped_no_sub ici (abonnement pas encore créé au
@@ -64,9 +68,20 @@ router.post('/register', [
           acquisition_source, acquisition_medium, acquisition_campaign } = req.body;
     const { rows: existing } = await db.query('SELECT id FROM users WHERE email=$1', [email]);
     if (existing.length) return res.status(409).json({ error: 'Email déjà utilisé' });
-    if (phone) {
-      const { rows: existingPhone } = await db.query('SELECT id FROM users WHERE phone=$1', [phone]);
-      if (existingPhone.length) return res.status(409).json({ error: 'Numéro de téléphone déjà utilisé' });
+    // Téléphone (décision BOSS D1, 2026-09-28) : normalisé E.164 (+2126… / +2127…) avant tout
+    // contrôle et tout stockage ; OBLIGATOIRE pour un Œil (anti-abus de la mission offerte :
+    // un numéro = un compte) ; doublon cherché sur le numéro NORMALISÉ, y compris contre les
+    // numéros déjà en base dans d'anciens formats. Course entre deux inscriptions : index unique
+    // uq_users_phone_e164 (db/schema.js) → 409 plus bas.
+    let phoneE164 = null;
+    if (phoneProvided(phone)) {
+      phoneE164 = normalizeMoroccanMobile(phone);
+      if (!phoneE164) return res.status(400).json({ error: PHONE_INVALID_MESSAGE, code: 'INVALID_PHONE' });
+    }
+    if (role === 'oeil' && !phoneE164) return res.status(400).json({ error: PHONE_REQUIRED_MESSAGE, code: 'PHONE_REQUIRED' });
+    if (phoneE164) {
+      const { rows: existingPhone } = await db.query('SELECT id FROM users WHERE shoofly_phone_e164(phone)=$1', [phoneE164]);
+      if (existingPhone.length) return res.status(409).json({ error: PHONE_TAKEN_MESSAGE, code: 'PHONE_TAKEN' });
     }
 
     let canonicalCity = null;
@@ -83,17 +98,23 @@ router.post('/register', [
 
     const id = uuidv4();
     const passwordHash = await bcrypt.hash(password, 10);
-    const { rows: [user] } = await db.query(
-    `INSERT INTO users (id,email,password,role,first_name,last_name,phone,city,quartier,
-      birth_date,profil,usage_reason,usage_frequency,villes_cibles,situation,disponibilite,motivation,
-      acquisition_source,acquisition_medium,acquisition_campaign)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`,
-    [id, email, passwordHash, role, first_name, last_name,
-     phone||null, canonicalCity, canonicalQuartier, birth_date||null,
-     profil||null, usage_reason||null, usage_frequency||null, villes_cibles||null,
-     situation||null, disponibilite||null, motivation||null,
-     acquisition_source||null, acquisition_medium||null, acquisition_campaign||null]
-  );
+    let user;
+    try {
+      ({ rows: [user] } = await db.query(
+      `INSERT INTO users (id,email,password,role,first_name,last_name,phone,city,quartier,
+        birth_date,profil,usage_reason,usage_frequency,villes_cibles,situation,disponibilite,motivation,
+        acquisition_source,acquisition_medium,acquisition_campaign)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`,
+      [id, email, passwordHash, role, first_name, last_name,
+       phoneE164, canonicalCity, canonicalQuartier, birth_date||null,
+       profil||null, usage_reason||null, usage_frequency||null, villes_cibles||null,
+       situation||null, disponibilite||null, motivation||null,
+       acquisition_source||null, acquisition_medium||null, acquisition_campaign||null]
+      ));
+    } catch (e) {
+      if (isPhoneUniqueViolation(e)) return res.status(409).json({ error: PHONE_TAKEN_MESSAGE, code: 'PHONE_TAKEN' });
+      throw e;
+    }
   if (role === 'oeil') await db.query(`INSERT INTO oeil_profiles (user_id) VALUES ($1)`, [id]);
 
   await notify(
@@ -185,9 +206,15 @@ router.get('/me', authenticate, asyncHandler(async (req, res) => {
 router.put('/me', authenticate, asyncHandler(async (req, res) => {
     const db = getDb();
     const { first_name, last_name, phone, city, bio, coverage_zone, disponibilites, has_bank_account } = req.body;
-    if (phone) {
-      const { rows: existingPhone } = await db.query('SELECT id FROM users WHERE phone=$1 AND id != $2', [phone, req.user.id]);
-      if (existingPhone.length) return res.status(409).json({ error: 'Numéro de téléphone déjà utilisé' });
+    // Téléphone (décision BOSS D1) : normalisé E.164 ; doublon cherché sur le numéro NORMALISÉ
+    // (un même numéro écrit 06… / +212… / avec espaces = un seul numéro). Champ vide = inchangé
+    // (COALESCE ci-dessous) : un Œil ne peut donc pas effacer son numéro.
+    let phoneE164 = null;
+    if (phoneProvided(phone)) {
+      phoneE164 = normalizeMoroccanMobile(phone);
+      if (!phoneE164) return res.status(400).json({ error: PHONE_INVALID_MESSAGE, code: 'INVALID_PHONE' });
+      const { rows: existingPhone } = await db.query('SELECT id FROM users WHERE shoofly_phone_e164(phone)=$1 AND id != $2', [phoneE164, req.user.id]);
+      if (existingPhone.length) return res.status(409).json({ error: PHONE_TAKEN_MESSAGE, code: 'PHONE_TAKEN' });
     }
     let canonicalCity = null;
     if (city) {
@@ -195,19 +222,26 @@ router.put('/me', authenticate, asyncHandler(async (req, res) => {
       if (!canonicalCity) return res.status(400).json({ error: 'Ville invalide' });
     }
 
-  const { rows: [user] } = await db.query(
-    `UPDATE users SET
-      first_name=COALESCE($1,first_name),
-      last_name=COALESCE($2,last_name),
-      phone=COALESCE($3,phone),
-      city=COALESCE($4,city),
-      disponibilites=COALESCE($5,disponibilites),
-      updated_at=NOW()
-     WHERE id=$6 RETURNING *`,
-    [first_name||null, last_name||null, phone||null, canonicalCity,
-     disponibilites ? JSON.stringify(disponibilites) : null,
-     req.user.id]
-  );
+  let user;
+  try {
+    ({ rows: [user] } = await db.query(
+      `UPDATE users SET
+        first_name=COALESCE($1,first_name),
+        last_name=COALESCE($2,last_name),
+        phone=COALESCE($3,phone),
+        city=COALESCE($4,city),
+        disponibilites=COALESCE($5,disponibilites),
+        updated_at=NOW()
+       WHERE id=$6 RETURNING *`,
+      [first_name||null, last_name||null, phoneE164, canonicalCity,
+       disponibilites ? JSON.stringify(disponibilites) : null,
+       req.user.id]
+    ));
+  } catch (e) {
+    // Course : un autre compte a pris ce numéro entre le contrôle ci-dessus et l'écriture.
+    if (isPhoneUniqueViolation(e)) return res.status(409).json({ error: PHONE_TAKEN_MESSAGE, code: 'PHONE_TAKEN' });
+    throw e;
+  }
   // A-3 (cache authenticate) : city est lue par authenticate (req.user.city, ex. GET /missions
   // ?mode=available) — un changement de ville doit être vu dès la requête suivante.
   invalidateAuthCache(req.user.id);
