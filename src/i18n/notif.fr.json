@@ -24,6 +24,8 @@
   "partialPaymentReceivedBody": "{{amount}} MAD crédités — votre part du transfert de \"{{missionTitle}}\".",
   "commissionDebitedOeilTitle": "💸 Commission débitée",
   "commissionDebitedOeilBody": "{{amount}} MAD de commission débités de votre wallet (mission cash).",
+  "firstMissionFreeOeilTitle": "🎁 Première mission offerte",
+  "firstMissionFreeOeilBody": "\"{{missionTitle}}\" est validée. C'était votre mission offerte : aucune commission n'a été prélevée.",
   "paymentReceivedOeilTitle": "💰 Paiement reçu !",
   "paymentReceivedOeilBody": "Le client a validé \"{{missionTitle}}\". {{amount}} MAD crédités.",
   "missionValidatedClientTitle": "✅ Mission validée",

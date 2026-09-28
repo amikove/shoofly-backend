@@ -27,9 +27,11 @@ const { resolveMapsLink, MapsLinkError } = require('../utils/mapsLink');
 const { getSubcategoryMinPrice, loadSubcategoryMinPricesMap } = require('../utils/subcategoryMinPrices');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
 const {
-  checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins,
-  requiredCashBalance, cashBalanceShortSet, OEIL_UNAVAILABLE_CODE, OEIL_UNAVAILABLE_MESSAGE,
+  checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins, notifyFirstMissionFreeOeil,
+  requiredCashBalance, cashBalanceShortSet, cashBalanceCoverFilter, OEIL_UNAVAILABLE_CODE, OEIL_UNAVAILABLE_MESSAGE,
+  oeilCashState, cashRequirementFor, openFirstMissionFreeOffer, forfeitFirstMissionFreeOfferSafe,
 } = require('../utils/cashCommission');
+const { isCashPlusEnabled } = require('../config/cashplus');
 const { generateUniqueReference } = require('../utils/ticketReference');
 const { parsePagination } = require('../utils/pagination');
 // notify() — point d'insertion unique in-app + socket live + push (voir utils/notify.js).
@@ -465,6 +467,19 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
     }
   }
 
+  // Réservation directe cash (oeil_id fourni) — première mission offerte (règle BOSS D3 f) : le
+  // contrôle de prepareMissionInsert n'est qu'un instantané. Verrou de la ligne de l'Œil (même
+  // ligne que le FOR UPDATE de checkOeilAssignable côté embauche / affectation admin) puis
+  // re-contrôle : deux réservations simultanées du même Œil neuf ne peuvent pas être offertes
+  // toutes les deux. L'offre est ouverte après l'INSERT (l'identifiant de la mission est requis).
+  let directFreeOffer = null;
+  if (oeil_id && payment_method === 'cash') {
+    await db.query(`SELECT 1 FROM oeil_profiles WHERE user_id=$1 FOR UPDATE`, [oeil_id]);
+    const lockedBalance = await checkCashCommissionBalance(db, oeil_id, commission, { missionId: null, stage: 'hire' });
+    if (lockedBalance.error) throw Object.assign(new Error(lockedBalance.error), { code: 'CASH_BALANCE_RECHECK', balanceCode: lockedBalance.code });
+    directFreeOffer = lockedBalance.freeOffer;
+  }
+
   const id = uuidv4();
   const { rows: [mission] } = await db.query(`
     INSERT INTO missions (
@@ -483,6 +498,8 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
     frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast', payment_method,
     isPrivateResidence, location.lat, location.lng, approx.lat, approx.lng
   ]);
+
+  if (directFreeOffer === 'start') await openFirstMissionFreeOffer(db, oeil_id, mission.id);
 
   // Mission offerte via code promo gratuit : Shoofly paie l'Œil de sa poche, sans commission générée.
   // On enregistre ce coût comme une dépense pour qu'il reste visible dans le Dashboard Financier.
@@ -789,7 +806,9 @@ router.post('/:id/validate', authenticate, requireRole('client'), asyncHandler(a
   for (const p of partialPayments) {
     await notify(db, p.oeilId, '💰 Paiement partiel reçu', `${p.share} MAD crédités — votre part de "${mission.title}".`, 'info', mission.id, emitToUser, null, 'partialPaymentReceivedTitle', 'partialPaymentReceivedBody', {amount: p.share, missionTitle: mission.title});
   }
-  if (cashSettlement) {
+  if (cashSettlement && cashSettlement.firstMissionFree) {
+    await notifyFirstMissionFreeOeil(db, mission, cashSettlement, emitToUser);
+  } else if (cashSettlement) {
     await notify(db, mission.oeil_id, '✅ Mission validée', `Le client a validé "${mission.title}". ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'info', mission.id, emitToUser, null, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', {missionTitle: mission.title, amount: cashSettlement.collected});
   } else {
     await notify(db, mission.oeil_id, '💰 Paiement reçu !', `Le client a validé "${mission.title}". ${mission.oeil_earning} MAD crédités.`, 'info', mission.id, emitToUser, null, 'paymentReceivedOeilTitle', 'paymentReceivedOeilBody', {missionTitle: mission.title, amount: mission.oeil_earning});
@@ -1105,6 +1124,32 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
     out.refund_partial_threshold_hours = refundPartialThresholdHours;
     return out;
   });
+
+  // Chantier « première mission offerte + solde insuffisant » (2026-09-28, A.6 / B.1 / D3) — Œil,
+  // missions disponibles UNIQUEMENT (jamais pour un client ni un admin) : ce que chaque mission
+  // lui demande, calculé par la règle unique (utils/cashCommission.js), pour griser « Postuler »
+  // sans que le frontend ne recopie la règle. Seul son PROPRE solde est exposé.
+  //   required_balance : montant que son wallet doit couvrir (0 si offerte / offrable) ;
+  //   apply_block      : null | INSUFFICIENT_BALANCE_TO_APPLY | FREE_MISSION_ALREADY_USED ;
+  //   free_offer       : cette mission porte sa candidature offerte.
+  if (req.user.role === 'oeil' && mode === 'available') {
+    const state = (await oeilCashState(db, req.user.id)) || { balance: 0, canStartOffer: false, liveOfferMissionId: null };
+    for (const out of serialized) {
+      const r = cashRequirementFor(out, state, { stage: 'apply' });
+      out.required_balance = r.required;
+      out.apply_block = state.balance >= r.required ? null : r.blockCode;
+      out.free_offer = r.freeOffer === 'existing';
+    }
+    return res.json({
+      missions: serialized, total, page: +page, pages: Math.ceil(total / limit),
+      oeil_wallet: {
+        balance: state.balance,
+        first_mission_free: state.canStartOffer,
+        free_offer_mission_id: state.liveOfferMissionId,
+        cashplus_enabled: isCashPlusEnabled(),
+      },
+    });
+  }
   res.json({ missions: serialized, total, page: +page, pages: Math.ceil(total / limit) });
 }));
 
@@ -1318,6 +1363,13 @@ router.post('/', missionCreateLimiter, authenticate, requireRole('client'), miss
     // renvoyé par prepareMissionInsert plus haut pour le cas séquentiel, jamais un 500 générique.
     if (e.code === 'PROMO_NO_LONGER_VALID' || e.code === 'PROMO_ALREADY_USED') {
       return res.status(400).json({ error: e.userMessage });
+    }
+    // Re-contrôle du solde de l'Œil réservé, sous verrou (insertMissionRecord) : appelant = le
+    // CLIENT → même message neutre que prepareMissionInsert, jamais le détail chiffré.
+    if (e.code === 'CASH_BALANCE_RECHECK') {
+      return e.balanceCode === 'insufficient_cash_commission_balance'
+        ? res.status(400).json({ error: OEIL_UNAVAILABLE_MESSAGE, code: OEIL_UNAVAILABLE_CODE })
+        : res.status(400).json({ error: e.message });
     }
     throw e;
   }
@@ -2920,11 +2972,55 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), interestLimiter,
     return res.status(400).json({ error: 'Vous avez déjà une mission dans le même créneau.' })
   }
 
-  const { rowCount: interestInsertCount } = await db.query(
+  // Chantier « première mission offerte + solde insuffisant » (2026-09-28, B.3 et règles BOSS D3) —
+  // mission cash à commission > 0 uniquement (règle unique : utils/cashCommission.js) :
+  //   - solde ≥ commission → candidature normale (payante) ;
+  //   - sinon, Œil éligible sans offre en jeu → candidature « offerte » (offre ouverte sur CETTE
+  //     mission, UNE seule à la fois) ;
+  //   - sinon refus propre : FREE_MISSION_ALREADY_USED (son offre est déjà prise ailleurs) ou
+  //     INSUFFICIENT_BALANCE_TO_APPLY. La commission et le solde renvoyés ne vont qu'à l'Œil
+  //     lui-même (son propre solde) — rien n'est créé, le client n'est pas notifié.
+  // Pré-contrôle (réponse rapide), puis re-contrôle + écriture sous le verrou de la ligne de l'Œil
+  // (même ligne que l'embauche) : deux candidatures offertes simultanées → une seule acceptée.
+  const refuseApply = (check) => {
+    if (check.code !== 'insufficient_cash_commission_balance') return res.status(400).json({ error: check.error });
+    const freeUsed = check.blockCode === 'FREE_MISSION_ALREADY_USED';
+    return res.status(400).json({
+      code: freeUsed ? 'FREE_MISSION_ALREADY_USED' : 'INSUFFICIENT_BALANCE_TO_APPLY',
+      error: freeUsed
+        ? 'Vous avez déjà postulé avec votre mission offerte. Rechargez votre wallet pour postuler à d\'autres missions.'
+        : 'Solde insuffisant pour postuler à cette mission : rechargez votre wallet.',
+      commission: check.commission,
+      balance: check.balance,
+    });
+  };
+  const insertInterest = (q) => q.query(
     `INSERT INTO mission_interests (mission_id, oeil_id, message)
      VALUES ($1, $2, $3) ON CONFLICT (mission_id, oeil_id) DO NOTHING`,
     [req.params.id, req.user.id, message || null]
   );
+  let interestInsertCount;
+  let freeOffer = false;
+  if (requiredCashBalance(mission) > 0) {
+    const applyCheck = { missionId: mission.id, stage: 'apply' };
+    const pre = await checkCashCommissionBalance(db, req.user.id, mission.commission, applyCheck);
+    if (pre.error) return refuseApply(pre);
+    try {
+      ({ interestInsertCount, freeOffer } = await walletService.withTransaction(db, async (client) => {
+        await client.query(`SELECT 1 FROM oeil_profiles WHERE user_id=$1 FOR UPDATE`, [req.user.id]);
+        const locked = await checkCashCommissionBalance(client, req.user.id, mission.commission, applyCheck);
+        if (locked.error) throw Object.assign(new Error(locked.error), { code: 'APPLY_BALANCE_RECHECK', check: locked });
+        const { rowCount } = await insertInterest(client);
+        if (rowCount > 0 && locked.freeOffer === 'start') await openFirstMissionFreeOffer(client, req.user.id, mission.id);
+        return { interestInsertCount: rowCount, freeOffer: locked.freeOffer === 'existing' || (rowCount > 0 && locked.freeOffer === 'start') };
+      }));
+    } catch (e) {
+      if (e.code === 'APPLY_BALANCE_RECHECK') return refuseApply(e.check);
+      throw e;
+    }
+  } else {
+    ({ rowCount: interestInsertCount } = await insertInterest(db));
+  }
 
   // Un retry (double-clic, ou nouvel essai après une erreur réseau qui masquait en fait un
   // succès) ne crée pas de 2e ligne (ON CONFLICT DO NOTHING ci-dessus) et ne doit donc
@@ -2986,7 +3082,8 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), interestLimiter,
     }
   }
 
-  res.status(201).json({ ok: true });
+  // free_offer : cette candidature porte la mission offerte de l'Œil (réponse à l'Œil lui-même).
+  res.status(201).json({ ok: true, free_offer: freeOffer });
 }));
 
 
@@ -3068,6 +3165,11 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
   // posé plus bas masque l'effet par accident ; pour 'before' (aucun cooldown posé), rien
   // d'autre ne l'empêchait — bug constaté empiriquement (audit scénario 2.9).
   await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, oeilId]);
+
+  // Première mission offerte (règle BOSS D3 c) : abandon de la mission offerte après avoir été
+  // retenu (demande de remplacement / urgence, réattribution forcée admin) → gratuité perdue.
+  // Sans effet si cette mission ne portait pas son offre. Jamais bloquant.
+  await forfeitFirstMissionFreeOfferSafe(db, oeilId, mission.id, `Abandon après sélection : ${reason}`);
 
   // Transfert pendant mission : ferme la ligne active de la chaîne (le nouvel Œil n'est pas
   // encore connu à ce stade — la nouvelle ligne sera ouverte au moment où quelqu'un accepte
@@ -3653,9 +3755,11 @@ router.post('/assistance-requests/:id/commission', authenticate, requireRole('ad
     );
     if (rowCount === 0) return false;
     if (decision === 'debit') {
+      // Déclaration d'assistance « mission » (client absent, mauvaise adresse…) : la mission offerte
+      // n'est pas consommée (règle BOSS D2) — débit normal si l'admin le décide.
       cashSettlement = await settleCashCommission(client, mission, assistanceRequest.status === 'validated'
         ? 'Commission Shoofly — mission cash (assistance confirmée par le client, décision admin)'
-        : 'Commission Shoofly — mission cash (assistance auto-validée, décision admin différée)');
+        : 'Commission Shoofly — mission cash (assistance auto-validée, décision admin différée)', { firstMissionFreeAllowed: false });
     }
     return true;
   });
@@ -3927,8 +4031,10 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     // bloquant, contrairement à la suspension/l'anti-fraude/le cooldown ci-dessous, jamais
     // overridable par l'admin (règle métier explicite : le mécanisme de commission prépayée
     // n'a pas de dérogation). N'exécute rien pour 'payzone'.
+    // Première mission offerte (2026-09-28) : offre déjà rattachée à cette mission ou droit
+    // d'ouvrir l'offre → dispensé ; contrôle refait sous verrou dans la transaction plus bas.
     if (mission.payment_method === 'cash') {
-      const cashBalanceCheck = await checkCashCommissionBalance(db, oeil_id, mission.commission);
+      const cashBalanceCheck = await checkCashCommissionBalance(db, oeil_id, mission.commission, { missionId: mission.id, stage: 'hire' });
       if (cashBalanceCheck.error) return res.status(400).json({ error: cashBalanceCheck.error });
     }
 
@@ -3991,6 +4097,14 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
         throw new MissionTransitionError('STALE_STATE', assignCheckLocked.error);
       }
 
+      // Première mission offerte (règle BOSS D3 f) : re-contrôle du solde exigé sous le verrou de
+      // l'Œil (voir hireOeilCore) ; ouvre l'offre sur cette mission si l'Œil en bénéficie ici.
+      if (mission.payment_method === 'cash') {
+        const lockedBalance = await checkCashCommissionBalance(client, oeil_id, mission.commission, { missionId: mission.id, stage: 'hire' });
+        if (lockedBalance.error) throw Object.assign(new Error(lockedBalance.error), { code: 'CASH_BALANCE_RECHECK' });
+        if (lockedBalance.freeOffer === 'start') await openFirstMissionFreeOffer(client, oeil_id, mission.id);
+      }
+
       await transitionMission(client, mission.id, 'pending', 'assigned', req.user.id, {
         extraFields: {
           oeil_id, assigned_at: 'NOW()', is_priority: false, transfer_deadline: null,
@@ -4023,6 +4137,7 @@ router.post('/:id/assign-admin', authenticate, requireRole('admin'), asyncHandle
     });
   } catch (e) {
     if (e instanceof MissionTransitionError) return res.status(409).json({ error: e.message });
+    if (e.code === 'CASH_BALANCE_RECHECK') return res.status(400).json({ error: e.message });
     throw e;
   }
 
@@ -4511,13 +4626,16 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
   // Chantier CashPlus (2026-09-27, point 2) : l'erreur remonte au CLIENT (POST /:id/hire/:oeilId) —
   // message neutre + code, AUCUNE information financière sur l'Œil. `reason` (jamais sérialisé
   // dans une réponse) permet à la cascade (index.js) de passer au candidat suivant.
+  //
+  // Première mission offerte (2026-09-28) : missionId → une offre déjà rattachée à CETTE mission
+  // (candidature offerte) ou le droit d'ouvrir l'offre dispensent de couvrir la commission. Ce
+  // contrôle n'est qu'un instantané : il est REFAIT sous verrou dans la transaction plus bas.
+  const balanceRefusal = (code) => (code === 'insufficient_cash_commission_balance'
+    ? { ok: false, status: 400, error: OEIL_UNAVAILABLE_MESSAGE, code: OEIL_UNAVAILABLE_CODE, reason: code }
+    : null);
   if (mission.payment_method === 'cash') {
-    const balanceCheck = await checkCashCommissionBalance(db, oeilId, mission.commission);
-    if (balanceCheck.error) {
-      return balanceCheck.code === 'insufficient_cash_commission_balance'
-        ? { ok: false, status: 400, error: OEIL_UNAVAILABLE_MESSAGE, code: OEIL_UNAVAILABLE_CODE, reason: balanceCheck.code }
-        : { ok: false, status: 400, error: balanceCheck.error };
-    }
+    const balanceCheck = await checkCashCommissionBalance(db, oeilId, mission.commission, { missionId: mission.id, stage: 'hire' });
+    if (balanceCheck.error) return balanceRefusal(balanceCheck.code) || { ok: false, status: 400, error: balanceCheck.error };
   }
 
   // candidate_window_ends_at, pending_candidate_id et batch_tiebreak_ends_at remis à NULL ici
@@ -4542,6 +4660,16 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
       });
       if (assignCheckLocked.error) {
         throw new MissionTransitionError('STALE_STATE', assignCheckLocked.error);
+      }
+
+      // Première mission offerte (règle BOSS D3 f) : re-contrôle du solde exigé SOUS le verrou de
+      // l'Œil posé ci-dessus. Deux embauches simultanées du même Œil neuf (missions différentes)
+      // sont sérialisées par ce verrou : la 2ᵉ voit l'offre ouverte par la 1ʳᵉ et n'est plus
+      // dispensée de commission. Ouvre l'offre sur CETTE mission si elle n'en porte pas déjà une.
+      if (mission.payment_method === 'cash') {
+        const lockedBalance = await checkCashCommissionBalance(client, oeilId, mission.commission, { missionId: mission.id, stage: 'hire' });
+        if (lockedBalance.error) throw Object.assign(new Error(lockedBalance.error), { code: 'CASH_BALANCE_RECHECK', balanceCode: lockedBalance.code });
+        if (lockedBalance.freeOffer === 'start') await openFirstMissionFreeOffer(client, oeilId, mission.id);
       }
 
       const updatedInner = await transitionMission(client, mission.id, 'pending', 'assigned', changedById, {
@@ -4575,6 +4703,7 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
     });
   } catch (e) {
     if (e instanceof MissionTransitionError) return { ok: false, status: 409, error: e.message };
+    if (e.code === 'CASH_BALANCE_RECHECK') return balanceRefusal(e.balanceCode) || { ok: false, status: 400, error: e.message };
     throw e;
   }
 
@@ -4697,17 +4826,20 @@ async function advanceCandidateCascade(db, io, emitToUser, mission, opts = {}) {
   // wallet ne couvre pas la commission n'est pas sollicité (il ne pourrait pas être retenu,
   // hireOeilCore le refuserait). requiredCashBalance = 0 hors cash : filtre sans effet (balance ≥ 0).
   // Non définitif : il redevient sollicitable au tirage suivant s'il a rechargé entre-temps.
+  // Première mission offerte (2026-09-28) : « couvre » = solde ≥ commission OU mission offerte de
+  // cet Œil OU droit d'ouvrir son offre (cashBalanceCoverFilter, règle unique).
   const batchSize = await getSetting(db, 'candidate_batch_size', 10);
+  const cover = capReached ? null : await cashBalanceCoverFilter(db, mission, { balanceExpr: 'p.balance', oeilExpr: 'u.id', paramIndex: 3 });
   const { rows: candidates } = capReached ? { rows: [] } : await db.query(`
     SELECT u.id
     FROM mission_interests mi
     JOIN users u ON u.id = mi.oeil_id
     LEFT JOIN oeil_profiles p ON p.user_id = u.id
     WHERE mi.mission_id = $1 AND mi.declined = false
-      AND COALESCE(p.balance, 0) >= $3::numeric
+      AND ${cover.sql}
     ORDER BY u.reliability_score DESC, p.rating_avg DESC
     LIMIT $2
-  `, [mission.id, batchSize, requiredCashBalance(mission)]);
+  `, [mission.id, batchSize, ...cover.params]);
 
   if (candidates.length > 0) {
     const candidateIds = candidates.map(c => c.id);

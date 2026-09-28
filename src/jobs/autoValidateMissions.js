@@ -1,7 +1,7 @@
 const { getSetting } = require('../utils/settings');
 const { logStatus } = require('../utils/missionHistory');
 const walletService = require('../services/walletService');
-const { settleCashCommission, notifyShortfallAdmins } = require('../utils/cashCommission');
+const { settleCashCommission, notifyShortfallAdmins, notifyFirstMissionFreeOeil } = require('../utils/cashCommission');
 // notify() vient de routes/missions.js — require sûr ici (missions.js ne require jamais ce
 // module en retour, pas de cycle) : évite de dupliquer l'INSERT INTO notifications + emitToUser
 // déjà standardisé ailleurs dans le projet.
@@ -113,7 +113,9 @@ async function runAutoValidateMissions(db, emitToUser = null) {
           'info', mission.id, emitToUser, null, 'partialPaymentAutoReceivedTitle', 'partialPaymentAutoReceivedBody',
           { amount: p.share, missionTitle: mission.title });
       }
-      if (cashSettlement) {
+      if (cashSettlement && cashSettlement.firstMissionFree) {
+        await notifyFirstMissionFreeOeil(db, mission, cashSettlement, emitToUser);
+      } else if (cashSettlement) {
         await notify(db, mission.oeil_id, '✅ Mission validée automatiquement',
           `Validation automatique après délai pour "${mission.title}". ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`,
           'info', mission.id, emitToUser, null, 'autoValidatedCashOeilTitle', 'autoValidatedCashOeilBody',

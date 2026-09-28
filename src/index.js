@@ -41,7 +41,7 @@ const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
 const { casablancaYMD } = require('./utils/schedule');
 const { transitionMission } = require('./utils/missionStateMachine');
-const { requiredCashBalance } = require('./utils/cashCommission');
+const { cashBalanceCoverFilter, forfeitFirstMissionFreeOfferSafe } = require('./utils/cashCommission');
 const walletService = require('./services/walletService');
 const { runAutoValidateMissions, runValidationReminders, runAssistanceReminders } = require('./jobs/autoValidateMissions');
 const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
@@ -913,6 +913,10 @@ initDb().then(() => {
             note: 'Transfert automatique — mission non démarrée à l\'heure (H+30)',
           });
 
+          // Première mission offerte (règle BOSS D3 c) : mission offerte non démarrée = abandon
+          // après sélection → gratuité perdue. Sans effet si la mission ne portait pas son offre.
+          await forfeitFirstMissionFreeOfferSafe(db, m.oeil_id, m.id, 'Abandon après sélection : mission non démarrée (H+30)');
+
           // Pénalité fiabilité — le score est entièrement recalculé par logReliabilityEvent ci-dessous,
           // pas besoin de le décrémenter manuellement ici (ancien code mort, toujours écrasé après coup).
           // Cooldown — cette mission est structurellement 'before' (jamais démarrée ; transfer_type
@@ -1394,6 +1398,9 @@ initDb().then(() => {
         // et — mission cash à commission > 0 — seulement ceux dont le wallet couvre la commission
         // (un insolvable n'est jamais retenu comme gagnant). Avant : LIMIT 1 sans filtre, et le
         // même gagnant insolvable était retenté à chaque tick, indéfiniment (mission bloquée).
+        // Première mission offerte (2026-09-28) : « couvre » = solde ≥ commission OU mission
+        // offerte de cet Œil OU droit d'ouvrir son offre — règle unique, utils/cashCommission.js.
+        const cover = await cashBalanceCoverFilter(db, mission, { balanceExpr: 'p.balance', oeilExpr: 'u.id', paramIndex: 3 });
         const { rows: confirmed } = await db.query(`
           SELECT mi.oeil_id
           FROM mission_interests mi
@@ -1401,9 +1408,9 @@ initDb().then(() => {
           LEFT JOIN oeil_profiles p ON p.user_id = u.id
           WHERE mi.mission_id=$1 AND mi.declined=false
             AND mi.confirmed_at IS NOT NULL AND mi.confirmed_at <= $2
-            AND COALESCE(p.balance, 0) >= $3::numeric
+            AND ${cover.sql}
           ORDER BY u.reliability_score DESC, p.rating_avg DESC
-        `, [mission.id, mission.batch_tiebreak_ends_at, requiredCashBalance(mission)]);
+        `, [mission.id, mission.batch_tiebreak_ends_at, ...cover.params]);
 
         if (confirmed.length === 0) {
           // Aucun confirmé retenable (tous insolvables sur une mission cash — ou, cas théorique,

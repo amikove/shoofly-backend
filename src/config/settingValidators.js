@@ -49,6 +49,7 @@ const SETTING_RULES = {
   // ── Drapeaux d'activation stricts (=== 'true' en aval).
   five_star_bonus_active:            { type: 'bool' }, // missions.js:1496, :2426
   late_cancel_penalty_tier1_enabled: { type: 'bool' }, // utils/reliabilityScore.js:29
+  first_mission_free_enabled:        { type: 'bool' }, // utils/cashCommission.js isFirstMissionFreeEnabled
 
   // ── Points de pénalité : TOUJOURS négatifs dans le code et les défauts (ajoutés au score,
   //    un "malus"). On borne le signe (<= 0), pas la magnitude (pas de réponse dans le code

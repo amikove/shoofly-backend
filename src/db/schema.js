@@ -1158,6 +1158,30 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
     CREATE INDEX IF NOT EXISTS idx_admin_wallet_credits_oeil ON admin_wallet_credits(oeil_id, created_at DESC);
 
+    -- Première mission offerte (chantier 2026-09-28, règles BOSS D1-D6) — utils/cashCommission.js.
+    -- Une ligne rattache la gratuité d'un Œil à UNE mission (candidature ou mission retenue).
+    -- open : ouverte ; qu'elle soit encore en jeu est déduit de l'état réel de la mission et de la
+    --        candidature (annulée, autre Œil retenu, expirée, retirée : gratuité rendue) ;
+    -- returned : ligne ouverte morte, refermée à l'ouverture d'une nouvelle offre (historique) ;
+    -- consumed : mission validée exonérée (commission_waived = montant non prélevé) ;
+    -- lost : l'Œil a abandonné la mission offerte après avoir été retenu.
+    -- Aucune écriture dans wallet_transactions : le ledger et ses contraintes ne sont pas touchés.
+    -- Deux index uniques partiels = gardes atomiques : au plus UNE offre ouverte par Œil, et au
+    -- plus UNE offre consommée ou perdue par Œil.
+    CREATE TABLE IF NOT EXISTS first_mission_free_offers (
+      id                SERIAL PRIMARY KEY,
+      oeil_id           TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      mission_id        TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      status            TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','returned','consumed','lost')),
+      commission_waived NUMERIC(10,2) CHECK (commission_waived IS NULL OR commission_waived > 0),
+      close_reason      TEXT,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      closed_at         TIMESTAMPTZ
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_fmf_offers_one_open ON first_mission_free_offers(oeil_id) WHERE status='open';
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_fmf_offers_one_final ON first_mission_free_offers(oeil_id) WHERE status IN ('consumed','lost');
+    CREATE INDEX IF NOT EXISTS idx_fmf_offers_mission ON first_mission_free_offers(mission_id);
+
     -- "Mot de passe oublié" (2026-08-10) — 2 colonnes sur users plutôt qu'une table dédiée : au
     -- plus UN token actif par utilisateur à la fois (règle métier "dernier token demandé = seul
     -- valide"), donc une simple paire nullable suffit et rend cette invariante STRUCTURELLE
@@ -1904,6 +1928,7 @@ CREATE TABLE IF NOT EXISTS identity_documents (
 
   console.log('✅ PostgreSQL schema ready');
 }
+
 
 // Exécute fn(client) UNE seule fois pour toute la vie de la base : insère le marqueur « name » dans
 // schema_migrations et migre les données dans la même transaction. Renvoie le résultat de fn, ou

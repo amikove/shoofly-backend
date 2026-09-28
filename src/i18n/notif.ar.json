@@ -24,6 +24,8 @@
   "partialPaymentReceivedBody": "تم إضافة {{amount}} درهم — نصيبك من تحويل \"{{missionTitle}}\".",
   "commissionDebitedOeilTitle": "💸 تم خصم العمولة",
   "commissionDebitedOeilBody": "تم خصم {{amount}} درهم كعمولة من محفظتك (مهمة نقدية).",
+  "firstMissionFreeOeilTitle": "🎁 مهمتك الأولى مجانية",
+  "firstMissionFreeOeilBody": "تم اعتماد «{{missionTitle}}». كانت هذه مهمتك المجانية: لم تُقتطع أي عمولة.",
   "paymentReceivedOeilTitle": "💰 تم استلام الدفع!",
   "paymentReceivedOeilBody": "صادق العميل على \"{{missionTitle}}\". تم إضافة {{amount}} درهم.",
   "missionValidatedClientTitle": "✅ تمت الموافقة على المهمة",

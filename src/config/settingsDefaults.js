@@ -104,6 +104,12 @@ module.exports = {
   // réactivable sans déploiement si l'interprétation s'avère fausse — voir computeLatePenalty,
   // utils/reliabilityScore.js.
   late_cancel_penalty_tier1_enabled: 'false',
+  // Première mission offerte (chantier 2026-09-28) : un Œil qui n'a encore rien fait peut postuler
+  // à UNE mission cash sans couvrir la commission, et n'en paiera aucune sur la mission retenue.
+  // 'false' = aucune NOUVELLE offre ; une offre déjà ouverte reste honorée (promesse tenue, voir
+  // utils/cashCommission.js). Dans l'allowlist de PUT /admin/settings et l'écran Paramètres
+  // (catégorie Tarification).
+  first_mission_free_enabled: 'true',
   presence_confirmation_deadline_minutes_h45: '15',
   password_reset_token_expiry_hours: '1',
   // PROMPT 2 (2026-08-17) — détection d'abandon sans GPS : fréquence de la demande de photo

@@ -7,7 +7,7 @@ const { isCashPlusEnabled, requireCashPlusEnabled } = require('../config/cashplu
 const { refundOnCancellation } = require('../utils/refund');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const walletService = require('../services/walletService');
-const { settleCashCommission, notifyShortfallAdmins } = require('../utils/cashCommission');
+const { settleCashCommission, notifyShortfallAdmins, notifyFirstMissionFreeOeil } = require('../utils/cashCommission');
 const { applyClientStrike } = require('../utils/clientStrikes');
 const cashplusService = require('../services/cashplus');
 const { isNewOeil } = require('../utils/reliabilityScore');
@@ -1816,6 +1816,7 @@ const {
   late_cancel_penalty_tier1_points, late_cancel_penalty_tier2_points, late_cancel_penalty_tier3_points,
   late_cancel_penalty_tier1_threshold_hours, late_cancel_penalty_tier2_threshold_hours,
   late_cancel_penalty_tier1_enabled,
+  first_mission_free_enabled,
   presence_confirmation_deadline_minutes_h45,
   password_reset_token_expiry_hours,
   // Anti-fraude (routes/antiFraud.js) — voir config/settingsDefaults.js pour le détail ligne à ligne
@@ -1863,6 +1864,7 @@ const {
     late_cancel_penalty_tier1_points, late_cancel_penalty_tier2_points, late_cancel_penalty_tier3_points,
     late_cancel_penalty_tier1_threshold_hours, late_cancel_penalty_tier2_threshold_hours,
     late_cancel_penalty_tier1_enabled,
+    first_mission_free_enabled,
     presence_confirmation_deadline_minutes_h45,
     password_reset_token_expiry_hours,
     fraud_oeil_cancel_lookback_days, fraud_oeil_nomedia_lookback_days,
@@ -2224,7 +2226,9 @@ router.put('/admin/claims/:missionId/resolve', authenticate, requireRole('admin'
     notifyUser(db, userId, title, body, 'info', mission.id, emitToUser, 'mission_view', titleKey, bodyKey, params);
 
   if (decision === 'oeil') {
-    if (cashSettlement) {
+    if (cashSettlement && cashSettlement.firstMissionFree) {
+      await notifyFirstMissionFreeOeil(db, mission, cashSettlement, emitToUser);
+    } else if (cashSettlement) {
       await notify(mission.oeil_id, '✅ Réclamation résolue', `Résolue en votre faveur. ${cashSettlement.collected} MAD de commission débités de votre wallet (mission cash).`, 'commissionDebitedOeilTitle', 'commissionDebitedOeilBody', { amount: cashSettlement.collected });
     } else if (isClientAbsent) {
       await notify(mission.oeil_id, '✅ Réclamation résolue', "Résolue en votre faveur.", 'claimResolvedOeilWinPendingCommissionTitle', 'claimResolvedOeilWinPendingCommissionBody', null);
@@ -2328,7 +2332,8 @@ router.post('/admin/claims/:missionId/commission', authenticate, requireRole('ad
     if (rowCount === 0) return; // déjà décidée — applied reste false, 409 renvoyé hors transaction (rien écrit)
     applied = true;
     if (decision === 'debit') {
-      cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (réclamation "client absent", décision admin différée)');
+      // No-show client : la mission offerte n'est pas consommée (règles BOSS D2/D6), débit normal.
+      cashSettlement = await settleCashCommission(client, mission, 'Commission Shoofly — mission cash (réclamation "client absent", décision admin différée)', { firstMissionFreeAllowed: false });
     }
   });
   if (!applied) return res.status(409).json({ error: 'La commission a déjà été décidée pour cette réclamation.' });
