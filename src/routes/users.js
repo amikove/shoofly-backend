@@ -2,7 +2,8 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/schema');
 const { authenticate, requireRole, invalidateAuthCache } = require('../middleware/auth');
-const { requirePermission } = require('../middleware/permissions');
+const { requirePermission, requireSuperAdmin } = require('../middleware/permissions');
+const { isCashPlusEnabled, requireCashPlusEnabled } = require('../config/cashplus');
 const { refundOnCancellation } = require('../utils/refund');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const walletService = require('../services/walletService');
@@ -287,7 +288,9 @@ router.post('/oeil/withdraw', authenticate, requireRole('oeil'), asyncHandler(as
 // mission. Aucune ligne cashplus_recharge_requests n'est créée si l'appel CashPlus échoue : rien
 // à suivre pour une tentative qui n'a jamais existé côté CashPlus (l'Œil peut simplement
 // réessayer, un nouveau request_id sera généré).
-router.post('/oeil/cashplus/generate-token', authenticate, requireRole('oeil'), asyncHandler(async (req, res) => {
+// requireCashPlusEnabled (config/cashplus.js) : 403 CASHPLUS_DISABLED tant que CASHPLUS_ENABLED
+// n'est pas 'true' — placé après l'authentification (sans jeton : 401), avant tout appel externe.
+router.post('/oeil/cashplus/generate-token', authenticate, requireRole('oeil'), requireCashPlusEnabled, asyncHandler(async (req, res) => {
   const amount = Number(req.body.amount);
   if (!cashplusService.ALLOWED_AMOUNTS.includes(amount)) {
     return res.status(400).json({ error: `Montant invalide — valeurs autorisées : ${cashplusService.ALLOWED_AMOUNTS.join(', ')} MAD` });
@@ -420,6 +423,15 @@ router.get('/admin/profile/:userId', authenticate, requireRole('admin'), require
       balance: parseFloat(oeilProfile?.balance || 0),
       wallet_transactions: walletTransactions,
       wire_transfers: walletTransactions.filter(t => t.reason === 'Virement bancaire'),
+      // Crédits manuels passés par un admin (POST /admin/oeils/:oeilId/wallet-credit) — historique
+      // complet, auteur compris, non filtré par date (volume faible, trace d'audit).
+      admin_wallet_credits: (await db.query(
+        `SELECT c.id, c.amount, c.reason, c.created_at,
+                a.first_name AS admin_first_name, a.last_name AS admin_last_name
+         FROM admin_wallet_credits c LEFT JOIN users a ON a.id = c.admin_id
+         WHERE c.oeil_id=$1 ORDER BY c.created_at DESC`,
+        [userId]
+      )).rows,
     };
   }
 
@@ -2734,7 +2746,9 @@ router.get('/oeil/earnings', authenticate, requireRole('oeil'), asyncHandler(asy
     `SELECT balance, total_earnings FROM oeil_profiles WHERE user_id=$1`, [req.user.id]
   );
 
-  res.json({ lines, balance: profile?.balance || 0, total_earnings: profile?.total_earnings || 0 });
+  // cashplus_enabled (config/cashplus.js) : le frontend n'affiche le bouton « Recharger » que si
+  // la recharge CashPlus est active côté serveur (un seul réglage, CASHPLUS_ENABLED).
+  res.json({ lines, balance: profile?.balance || 0, total_earnings: profile?.total_earnings || 0, cashplus_enabled: isCashPlusEnabled() });
 }));
 
 // ── GET /users/admin/finance/oeils — admin liste les Œils avec solde pour paiement ──
@@ -2799,6 +2813,84 @@ router.post('/admin/finance/:oeilId/wire-transfer', authenticate, requireRole('a
   );
 
   res.json({ ok: true, transaction });
+}));
+
+// ── POST /users/admin/oeils/:oeilId/wallet-credit — crédit manuel du wallet d'un Œil ──
+// Chantier CashPlus (2026-09-27, point 4) : filet tant que la recharge CashPlus est coupée (ex.
+// espèces reçues en main propre). Super admin uniquement (requireSuperAdmin, mécanisme existant).
+//   - amount : > 0, au plus ADMIN_WALLET_CREDIT_MAX MAD, 2 décimales au plus ;
+//   - reason : motif OBLIGATOIRE (3 à 500 caractères), inscrit au ledger et dans l'historique ;
+//   - idempotency_key : OBLIGATOIRE, générée par le formulaire à son ouverture. Même clé renvoyée
+//     (double clic, réseau qui rejoue) → aucun second crédit, réponse 200 already_applied. Même clé
+//     pour un autre montant ou un autre Œil → 409.
+// Écriture : walletService.credit (seul chemin autorisé vers le solde, ligne de ledger comprise),
+// clé de ledger préfixée « admin_credit: » (type de ligne dédié, repérable), countsAsEarning:false
+// (ce n'est pas un gain de mission : total_earnings inchangé). L'historique admin
+// (admin_wallet_credits) est écrit dans la MÊME transaction. Notification à l'Œil APRÈS le commit.
+const ADMIN_WALLET_CREDIT_MAX = 1000;
+router.post('/admin/oeils/:oeilId/wallet-credit', authenticate, requireRole('admin'), requireSuperAdmin, asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { oeilId } = req.params;
+  const rawAmount = req.body?.amount;
+  const amount = typeof rawAmount === 'number' ? rawAmount : (typeof rawAmount === 'string' && rawAmount.trim() !== '' ? Number(rawAmount) : NaN);
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  const key = typeof req.body?.idempotency_key === 'string' ? req.body.idempotency_key.trim() : '';
+
+  if (!Number.isFinite(amount) || amount <= 0 || amount > ADMIN_WALLET_CREDIT_MAX || Math.round(amount * 100) !== amount * 100) {
+    return res.status(400).json({ code: 'INVALID_AMOUNT', error: `Montant invalide : supérieur à 0 et au plus ${ADMIN_WALLET_CREDIT_MAX} MAD, 2 décimales au plus.`, max: ADMIN_WALLET_CREDIT_MAX });
+  }
+  if (reason.length < 3 || reason.length > 500) {
+    return res.status(400).json({ code: 'REASON_REQUIRED', error: 'Motif obligatoire (3 à 500 caractères).' });
+  }
+  if (key.length < 8 || key.length > 100) {
+    return res.status(400).json({ code: 'IDEMPOTENCY_KEY_REQUIRED', error: "Clé d'idempotence manquante ou invalide." });
+  }
+
+  const { rows: [oeil] } = await db.query(
+    `SELECT u.id FROM users u JOIN oeil_profiles p ON p.user_id = u.id WHERE u.id=$1 AND u.role='oeil'`,
+    [oeilId]
+  );
+  if (!oeil) return res.status(404).json({ error: 'Œil introuvable' });
+
+  let outcome;
+  try {
+    outcome = await walletService.withTransaction(db, async (client) => {
+      const r = await walletService.credit(client, oeilId, 'oeil', amount, `Crédit manuel admin : ${reason}`, null, {
+        countsAsEarning: false,
+        idempotencyKey: `admin_credit:${key}`,
+      });
+      if (!r.applied) {
+        const { rows: [prev] } = await client.query(
+          `SELECT id, oeil_id, amount, reason, created_at FROM admin_wallet_credits WHERE idempotency_key=$1`, [key]
+        );
+        return { applied: false, credit: prev || null, balance: r.balance };
+      }
+      const { rows: [credit] } = await client.query(
+        `INSERT INTO admin_wallet_credits (oeil_id, admin_id, amount, reason, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id, oeil_id, amount, reason, created_at`,
+        [oeilId, req.user.id, amount, reason, key]
+      );
+      return { applied: true, credit, balance: r.balance };
+    });
+  } catch (e) {
+    if (e.code === 'IDEMPOTENCY_KEY_REUSED') {
+      return res.status(409).json({ code: 'IDEMPOTENCY_KEY_REUSED', error: 'Cette clé a déjà servi pour un autre crédit.' });
+    }
+    throw e;
+  }
+
+  if (!outcome.applied) {
+    return res.status(200).json({ ok: true, applied: false, already_applied: true, credit: outcome.credit, balance: outcome.balance });
+  }
+
+  await notifyUser(
+    db, oeilId,
+    '💰 Wallet crédité',
+    `Votre wallet a été crédité de ${amount.toFixed(2)} MAD par l'équipe Shoofly.`,
+    'success', null, req.app.get('emitToUser'), 'gains_page',
+    'adminWalletCreditTitle', 'adminWalletCreditBody', { amount }
+  );
+  res.status(201).json({ ok: true, applied: true, credit: outcome.credit, balance: outcome.balance });
 }));
 
 // Admin joins its own WS room on connect (done client-side)

@@ -2,6 +2,7 @@
 // confirmation du paiement (callback webhook PayZone), jamais au moment du formulaire —
 // voir mission_payment_attempts (db/schema.js) et le rapport de session pour le détail.
 const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 const Sentry = require('@sentry/node');
 const router = require('express').Router();
 const { validationResult } = require('express-validator');
@@ -273,7 +274,27 @@ router.post('/payzone/retry/:attemptId', missionCreateLimiter, authenticate, req
 // KO métier) : HTTP 200 est donc utilisé pour tout rejet "métier" (request_id inconnu), seul un
 // HMAC invalide renvoie 403 — par analogie directe avec verifyCallbackSignature ci-dessus,
 // signalé comme hypothèse dans le rapport de session faute de précision équivalente pour CashPlus.
-router.post('/cashplus/callback', asyncHandler(async (req, res) => {
+//
+// Limiteur dédié par IP (chantier CashPlus 2026-09-27, point 6) — la route est exemptée du plafond
+// global (index.js). Seules les réponses en ÉCHEC (statut ≥ 400 : HMAC invalide, erreur serveur)
+// consomment le quota (skipSuccessfulRequests) : un vrai callback CashPlus (200 « OK »), et ses
+// rejeux idempotents (200 « OK », aucun second crédit), ne sont jamais freinés, même en rafale ;
+// une IP qui enchaîne les signatures invalides est bloquée en 429 « NOK » au-delà de
+// CASHPLUS_CALLBACK_MAX_FAILURES par fenêtre de 15 min. Une requête bloquée n'atteint pas le
+// handler : rien n'est crédité, et CashPlus peut la rejouer plus tard sans risque de double crédit.
+const CASHPLUS_CALLBACK_MAX_FAILURES = 30;
+const cashplusCallbackLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: CASHPLUS_CALLBACK_MAX_FAILURES,
+  skipSuccessfulRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    console.warn(`[cashplus] Callback limité (429) — trop d'échecs depuis ${req.ip}`);
+    res.status(429).type('text/plain').send('NOK');
+  },
+});
+router.post('/cashplus/callback', cashplusCallbackLimiter, asyncHandler(async (req, res) => {
   const sendPlain = (status, text) => res.status(status).type('text/plain').send(text);
   const { request_id: requestId, hmac, amount: payloadAmount } = req.body || {};
 

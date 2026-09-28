@@ -1142,6 +1142,22 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- status='pending' — même principe que idx_whatsapp_failures_unresolved ci-dessus.
     CREATE INDEX IF NOT EXISTS idx_cashplus_requests_pending_expiry ON cashplus_recharge_requests(date_expiration) WHERE status='pending';
 
+    -- Crédits manuels du wallet Œil par un super admin (chantier CashPlus 2026-09-27, point 4 —
+    -- routes/users.js POST /admin/oeils/:oeilId/wallet-credit). Historique admin : qui, combien,
+    -- pourquoi. Le mouvement d'argent lui-même est la ligne wallet_transactions de clé
+    -- 'admin_credit:<idempotency_key>', écrite dans la MÊME transaction que cette ligne.
+    -- idempotency_key UNIQUE : un double envoi ne crée jamais une deuxième ligne.
+    CREATE TABLE IF NOT EXISTS admin_wallet_credits (
+      id              SERIAL PRIMARY KEY,
+      oeil_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      admin_id        TEXT REFERENCES users(id) ON DELETE SET NULL,
+      amount          NUMERIC(10,2) NOT NULL CHECK (amount > 0),
+      reason          TEXT NOT NULL CHECK (length(btrim(reason)) > 0),
+      idempotency_key TEXT UNIQUE NOT NULL,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_admin_wallet_credits_oeil ON admin_wallet_credits(oeil_id, created_at DESC);
+
     -- "Mot de passe oublié" (2026-08-10) — 2 colonnes sur users plutôt qu'une table dédiée : au
     -- plus UN token actif par utilisateur à la fois (règle métier "dernier token demandé = seul
     -- valide"), donc une simple paire nullable suffit et rend cette invariante STRUCTURELLE

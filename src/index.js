@@ -141,10 +141,14 @@ const USER_KEYED_LIMITER_PATHS = /^\/api\/missions\/[^/]+\/(confirm-presence|can
 // lui aussi exempté — sinon, derrière une IP partagée, les accusés de tous les appareils
 // épuiseraient ce plafond global au détriment des vraies actions. Il a son propre limiteur
 // (routes/push.js) et n'accepte qu'un jeton signé.
+// Chantier CashPlus (2026-09-27) : POST /api/payments/cashplus/callback exempté aussi — limiteur
+// dédié par IP (routes/payments.js) qui ne compte que les échecs, pour ne jamais refuser une rafale
+// de vrais paiements confirmés par CashPlus.
+const CASHPLUS_CALLBACK_PATH = '/api/payments/cashplus/callback';
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
-  skip: (req) => req.path === '/health' || (req.method === 'POST' && (USER_KEYED_LIMITER_PATHS.test(req.path) || req.path === '/api/push/ack')),
+  skip: (req) => req.path === '/health' || (req.method === 'POST' && (USER_KEYED_LIMITER_PATHS.test(req.path) || req.path === '/api/push/ack' || req.path === CASHPLUS_CALLBACK_PATH)),
   message: { error: 'Trop de requêtes, réessayez dans 15 minutes.' },
   standardHeaders: true,
   legacyHeaders: false,
@@ -238,7 +242,7 @@ const skipForPayzoneCallback = (middleware) => (req, res, next) => (
 // monté globalement en complément, donc les deux cas restent couverts sans deviner lequel
 // CashPlus utilise réellement — comportement de PARSING inchangé pour cette route précise, seul
 // son périmètre (plus seulement cette route, avant) et la limite du JSON global changent.
-app.use('/api/payments/cashplus/callback', express.urlencoded({ extended: true, limit: '10kb' }));
+app.use(CASHPLUS_CALLBACK_PATH, express.urlencoded({ extended: true, limit: '10kb' }));
 // SP-1 — limite ramenée de 5 Mo à 256 Ko : mesuré (scratchpad de session, colonnes réelles de la
 // base) qu'aucun payload JSON légitime du projet n'approche cet ordre de grandeur (le plus gros
 // trouvé, un rapport de mission/une demande de modification, tient en quelques Ko même
