@@ -5,7 +5,7 @@ const { authenticate, invalidateAuthCache } = require('../middleware/auth');
 const { requireSuperAdmin, ALL_PERMISSIONS, PROFILES } = require('../middleware/permissions');
 const asyncHandler = require('../middleware/asyncHandler');
 const {
-  normalizeMoroccanMobile, phoneProvided, isPhoneUniqueViolation, PHONE_INVALID_MESSAGE, PHONE_TAKEN_MESSAGE,
+  normalizePhoneForRole, phoneProvided, isPhoneUniqueViolation, phoneInvalidMessage, PHONE_TAKEN_MESSAGE,
 } = require('../utils/phone');
 
 // ── GET /super-admin/admins — liste des admins ────────────
@@ -40,12 +40,12 @@ router.post('/admins', authenticate, requireSuperAdmin, asyncHandler(async (req,
     finalPermissions = permissions.filter(p => ALL_PERMISSIONS.includes(p));
   }
 
-  // Téléphone (décision BOSS D1) : même normalisation E.164 et même unicité que l'inscription
+  // Téléphone (décision BOSS D1) : même normalisation E.164 (règle générale, numéro étranger accepté) et même unicité que l'inscription
   // (facultatif pour un admin). L'index unique porte sur TOUS les comptes.
   let phoneE164 = null;
   if (phoneProvided(phone)) {
-    phoneE164 = normalizeMoroccanMobile(phone);
-    if (!phoneE164) return res.status(400).json({ error: PHONE_INVALID_MESSAGE, code: 'INVALID_PHONE' });
+    phoneE164 = normalizePhoneForRole(phone, 'admin');
+    if (!phoneE164) return res.status(400).json({ error: phoneInvalidMessage('admin'), code: 'INVALID_PHONE' });
     const { rows: [taken] } = await db.query('SELECT id FROM users WHERE shoofly_phone_e164(phone)=$1', [phoneE164]);
     if (taken) return res.status(409).json({ error: PHONE_TAKEN_MESSAGE, code: 'PHONE_TAKEN' });
   }

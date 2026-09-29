@@ -1935,23 +1935,31 @@ CREATE TABLE IF NOT EXISTS identity_documents (
   console.log('✅ PostgreSQL schema ready');
 }
 
-// Jumelle SQL de utils/phone.js normalizeMoroccanMobile (MÊME règle, voir son commentaire) :
-// renvoie +2126XXXXXXXX / +2127XXXXXXXX, ou NULL si le numéro n'est pas un mobile marocain.
-// IMMUTABLE : requis pour servir d'expression d'index.
+// Jumelle SQL de utils/phone.js normalizePhone (MÊME règle générale, voir son commentaire) :
+// numéro marocain MOBILE (06-07) → +212XXXXXXXXX (fixe 05 → NULL, décision BOSS 2026-09-29, tous
+// rôles) ; numéro international « + » ou « 00 » → E.164 (8 à 15 chiffres) ; sinon NULL. La règle
+// Œil (numéro étranger refusé) reste côté JS.
+// IMMUTABLE : requis pour servir d'expression d'index. Toute modification du corps impose un
+// REINDEX de uq_users_phone_e164 (les entrées déjà indexées ne sont pas recalculées).
 const PHONE_E164_FUNCTION_SQL = `
   CREATE OR REPLACE FUNCTION shoofly_phone_e164(p TEXT) RETURNS TEXT
   LANGUAGE plpgsql IMMUTABLE AS $fn$
-  DECLARE s TEXT;
+  DECLARE s TEXT; ma TEXT;
   BEGIN
     IF p IS NULL THEN RETURN NULL; END IF;
     s := regexp_replace(btrim(p), '[[:space:].()/-]', '', 'g');
     IF s = '' THEN RETURN NULL; END IF;
     IF left(s, 2) = '00' THEN s := '+' || substr(s, 3); END IF;
-    IF left(s, 4) = '+212' THEN s := substr(s, 5);
-    ELSIF left(s, 3) = '212' AND length(s) = 12 THEN s := substr(s, 4);
+    IF left(s, 4) = '+212' THEN ma := substr(s, 5);
+    ELSIF left(s, 3) = '212' AND length(s) = 12 THEN ma := substr(s, 4);
+    ELSIF left(s, 1) <> '+' THEN ma := s;
     END IF;
-    IF s ~ '^0[67][0-9]{8}$' THEN RETURN '+212' || substr(s, 2); END IF;
-    IF s ~ '^[67][0-9]{8}$' THEN RETURN '+212' || s; END IF;
+    IF ma IS NOT NULL THEN
+      IF ma ~ '^0[67][0-9]{8}$' THEN RETURN '+212' || substr(ma, 2); END IF;
+      IF ma ~ '^[67][0-9]{8}$' THEN RETURN '+212' || ma; END IF;
+      RETURN NULL; -- dont un fixe marocain 05… : refusé pour tous les rôles
+    END IF;
+    IF s ~ '^[+][1-9][0-9]{7,14}$' THEN RETURN s; END IF;
     RETURN NULL;
   END
   $fn$;

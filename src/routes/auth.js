@@ -17,8 +17,8 @@ const { authenticate, requireRole, invalidateAuthCache } = require('../middlewar
 const asyncHandler = require('../middleware/asyncHandler');
 const { resolveCity, resolveQuartier } = require('../constants/villes');
 const {
-  normalizeMoroccanMobile, phoneProvided, isPhoneUniqueViolation,
-  PHONE_INVALID_MESSAGE, PHONE_REQUIRED_MESSAGE, PHONE_TAKEN_MESSAGE,
+  normalizePhoneForRole, phoneProvided, isPhoneUniqueViolation,
+  phoneInvalidMessage, PHONE_REQUIRED_MESSAGE, PHONE_TAKEN_MESSAGE,
 } = require('../utils/phone');
 const { sendPasswordResetEmail } = require('../services/email');
 // notify() — in-app + socket live + push (utils/notify.js). Inscription : pas d'emitToUser en
@@ -68,18 +68,15 @@ router.post('/register', [
           acquisition_source, acquisition_medium, acquisition_campaign } = req.body;
     const { rows: existing } = await db.query('SELECT id FROM users WHERE email=$1', [email]);
     if (existing.length) return res.status(409).json({ error: 'Email déjà utilisé' });
-    // Téléphone (décision BOSS D1, 2026-09-28) : normalisé E.164 (+2126… / +2127…) avant tout
-    // contrôle et tout stockage ; OBLIGATOIRE pour un Œil (anti-abus de la mission offerte :
-    // un numéro = un compte) ; doublon cherché sur le numéro NORMALISÉ, y compris contre les
-    // numéros déjà en base dans d'anciens formats. Course entre deux inscriptions : index unique
-    // uq_users_phone_e164 (db/schema.js) → 409 plus bas.
-    let phoneE164 = null;
-    if (phoneProvided(phone)) {
-      phoneE164 = normalizeMoroccanMobile(phone);
-      if (!phoneE164) return res.status(400).json({ error: PHONE_INVALID_MESSAGE, code: 'INVALID_PHONE' });
-    }
-    if (role === 'oeil' && !phoneE164) return res.status(400).json({ error: PHONE_REQUIRED_MESSAGE, code: 'PHONE_REQUIRED' });
-    if (phoneE164) {
+    // Téléphone (décisions BOSS D1, 2026-09-28) : OBLIGATOIRE pour tout client et tout Œil (un
+    // numéro = un compte) ; normalisé E.164 avant tout contrôle et tout stockage — Œil : mobile
+    // marocain (+2126… / +2127…) ; client : numéro marocain ou étranger (utils/phone.js) ; doublon
+    // cherché sur le numéro NORMALISÉ, y compris contre les numéros déjà en base dans d'anciens
+    // formats. Course entre deux inscriptions : index unique uq_users_phone_e164 (db/schema.js) → 409 plus bas.
+    if (!phoneProvided(phone)) return res.status(400).json({ error: PHONE_REQUIRED_MESSAGE, code: 'PHONE_REQUIRED' });
+    const phoneE164 = normalizePhoneForRole(phone, role);
+    if (!phoneE164) return res.status(400).json({ error: phoneInvalidMessage(role), code: 'INVALID_PHONE' });
+    {
       const { rows: existingPhone } = await db.query('SELECT id FROM users WHERE shoofly_phone_e164(phone)=$1', [phoneE164]);
       if (existingPhone.length) return res.status(409).json({ error: PHONE_TAKEN_MESSAGE, code: 'PHONE_TAKEN' });
     }
@@ -206,15 +203,20 @@ router.get('/me', authenticate, asyncHandler(async (req, res) => {
 router.put('/me', authenticate, asyncHandler(async (req, res) => {
     const db = getDb();
     const { first_name, last_name, phone, city, bio, coverage_zone, disponibilites, has_bank_account } = req.body;
-    // Téléphone (décision BOSS D1) : normalisé E.164 ; doublon cherché sur le numéro NORMALISÉ
-    // (un même numéro écrit 06… / +212… / avec espaces = un seul numéro). Champ vide = inchangé
-    // (COALESCE ci-dessous) : un Œil ne peut donc pas effacer son numéro.
+    // Téléphone (décisions BOSS D1) : même règle par rôle qu'à l'inscription (utils/phone.js) ;
+    // doublon cherché sur le numéro NORMALISÉ. Modifier son numéro : oui ; le VIDER : non — champ
+    // présent mais vide / blanc / null → 400 PHONE_REQUIRED dès que le compte a déjà un numéro
+    // (un compte sans numéro, typiquement un admin, peut toujours enregistrer son profil). Champ
+    // absent du corps = numéro inchangé (COALESCE ci-dessous).
     let phoneE164 = null;
     if (phoneProvided(phone)) {
-      phoneE164 = normalizeMoroccanMobile(phone);
-      if (!phoneE164) return res.status(400).json({ error: PHONE_INVALID_MESSAGE, code: 'INVALID_PHONE' });
+      phoneE164 = normalizePhoneForRole(phone, req.user.role);
+      if (!phoneE164) return res.status(400).json({ error: phoneInvalidMessage(req.user.role), code: 'INVALID_PHONE' });
       const { rows: existingPhone } = await db.query('SELECT id FROM users WHERE shoofly_phone_e164(phone)=$1 AND id != $2', [phoneE164, req.user.id]);
       if (existingPhone.length) return res.status(409).json({ error: PHONE_TAKEN_MESSAGE, code: 'PHONE_TAKEN' });
+    } else if (phone !== undefined) {
+      const { rows: [current] } = await db.query('SELECT phone FROM users WHERE id=$1', [req.user.id]);
+      if (current && phoneProvided(current.phone)) return res.status(400).json({ error: PHONE_REQUIRED_MESSAGE, code: 'PHONE_REQUIRED' });
     }
     let canonicalCity = null;
     if (city) {

@@ -32,6 +32,7 @@ const {
   oeilCashState, cashRequirementFor, openFirstMissionFreeOffer, forfeitFirstMissionFreeOfferSafe,
 } = require('../utils/cashCommission');
 const { isCashPlusEnabled } = require('../config/cashplus');
+const { phoneProvided, PHONE_REQUIRED_MESSAGE } = require('../utils/phone');
 const { generateUniqueReference } = require('../utils/ticketReference');
 const { parsePagination } = require('../utils/pagination');
 // notify() — point d'insertion unique in-app + socket live + push (voir utils/notify.js).
@@ -1306,12 +1307,26 @@ const missionCreateValidators = [
   body('replacement_preference').optional().isIn(['fast','choose']),
 ];
 
+// Téléphone obligatoire côté serveur (décision BOSS 2026-09-29) : l'écran « Ajoutez votre numéro »
+// côté frontend (RequireAuth) ne protège que l'app web — un appel direct à l'API (hors frontend)
+// contournait jusqu'ici totalement l'obligation. Admins non concernés (jamais appelant de ces deux
+// routes). Renvoie true (et a déjà répondu) si le compte n'a pas de numéro enregistré.
+async function blockIfPhoneMissing(db, userId, res) {
+  const { rows: [u] } = await db.query('SELECT phone FROM users WHERE id=$1', [userId]);
+  if (!phoneProvided(u && u.phone)) {
+    res.status(403).json({ error: PHONE_REQUIRED_MESSAGE, code: 'PHONE_REQUIRED' });
+    return true;
+  }
+  return false;
+}
+
 // ── POST /missions ─────────────────────────────────────────
 router.post('/', missionCreateLimiter, authenticate, requireRole('client'), missionCreateValidators, asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   const db = getDb();
+  if (await blockIfPhoneMissing(db, req.user.id, res)) return;
   const emitToUser = req.app.get('emitToUser');
   const io = req.app.get('io');
 
@@ -2945,6 +2960,7 @@ router.post('/:id/rate-client', authenticate, requireRole('oeil'), [
 
 router.post('/:id/interest', authenticate, requireRole('oeil'), interestLimiter, asyncHandler(async (req, res) => {
     const db = getDb();
+    if (await blockIfPhoneMissing(db, req.user.id, res)) return;
     const { message } = req.body;
     // La suspension est vérifiée en amont par le middleware authenticate ; le cooldown
     // de transfert reste à vérifier ici, ce n'est pas la même chose qu'une suspension.
