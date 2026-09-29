@@ -162,24 +162,40 @@ async function openFirstMissionFreeOffer(client, oeilId, missionId) {
   await client.query(`INSERT INTO first_mission_free_offers (oeil_id, mission_id) VALUES ($1,$2)`, [oeilId, missionId]);
 }
 
-// Gratuité PERDUE (D3 c) : l'Œil abandonne, après avoir été retenu, la mission qui portait son
-// offre (demande de remplacement, réattribution forcée, suspension, blocage, présence non
-// confirmée, non-démarrage H+30). Sans effet si la mission ne portait pas d'offre ouverte.
+// Gratuité PERDUE (D3 c + ajustements BOSS du 2026-09-28) : l'Œil perd, après avoir été retenu, la
+// mission qui portait son offre — demande de remplacement (urgence), réattribution forcée SANS
+// exemption, non-démarrage H+30, présence non confirmée, suspension, blocage anti-fraude. Sans
+// effet si la mission ne portait pas d'offre ouverte. Renvoie true si une offre a été perdue ICI
+// (sert aux messages : « Votre mission offerte n'est plus disponible. »).
 async function forfeitFirstMissionFreeOffer(db, oeilId, missionId, reason) {
-  await db.query(
+  const { rowCount } = await db.query(
     `UPDATE first_mission_free_offers SET status='lost', closed_at=NOW(), close_reason=$3
      WHERE oeil_id=$1 AND mission_id=$2 AND status='open'
        AND NOT EXISTS (SELECT 1 FROM first_mission_free_offers t WHERE t.oeil_id=$1 AND t.status IN ('consumed','lost'))`,
     [oeilId, missionId, reason]
   );
+  return rowCount === 1;
 }
 
 // Variante « jamais bloquante » pour les chemins d'abandon (hors transaction) : un échec ici ne
-// doit jamais empêcher la libération de la mission — au pire la gratuité reste rendue.
+// doit jamais empêcher la libération de la mission — au pire la gratuité reste rendue (false).
 async function forfeitFirstMissionFreeOfferSafe(db, oeilId, missionId, reason) {
-  try { await forfeitFirstMissionFreeOffer(db, oeilId, missionId, reason); } catch (e) {
+  try { return await forfeitFirstMissionFreeOffer(db, oeilId, missionId, reason); } catch (e) {
     console.error(`❌ forfeitFirstMissionFreeOffer (Œil ${oeilId}, mission ${missionId}) :`, e.message);
+    return false;
   }
+}
+
+// Candidature RETIRÉE par l'Œil avant d'être retenu (Q5) : si elle portait son offre ouverte, la
+// gratuité est rendue immédiatement (ligne refermée 'returned'). À appeler dans la transaction du
+// retrait, sous le verrou de la ligne de l'Œil. Renvoie true si une offre a été refermée.
+async function returnFirstMissionFreeOffer(client, oeilId, missionId, reason) {
+  const { rowCount } = await client.query(
+    `UPDATE first_mission_free_offers SET status='returned', closed_at=NOW(), close_reason=$3
+     WHERE oeil_id=$1 AND mission_id=$2 AND status='open'`,
+    [oeilId, missionId, reason]
+  );
+  return rowCount > 0;
 }
 
 // Filtre SQL « le wallet de l'Œil couvre ce que la mission lui demande » (cascade par lot :
@@ -327,5 +343,5 @@ module.exports = {
   checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins, notifyFirstMissionFreeOeil,
   requiredCashBalance, cashBalanceShortSet, cashBalanceCoverFilter, OEIL_UNAVAILABLE_CODE, OEIL_UNAVAILABLE_MESSAGE,
   isFirstMissionFreeEnabled, oeilCashState, cashRequirementFor, openFirstMissionFreeOffer,
-  forfeitFirstMissionFreeOffer, forfeitFirstMissionFreeOfferSafe,
+  forfeitFirstMissionFreeOffer, forfeitFirstMissionFreeOfferSafe, returnFirstMissionFreeOffer,
 };

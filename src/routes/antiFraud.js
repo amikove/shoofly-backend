@@ -6,6 +6,7 @@ const { getSetting } = require('../utils/settings');
 const asyncHandler = require('../middleware/asyncHandler');
 const { transitionMission, MissionTransitionError } = require('../utils/missionStateMachine');
 const Sentry = require('@sentry/node');
+const { forfeitFirstMissionFreeOfferSafe } = require('../utils/cashCommission');
 // Réutilise le mécanisme de cascade de réattribution (voir routes/missions.js) plutôt que
 // de dupliquer la logique de sélection de candidat — même approche que
 // PUT /users/admin/:id/toggle-active (routes/users.js).
@@ -522,6 +523,11 @@ router.post('/block/:userId', authenticate, requireRole('admin'), requirePermiss
       // Retire la propre candidature de l'Œil bloqué sur sa propre mission (même correctif que
       // POST /:id/transfer et toggle-active, voir bug fantôme audit 2.9) avant de lancer la cascade.
       await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, req.params.userId]);
+
+      // Première mission offerte (décision BOSS Q1, 2026-09-28) : blocage anti-fraude = gratuité
+      // PERDUE si cette mission portait son offre. Aucun message « aucune pénalité » n'est envoyé à
+      // l'Œil bloqué sur ce chemin (seulement « Compte suspendu » + motif) : rien à corriger.
+      await forfeitFirstMissionFreeOfferSafe(db, req.params.userId, updated.id, 'Blocage anti-fraude');
 
       await missionRoutes.advanceCandidateCascade(db, io, emitToUser, updated, {});
 

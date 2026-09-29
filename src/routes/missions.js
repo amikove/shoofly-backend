@@ -29,7 +29,7 @@ const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBul
 const {
   checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins, notifyFirstMissionFreeOeil,
   requiredCashBalance, cashBalanceShortSet, cashBalanceCoverFilter, OEIL_UNAVAILABLE_CODE, OEIL_UNAVAILABLE_MESSAGE,
-  oeilCashState, cashRequirementFor, openFirstMissionFreeOffer, forfeitFirstMissionFreeOfferSafe,
+  oeilCashState, cashRequirementFor, openFirstMissionFreeOffer, forfeitFirstMissionFreeOfferSafe, returnFirstMissionFreeOffer,
 } = require('../utils/cashCommission');
 const { isCashPlusEnabled } = require('../config/cashplus');
 const { phoneProvided, PHONE_REQUIRED_MESSAGE } = require('../utils/phone');
@@ -171,12 +171,18 @@ async function reassignMissionsOnSuspension(db, io, emitToUser, oeilId, opts = {
       // que POST /:id/transfer, voir bug fantôme audit 2.9) avant de lancer la cascade.
       await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, oeilId]);
 
+      // Première mission offerte (décision BOSS Q1, 2026-09-28) : suspension = gratuité PERDUE si
+      // cette mission portait son offre ; le message le dit (sinon « aucune retenue » tromperait).
+      const freeLost = await forfeitFirstMissionFreeOfferSafe(db, oeilId, mission.id, `Suspension du compte : ${transferReason}`);
+
       await advanceCandidateCascade(db, io, emitToUser, updated, {});
 
       const reassignTitle = '📋 Mission réattribuée';
-      const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la suspension de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`;
+      const reassignBody = `Votre mission "${mission.title}" a été réattribuée à un autre Œil suite à la suspension de votre compte. Aucune pénalité ni retenue financière ne vous est appliquée pour cette mission.`
+        + (freeLost ? ' Votre mission offerte n\'est plus disponible.' : '');
       await notify(db, oeilId, reassignTitle, reassignBody,
-        'mission', mission.id, emitToUser, null, 'missionReassignedNoPenaltyTitle', 'missionReassignedNoPenaltyBody', { missionTitle: mission.title });
+        'mission', mission.id, emitToUser, null, 'missionReassignedNoPenaltyTitle',
+        freeLost ? 'missionReassignedNoPenaltyFreeLostBody' : 'missionReassignedNoPenaltyBody', { missionTitle: mission.title });
       // WhatsApp Œil retiré (chantier 2, décision A — config/whatsappPolicy.js).
     } catch (e) {
       // Groupe 3 point 3.4 (audit exhaustif backend 2026-09-05 §2.4) : l'échec de réattribution
@@ -3102,6 +3108,49 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), interestLimiter,
   res.status(201).json({ ok: true, free_offer: freeOffer });
 }));
 
+// ── POST /missions/:id/withdraw-interest ── L'Œil retire sa candidature (décision BOSS Q5, 2026-09-28) ──
+// Seulement AVANT d'être retenu : une fois l'Œil affecté à la mission, l'abandon reste le parcours
+// « Demander assistance » (409 ALREADY_SELECTED). Si la candidature portait sa mission offerte, la
+// gratuité lui est rendue immédiatement (offre refermée 'returned'). Le client voit simplement le
+// candidat disparaître de sa liste — aucune notification, aucun motif.
+// Idempotente (un 2ᵉ retrait → 200 already_withdrawn, rien d'autre) et protégée par le verrou de la
+// ligne de l'Œil : même verrou que l'embauche (hireOeilCore / affectation admin, qui re-lisent la
+// candidature sous ce verrou) et que la candidature — un double clic n'a qu'un seul effet, et un
+// retrait ne peut jamais croiser une embauche en laissant un état incohérent.
+router.post('/:id/withdraw-interest', authenticate, requireRole('oeil'), interestLimiter, asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { rows: [exists] } = await db.query('SELECT 1 FROM missions WHERE id=$1', [req.params.id]);
+  if (!exists) return res.status(404).json({ error: 'Mission introuvable' });
+
+  let result;
+  try {
+    result = await walletService.withTransaction(db, async (client) => {
+      await client.query('SELECT 1 FROM oeil_profiles WHERE user_id=$1 FOR UPDATE', [req.user.id]);
+      const { rows: [m] } = await client.query('SELECT status, oeil_id FROM missions WHERE id=$1', [req.params.id]);
+      if (m.oeil_id === req.user.id && m.status !== 'pending') {
+        throw Object.assign(new Error('ALREADY_SELECTED'), { code: 'ALREADY_SELECTED' });
+      }
+      const { rowCount } = await client.query('DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2', [req.params.id, req.user.id]);
+      if (rowCount === 0) return { withdrawn: false, freeReturned: false };
+      const freeReturned = await returnFirstMissionFreeOffer(client, req.user.id, req.params.id, 'Candidature retirée par l\'Œil');
+      return { withdrawn: true, freeReturned };
+    });
+  } catch (e) {
+    if (e.code === 'ALREADY_SELECTED') {
+      return res.status(409).json({
+        code: 'ALREADY_SELECTED',
+        error: 'Vous avez déjà été retenu pour cette mission : utilisez « Demander assistance » si vous ne pouvez plus l\'assurer.',
+      });
+    }
+    throw e;
+  }
+  if (!result.withdrawn) return res.json({ ok: true, already_withdrawn: true });
+
+  const io = req.app.get('io');
+  if (io) io.to('room:admin').emit('mission_updated', { id: req.params.id });
+  res.json({ ok: true, withdrawn: true, free_offer_returned: result.freeReturned });
+}));
+
 
 
 
@@ -3134,6 +3183,9 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
     systemMessageText = "L'Œil a signalé un empêchement. Mission remise en priorité.",
     systemMessageKey = 'missionImpediment',
     skipReliabilityPenalty = false,
+    // Première mission offerte : abandon après sélection = gratuité perdue (défaut). false =
+    // gratuité rendue — réattribution forcée admin AVEC exemption de pénalité (décision BOSS Q2).
+    forfeitFirstMissionFree = true,
   } = options;
 
   if (!['assigned', 'en_route', 'active'].includes(mission.status)) {
@@ -3183,9 +3235,14 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
   await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [mission.id, oeilId]);
 
   // Première mission offerte (règle BOSS D3 c) : abandon de la mission offerte après avoir été
-  // retenu (demande de remplacement / urgence, réattribution forcée admin) → gratuité perdue.
+  // retenu (demande de remplacement / urgence, réattribution forcée admin) → gratuité perdue ;
+  // réattribution forcée exemptée de pénalité → gratuité rendue (Q2, forfeitFirstMissionFree:false :
+  // rien n'est écrit, l'offre devient simplement « morte » et l'Œil redevient éligible).
   // Sans effet si cette mission ne portait pas son offre. Jamais bloquant.
-  await forfeitFirstMissionFreeOfferSafe(db, oeilId, mission.id, `Abandon après sélection : ${reason}`);
+  let freeLost = false;
+  if (forfeitFirstMissionFree) {
+    freeLost = await forfeitFirstMissionFreeOfferSafe(db, oeilId, mission.id, `Abandon après sélection : ${reason}`);
+  }
 
   // Transfert pendant mission : ferme la ligne active de la chaîne (le nouvel Œil n'est pas
   // encore connu à ce stade — la nouvelle ligne sera ouverte au moment où quelqu'un accepte
@@ -3273,7 +3330,7 @@ async function releaseMissionForReplacement(db, io, emitToUser, mission, oeilId,
   // (l'intérêt propre de l'Œil transférant a déjà été supprimé ci-dessus).
   await advanceCandidateCascade(db, io, emitToUser, mission, {});
 
-  return { ok: true, transferType, deadline };
+  return { ok: true, transferType, deadline, freeLost };
 }
 
 // Fermé pour l'Œil (2026-07-30, prompt 18) — défense en profondeur derrière le remplacement de
@@ -3602,6 +3659,7 @@ router.post('/:id/force-reassign', authenticate, requireRole('admin'), asyncHand
     systemMessageText: 'Un administrateur a lancé une recherche de remplaçant pour cette mission.',
     systemMessageKey: 'forceReassignSystemMessage',
     skipReliabilityPenalty: isExempt,
+    forfeitFirstMissionFree: !isExempt, // exemptée → gratuité rendue (décision BOSS Q2)
   });
   if (!result.ok) return res.status(result.status).json({ error: result.error });
 
@@ -3615,13 +3673,18 @@ router.post('/:id/force-reassign', authenticate, requireRole('admin'), asyncHand
   // "aucune pénalité" de façon inconditionnelle. Ce n'est plus vrai par défaut (isExempt=false)
   // — le sort réel de la pénalité (-70) dépend de la suite (remplaçant trouvé à temps ou non),
   // décidée plus tard par checkTransferDeadlines, jamais connue à cet instant.
+  // Décision BOSS 2026-09-29 : si la réattribution forcée SANS exemption a fait perdre la mission
+  // offerte (isExempt=false → forfeitFirstMissionFree=true dans releaseMissionForReplacement,
+  // result.freeLost ci-dessus), le message le dit — sinon inchangé. Exemptée : la gratuité est
+  // RENDUE (pas perdue), donc jamais cette phrase sur le message "Aucune pénalité…".
+  const freeLostMsg = !isExempt && result.freeLost ? " Votre mission offerte n'est plus disponible." : '';
   await notify(db, oeilId,
     'Mission réattribuée par un administrateur',
-    isExempt
+    (isExempt
       ? `Un administrateur a lancé une recherche de remplaçant pour "${mission.title}". Aucune pénalité ne vous a été appliquée pour cette mission.`
-      : `Un administrateur a lancé une recherche de remplaçant pour "${mission.title}". Si aucun remplaçant n'est trouvé avant l'expiration du délai, une pénalité de fiabilité pourra être appliquée.`,
+      : `Un administrateur a lancé une recherche de remplaçant pour "${mission.title}". Si aucun remplaçant n'est trouvé avant l'expiration du délai, une pénalité de fiabilité pourra être appliquée.`) + freeLostMsg,
     'mission', mission.id, emitToUser, null, 'forceReassignOeilTitle',
-    isExempt ? 'forceReassignOeilBody' : 'forceReassignOeilBodyPenaltyPending',
+    isExempt ? 'forceReassignOeilBody' : (result.freeLost ? 'forceReassignOeilBodyPenaltyPendingFreeLost' : 'forceReassignOeilBodyPenaltyPending'),
     { missionTitle: mission.title });
 
   res.json({ ok: true, assistance_request_id: assistanceRequest.id, transfer_type: result.transferType, deadline: result.deadline, penalty_exempted: isExempt });
@@ -4483,12 +4546,18 @@ async function checkPresenceConfirmationDeadlines(db, io, emitToUser) {
     // lancer la cascade.
     await db.query(`DELETE FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2`, [updated.id, oeilId]);
 
+    // Première mission offerte (décision BOSS Q1, 2026-09-28) : présence non confirmée = gratuité
+    // PERDUE si cette mission portait son offre ; le message le dit (sinon « aucune retenue » tromperait).
+    const freeLost = await forfeitFirstMissionFreeOfferSafe(db, oeilId, mission.id, 'Présence non confirmée à temps');
+
     await advanceCandidateCascade(db, io, emitToUser, updated, {});
 
     await notify(db, oeilId,
       '⏰ Présence non confirmée',
-      `Vous n'avez pas confirmé votre présence à temps pour "${mission.title}". La mission a été réattribuée. Aucune pénalité ni retenue financière ne vous est appliquée.`,
-      'warning', mission.id, emitToUser, null, 'presenceNotConfirmedReassignedTitle', 'presenceNotConfirmedReassignedBody',
+      `Vous n'avez pas confirmé votre présence à temps pour "${mission.title}". La mission a été réattribuée. Aucune pénalité ni retenue financière ne vous est appliquée.`
+        + (freeLost ? ' Votre mission offerte n\'est plus disponible.' : ''),
+      'warning', mission.id, emitToUser, null, 'presenceNotConfirmedReassignedTitle',
+      freeLost ? 'presenceNotConfirmedReassignedFreeLostBody' : 'presenceNotConfirmedReassignedBody',
       { missionTitle: mission.title }
     );
 
@@ -4677,6 +4746,14 @@ async function hireOeilCore(db, io, emitToUser, mission, oeilId, opts) {
       if (assignCheckLocked.error) {
         throw new MissionTransitionError('STALE_STATE', assignCheckLocked.error);
       }
+
+      // Retrait de candidature (décision BOSS Q5, 2026-09-28) : la candidature est re-lue SOUS le
+      // verrou de l'Œil — POST /:id/withdraw-interest prend le même verrou. Une candidature retirée
+      // entre le pré-contrôle plus haut et cette transaction n'est donc jamais embauchée.
+      const { rowCount: stillInterested } = await client.query(
+        'SELECT 1 FROM mission_interests WHERE mission_id=$1 AND oeil_id=$2', [mission.id, oeilId]
+      );
+      if (!stillInterested) throw new MissionTransitionError('STALE_STATE', "Cet Œil a retiré sa candidature.");
 
       // Première mission offerte (règle BOSS D3 f) : re-contrôle du solde exigé SOUS le verrou de
       // l'Œil posé ci-dessus. Deux embauches simultanées du même Œil neuf (missions différentes)
