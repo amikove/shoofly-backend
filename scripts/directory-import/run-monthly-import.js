@@ -12,6 +12,12 @@
 //
 // Ne PAS exécuter automatiquement dans ce chantier (Phase 4 : "aucun déploiement"). Prévu pour être
 // lancé par le Cron Job Render une fois le service créé par BOSS.
+//
+// Phase 5 (2026-09-30) : MTNRA (fetch-mtnra.js) et les limites de ville (fetch-boundaries-
+// nominatim.js) sont désormais téléchargés À L'EXÉCUTION (data.gov.ma / Nominatim), jamais
+// committés. fetch-boundaries-nominatim.js tourne en premier dans le bloc "santé" : un échec
+// Nominatim fait donc échouer tout le domaine santé pour ce run (seul domaine qui en dépend
+// aujourd'hui — voir son commentaire), mais jamais les administrations ni NARSA.
 
 const { execFileSync } = require('child_process');
 const path = require('path');
@@ -32,6 +38,7 @@ async function main() {
   const results = { sante: 'non tenté', administrations: 'non tenté', narsa: 'non tenté' };
 
   try {
+    run('fetch-boundaries-nominatim.js'); // limites de ville (Nominatim) — utilisées par les étapes suivantes
     run('fetch-sources.js');
     run('merge-classify.js');
     run('assign-neighborhoods.js');
