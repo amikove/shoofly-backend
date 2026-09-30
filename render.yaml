@@ -16,6 +16,35 @@ services:
       - key: FRONTEND_URL
         value: https://shoofly.ma
 
+  # Chantier SEO annuaire — Phase 4, décision #3 (2026-09-30). Service DÉDIÉ, séparé de shoofly-api
+  # (décision Phase 2 déjà validée : les dépendances lourdes du pipeline — duckdb notamment,
+  # scripts/directory-import/package.json — ne doivent jamais entrer dans le npm install du service
+  # web). PRÉPARÉ ICI, PAS DÉPLOYÉ : ce bloc doit être revu par BOSS (Render Blueprint sync, ou
+  # création manuelle du service dans le dashboard avec ces mêmes réglages) avant toute mise en
+  # route. Calendrier proposé : 1er de chaque mois à 3h du matin (heure serveur, UTC sur Render).
+  - type: cron
+    name: shoofly-directory-cron
+    env: node
+    schedule: "0 3 1 * *"
+    buildCommand: cd scripts/directory-import && npm install
+    startCommand: node scripts/directory-import/run-monthly-import.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: shoofly-db
+          property: connectionString
+      # Variables SANS valeur ici (sync: false) — à créer par BOSS dans le dashboard Render, jamais
+      # committées. Voir RAPPORT_PHASE4.md pour la liste complète et comment générer chaque valeur.
+      - key: VERCEL_DEPLOY_HOOK_URL
+        sync: false
+
 databases:
+  # Phase 5 (2026-09-30) — corrigé : shoofly-db est sur le plan PAYANT constaté dans le dashboard
+  # Render (0.1 CPU, 256 MB RAM, 6 $/mois), pas "free". Valeur Blueprint vérifiée dans la doc
+  # officielle Render (docs/blueprint-spec, docs/compute-plans) : l'ID de plan pour ce palier est
+  # "0.1c-256mb" (alias historique : "basic-256mb"). Un `plan:` absent ou erroné ferait tenter à
+  # Render Blueprint sync de RECRÉER/RÉTROGRADER la base vers un autre palier — jamais deviné ici.
   - name: shoofly-db
-    plan: free
+    plan: 0.1c-256mb
