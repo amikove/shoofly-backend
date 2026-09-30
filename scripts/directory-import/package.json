@@ -1,0 +1,14 @@
+{
+  "name": "shoofly-directory-import",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pipeline d'import annuaire SEO (Overture + Foursquare) — dépendances ISOLÉES du service web (décision BOSS #8 : service Cron Job Render dédié, jamais dans le npm install du service API). Voir RAPPORT_PHASE2_DONNEES.md.",
+  "scripts": {
+    "import": "node run-import.js"
+  },
+  "dependencies": {
+    "duckdb": "^1.1.3",
+    "pg": "^8.11.3",
+    "xlsx": "^0.18.5"
+  }
+}

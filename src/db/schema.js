@@ -1876,6 +1876,220 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- dédié, "seulement si ce KPI devient lent") : aucun changement de comportement, l'index n'a
     -- simplement aucun lecteur pour l'instant.
     CREATE INDEX IF NOT EXISTS idx_missions_cancelled_at ON missions (cancelled_at) WHERE status='cancelled';
+
+    -- ═══ Chantier SEO annuaire — Phase 2, couche données (2026-09-30) ═══
+    -- Pages annuaire d'établissements "où l'on attend" (santé, RST). Alimentées par un pipeline
+    -- d'import hors-ligne (Overture + Foursquare, backend/scripts/directory-import/) qui résout
+    -- ville/quartier et fait la jointure spatiale AVANT d'écrire ici — aucune extension spatiale
+    -- (PostGIS) requise sur cette base : lat/lng sont stockés en NUMERIC simples, déjà résolus.
+    -- WT non déployé : tables créées mais aucune route ne les utilise encore en production tant
+    -- que ce chantier n'est pas validé par BOSS. Voir PLAN_SEO_ANNUAIRE.md / RAPPORT_PHASE2_DONNEES.md
+    -- (Shoofly/seo-study/) pour le contexte complet.
+
+    -- Vocabulaire fermé des catégories santé (décision BOSS #2, 2026-09-30) — reclassement par
+    -- mots-clés du nom (FR+AR), voir scripts/directory-import/keyword-rules.js. 'autres_sante' est
+    -- le repli explicite pour tout nom ambigu (décision #3 de l'étude initiale).
+    CREATE TABLE IF NOT EXISTS directory_categories (
+      id            TEXT PRIMARY KEY,
+      domain        TEXT NOT NULL DEFAULT 'sante' CHECK (domain IN ('sante','administration')),
+      label_fr      TEXT NOT NULL,
+      label_ar      TEXT NOT NULL,
+      schema_org_type TEXT NOT NULL,
+      sort_order    INTEGER NOT NULL DEFAULT 0,
+      is_published  BOOLEAN NOT NULL DEFAULT TRUE
+    );
+    INSERT INTO directory_categories (id, domain, label_fr, label_ar, schema_org_type, sort_order, is_published) VALUES
+      ('hopitaux',             'sante', 'Hôpitaux',                         'مستشفيات',            'Hospital',      10, TRUE),
+      ('cliniques',            'sante', 'Cliniques',                       'مصحات',               'MedicalClinic', 20, TRUE),
+      ('dentistes',            'sante', 'Dentistes',                       'أطباء الأسنان',        'Dentist',       30, TRUE),
+      ('kinesitherapie',       'sante', 'Kinésithérapie / Rééducation',    'العلاج الطبيعي',       'MedicalClinic', 40, TRUE),
+      ('laboratoires',         'sante', 'Laboratoires d''analyses',         'مختبرات التحاليل',     'MedicalLaboratory', 50, TRUE),
+      ('radiologie',           'sante', 'Radiologie / imagerie médicale',  'الأشعة والتصوير الطبي', 'MedicalClinic', 60, TRUE),
+      ('ophtalmologie',        'sante', 'Ophtalmologie / optométrie',      'طب وجراحة العيون',     'MedicalClinic', 70, TRUE),
+      ('gynecologie',          'sante', 'Gynécologie / maternité',         'أمراض النساء والتوليد', 'MedicalClinic', 80, TRUE),
+      ('pediatrie',            'sante', 'Pédiatrie',                       'طب الأطفال',           'MedicalClinic', 90, TRUE),
+      ('sante_mentale',        'sante', 'Santé mentale',                   'الصحة النفسية',        'MedicalClinic', 100, TRUE),
+      ('medecines_douces',     'sante', 'Médecines douces',                'الطب البديل',          'MedicalClinic', 110, TRUE),
+      ('urgences',             'sante', 'Urgences',                        'الإسعافات',            'MedicalClinic', 120, TRUE),
+      ('specialites_medicales','sante', 'Spécialités médicales',           'التخصصات الطبية',      'MedicalClinic', 130, TRUE),
+      ('medecine_generale',    'sante', 'Médecine générale',               'الطب العام',           'MedicalClinic', 140, TRUE),
+      ('autres_sante',         'sante', 'Autres établissements de santé',  'مؤسسات صحية أخرى',     'MedicalClinic', 150, TRUE),
+      -- Phase 3, décision #1 (2026-09-30) — reclassée hors de "Autres administrations" (dispensaires,
+      -- centres de santé publics/urbains/ruraux, CSU) : c'est un lieu d'attente santé, pas une
+      -- administration au sens où on l'entend ici.
+      ('centres_sante_publics','sante', 'Centres de santé publics',        'المراكز الصحية العمومية', 'MedicalClinic', 160, TRUE),
+      -- Administrations (Phase 2 bis, décision #2, 2026-09-30) — import MTNRA/data.gov.ma.
+      ('cnss',                     'administration', 'CNSS',                              'الصندوق الوطني للضمان الاجتماعي', 'GovernmentOffice', 200, TRUE),
+      ('barid',                    'administration', 'Barid Al-Maghrib',                  'بريد المغرب',                     'PostOffice',       210, TRUE),
+      ('conservation_fonciere',    'administration', 'Conservation foncière',             'المحافظة العقارية',               'GovernmentOffice', 220, TRUE),
+      ('impots',                   'administration', 'Impôts',                            'الضرائب',                         'GovernmentOffice', 230, TRUE),
+      ('eau_electricite',          'administration', 'Agences eau / électricité',         'وكالات الماء والكهرباء',          'GovernmentOffice', 240, TRUE),
+      ('prefecture',               'administration', 'Préfectures',                       'العمالات والمقاطعات',             'GovernmentOffice', 250, TRUE),
+      ('arrondissement_etat_civil','administration', 'Arrondissements / état civil',      'المقاطعات والحالة المدنية',       'GovernmentOffice', 260, TRUE),
+      ('commissariat',             'administration', 'Commissariats',                     'مراكز الشرطة',                    'PoliceStation',    270, TRUE),
+      ('tribunal',                 'administration', 'Tribunaux',                         'المحاكم',                         'Courthouse',       280, TRUE),
+      ('banque',                   'administration', 'Banques',                           'البنوك',                          'BankOrCreditUnion',290, TRUE),
+      -- Vide pour l'instant (Phase 3, §CCT) : aucune des sources vérifiées (SILIAD/controletechnique.ma,
+      -- DEKRA, SALAMA, REVITEX — interdiction explicite ou CGU absentes) n'autorise l'extraction ;
+      -- NARSA (régulateur officiel, khadamatnarsa.ma) n'a pas non plus de CGU publiées. Catégorie
+      -- créée (texte déjà prêt dans MODELES_TEXTES_SEO.md §8) mais generera 0 page tant qu'aucune
+      -- fiche n'existe — voir RAPPORT_PHASE3.md pour la recommandation (contact direct NARSA).
+      ('visite_technique',         'administration', 'Centres de visite technique',       'مراكز الفحص التقني',              'AutomotiveBusiness',295, TRUE),
+      ('autres_administrations',   'administration', 'Autres administrations',            'إدارات أخرى',                     'GovernmentOffice', 300, TRUE)
+    ON CONFLICT (id) DO NOTHING;
+    -- Phase 3, décision #1 (2026-09-30) : écoles, pharmacies, maisons de jeunes... (tout ce qui
+    -- n'est pas un lieu d'attente) restent en base sous 'autres_administrations' mais la catégorie
+    -- n'est plus publiée. UPDATE explicite (pas un seed ON CONFLICT DO NOTHING) : doit s'appliquer
+    -- même sur une base où la catégorie existait déjà avec is_published=TRUE (Phase 2 bis).
+    UPDATE directory_categories SET is_published = FALSE WHERE id = 'autres_administrations';
+    UPDATE directory_categories SET schema_org_type = 'MedicalLaboratory' WHERE id = 'laboratoires';
+
+    -- Quartiers rattachés AUTOMATIQUEMENT (décision #4, 2026-09-30) : OSM/Overpass (nœuds/voies
+    -- place=suburb|quarter|neighbourhood) + détection du nom dans l'adresse des fiches. Alimentée
+    -- par le pipeline, jamais saisie à la main. osm_id NULL pour une entrée créée uniquement par
+    -- détection d'adresse (aucun point OSM correspondant trouvé).
+    CREATE TABLE IF NOT EXISTS directory_neighborhoods (
+      id            TEXT PRIMARY KEY,
+      city          TEXT NOT NULL CHECK (city IN ('Rabat','Salé','Témara')),
+      name_fr       TEXT NOT NULL,
+      name_ar       TEXT,
+      osm_type      TEXT CHECK (osm_type IN ('node','way')),
+      osm_id        BIGINT,
+      centroid_lat  NUMERIC(9,6),
+      centroid_lng  NUMERIC(9,6),
+      -- 'mtnra_provided' (Phase 2 bis, décision #2 administrations) : quartier FR/AR fourni
+      -- directement par le fichier MTNRA/data.gov.ma, pas déduit d'Overpass — osm_type/osm_id
+      -- restent NULL dans ce cas, dédoublonné par (city, name_fr) via l'index partiel ci-dessous.
+      source        TEXT NOT NULL CHECK (source IN ('osm_overpass','address_detection','mtnra_provided')),
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (osm_type, osm_id)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_directory_neighborhoods_mtnra ON directory_neighborhoods (city, name_fr) WHERE source='mtnra_provided';
+
+    -- Coeur de l'annuaire. overture_id/foursquare_id nullable (une fiche peut venir d'une seule
+    -- source) mais au moins l'un des deux doit être renseigné — pas de fiche 100% manuelle dans ce
+    -- chantier. slug : calculé UNE SEULE FOIS à la création (décision #7), jamais réécrit par
+    -- l'upsert (voir scripts/directory-import/run-import.js, clause ON CONFLICT — slug absent du
+    -- SET). L'URL d'une fiche (/etablissements/{city}/{slug}) est donc stable même si le nom
+    -- source change ou si l'établissement change de quartier lors d'un réimport.
+    CREATE TABLE IF NOT EXISTS directory_establishments (
+      id                TEXT PRIMARY KEY,
+      overture_id       TEXT,
+      foursquare_id     TEXT,
+      -- mtnra_id : clé SYNTHÉTIQUE (hash nom+ville normalisés) — le fichier MTNRA/data.gov.ma ne
+      -- fournit aucun identifiant stable (Phase 2 bis, §administrations). osm_id : établissements
+      -- (essentiellement des banques) trouvés UNIQUEMENT via Overpass, sans correspondance
+      -- MTNRA/Overture/Foursquare — voir scripts/directory-import/merge-classify-admin.js.
+      mtnra_id          TEXT,
+      osm_id            TEXT,
+      -- narsa_id : clé SYNTHÉTIQUE (hash nom+ville, même limite que mtnra_id) — NARSA
+      -- (khadamatnarsa.ma) ne fournit pas d'id non plus. Catégorie visite_technique uniquement,
+      -- Phase 4 décision #6. Attribution dédiée "Source : NARSA" (licence non précisée par le
+      -- site — organisme public, donnée déjà publique, pas de mention de réutilisation trouvée).
+      narsa_id          TEXT,
+      -- Source qui a fourni le contenu affiché en priorité (nom/adresse) quand plusieurs sources
+      -- corroborent la même fiche — sert aussi à documenter l'attribution par licence (décision
+      -- BOSS Phase 2 bis #4) : 'overture'→CDLA-Permissive-2.0, 'foursquare'→Apache-2.0 (+NOTICE),
+      -- 'mtnra'→ODbL (data.gov.ma), 'osm_overpass'→ODbL (OpenStreetMap contributors), 'narsa'→voir
+      -- ci-dessus.
+      primary_source    TEXT NOT NULL DEFAULT 'overture' CONSTRAINT directory_establishments_primary_source_check CHECK (primary_source IN ('overture','foursquare','mtnra','osm_overpass','narsa')),
+      slug              TEXT NOT NULL UNIQUE,
+      name              TEXT NOT NULL,
+      category_id       TEXT NOT NULL REFERENCES directory_categories(id),
+      city              TEXT NOT NULL CHECK (city IN ('Rabat','Salé','Témara')),
+      neighborhood_id   TEXT REFERENCES directory_neighborhoods(id),
+      address           TEXT,
+      phone             TEXT,
+      website           TEXT,
+      lat               NUMERIC(9,6),
+      lng               NUMERIC(9,6),
+      confidence        NUMERIC(4,3),
+      status            TEXT NOT NULL DEFAULT 'published' CHECK (status IN ('published','pending_review','removed')),
+      probably_closed   BOOLEAN NOT NULL DEFAULT FALSE,
+      closed_signal_source TEXT,
+      -- Réservé pour une future mise en avant payante (décision #13 du plan initial) — AUCUNE
+      -- logique ni UI ne lit ces 3 colonnes dans ce chantier.
+      is_premium        BOOLEAN NOT NULL DEFAULT FALSE,
+      premium_until     TIMESTAMPTZ,
+      premium_tier      TEXT,
+      first_seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT directory_establishments_has_source_id CHECK (overture_id IS NOT NULL OR foursquare_id IS NOT NULL OR mtnra_id IS NOT NULL OR osm_id IS NOT NULL OR narsa_id IS NOT NULL)
+    );
+    -- Migration additive (Phase 4, décision #6) : sur une base où directory_establishments existait
+    -- déjà (CREATE TABLE IF NOT EXISTS ne touche pas une table existante), narsa_id et les 2
+    -- contraintes ci-dessus doivent être ajoutés explicitement. Sans effet sur une base neuve (la
+    -- colonne/les contraintes existent déjà depuis le CREATE TABLE juste au-dessus).
+    ALTER TABLE directory_establishments ADD COLUMN IF NOT EXISTS narsa_id TEXT;
+    ALTER TABLE directory_establishments DROP CONSTRAINT IF EXISTS directory_establishments_primary_source_check;
+    ALTER TABLE directory_establishments ADD CONSTRAINT directory_establishments_primary_source_check CHECK (primary_source IN ('overture','foursquare','mtnra','osm_overpass','narsa'));
+    ALTER TABLE directory_establishments DROP CONSTRAINT IF EXISTS directory_establishments_check;
+    ALTER TABLE directory_establishments DROP CONSTRAINT IF EXISTS directory_establishments_has_source_id;
+    ALTER TABLE directory_establishments ADD CONSTRAINT directory_establishments_has_source_id CHECK (overture_id IS NOT NULL OR foursquare_id IS NOT NULL OR mtnra_id IS NOT NULL OR osm_id IS NOT NULL OR narsa_id IS NOT NULL);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_directory_establishments_overture_id ON directory_establishments (overture_id) WHERE overture_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_directory_establishments_foursquare_id ON directory_establishments (foursquare_id) WHERE foursquare_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_directory_establishments_mtnra_id ON directory_establishments (mtnra_id) WHERE mtnra_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_directory_establishments_narsa_id ON directory_establishments (narsa_id) WHERE narsa_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_directory_establishments_osm_id ON directory_establishments (osm_id) WHERE osm_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_directory_establishments_city_category ON directory_establishments (city, category_id) WHERE status='published';
+    CREATE INDEX IF NOT EXISTS idx_directory_establishments_neighborhood ON directory_establishments (neighborhood_id) WHERE status='published';
+
+    -- Retraits définitifs (décision #11 du plan initial) — clé (source, source_id), INDÉPENDANTE de
+    -- directory_establishments : vérifiée par le pipeline AVANT tout upsert, donc survit même à une
+    -- suppression/recréation complète de la ligne establishments correspondante.
+    CREATE TABLE IF NOT EXISTS directory_exclusions (
+      source                    TEXT NOT NULL CHECK (source IN ('overture','foursquare','mtnra','osm_overpass','narsa')),
+      source_id                 TEXT NOT NULL,
+      reason                    TEXT,
+      establishment_name_at_exclusion TEXT,
+      excluded_by_report_id     TEXT,
+      excluded_by_admin_id      TEXT REFERENCES users(id),
+      excluded_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (source, source_id)
+    );
+
+    -- "Demander le retrait" / "Signaler une erreur" — endpoint PUBLIC, sans authentification
+    -- (décision #C, 2026-09-30) : un visiteur qui tombe sur une fiche depuis Google n'a le plus
+    -- souvent pas de compte Shoofly. Volontairement SÉPARÉE de support_tickets (qui exige un
+    -- user_id authentifié, voir routes/tickets.js) — voir PLAN_SEO_ANNUAIRE.md §G pour la
+    -- justification. ip_hash (SHA-256, jamais l'IP en clair) sert uniquement à repérer un pattern
+    -- d'abus en revue admin, pas de rate-limit applicatif (géré par express-rate-limit en mémoire).
+    CREATE TABLE IF NOT EXISTS directory_reports (
+      id               TEXT PRIMARY KEY,
+      establishment_id TEXT NOT NULL REFERENCES directory_establishments(id),
+      type             TEXT NOT NULL CHECK (type IN ('retrait','erreur')),
+      message          TEXT NOT NULL,
+      contact_email    TEXT,
+      ip_hash          TEXT,
+      status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','actioned','dismissed')),
+      reviewed_by      TEXT REFERENCES users(id),
+      reviewed_at      TIMESTAMPTZ,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_directory_reports_status ON directory_reports (status, created_at);
+
+    -- Historique des imports (traçabilité, décision #H du plan initial) — un run par exécution du
+    -- pipeline mensuel (backend/scripts/directory-import/run-import.js).
+    CREATE TABLE IF NOT EXISTS directory_import_runs (
+      id                          SERIAL PRIMARY KEY,
+      started_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      finished_at                 TIMESTAMPTZ,
+      overture_release            TEXT,
+      foursquare_release          TEXT,
+      records_seen_overture       INTEGER,
+      records_seen_foursquare     INTEGER,
+      records_merged_duplicates   INTEGER,
+      records_created             INTEGER,
+      records_updated             INTEGER,
+      records_marked_closed       INTEGER,
+      records_excluded_skipped    INTEGER,
+      neighborhoods_matched       INTEGER,
+      neighborhoods_total         INTEGER,
+      status                      TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','success','partial','failed')),
+      error_message                TEXT
+    );
   `);
 
   // ═══ I-9 (audit perf/concurrence 2026-09-19/21, §6.2) — recherche admin S-2, chantier Point 5 ═══
