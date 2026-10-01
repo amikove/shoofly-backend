@@ -19,13 +19,38 @@ function jstr(obj) { return JSON.stringify(obj, (k, v) => typeof v === 'bigint' 
 // d'environnement du service, pas un fichier (seo-study/ n'existe pas sur Render, hors du dépôt).
 // On privilégie donc process.env.HF_TOKEN ; le fichier local (dev uniquement) reste un repli si la
 // variable d'environnement est absente.
+//
+// Phase 5 quinquies (2026-10-01) — bug trouvé : 401 Unauthorized sur hf:// malgré HF_TOKEN défini
+// sur Render. execFileSync transmet bien process.env.HF_TOKEN tel quel aux process enfants (vérifié
+// empiriquement, 2 niveaux d'imbrication comme en prod) — ce n'est PAS un problème de propagation.
+// Le vrai bug : seul le chemin "lu depuis le fichier" nettoyait la valeur (trim + guillemets) ;
+// process.env.HF_TOKEN était utilisé BRUT. Une valeur collée dans le dashboard Render avec un espace
+// ou un retour à la ligne de trop (ou des guillemets autour) produisait un jeton invalide passé tel
+// quel à CREATE SECRET — explique le 401 sans erreur de lecture. Les deux sources sont maintenant
+// nettoyées de façon identique, et un log de diagnostic (JAMAIS la valeur elle-même) précède l'essai.
+function cleanToken(raw) {
+  return raw.trim().replace(/^['"]+|['"]+$/g, '').trim();
+}
+function logTokenDiagnostics(raw, source) {
+  if (!raw) { console.log(`[HF_TOKEN diagnostic] absent (source tentée : ${source})`); return; }
+  console.log(`[HF_TOKEN diagnostic] source=${source} longueur=${raw.length} prefixe_hf_=${raw.trim().replace(/^['"]+/, '').startsWith('hf_') ? 'oui' : 'non'} espaces_parasites=${raw !== raw.trim() ? 'oui' : 'non'} guillemets_parasites=${/^['"]|['"]$/.test(raw.trim()) ? 'oui' : 'non'}`);
+}
 function readHfToken() {
-  if (process.env.HF_TOKEN) return process.env.HF_TOKEN;
-  if (!HF_ENV_PATH || !fs.existsSync(HF_ENV_PATH)) return null;
-  const content = fs.readFileSync(HF_ENV_PATH, 'utf8');
-  const m = content.match(/^HF_TOKEN\s*=\s*(.+)$/m);
-  if (!m) return null;
-  return m[1].trim().replace(/^['"]|['"]$/g, '');
+  let raw, source;
+  if (process.env.HF_TOKEN) {
+    raw = process.env.HF_TOKEN;
+    source = "variable d'environnement";
+  } else if (HF_ENV_PATH && fs.existsSync(HF_ENV_PATH)) {
+    const content = fs.readFileSync(HF_ENV_PATH, 'utf8');
+    const m = content.match(/^HF_TOKEN\s*=\s*(.+)$/m);
+    raw = m ? m[1] : null;
+    source = `fichier ${HF_ENV_PATH}`;
+  } else {
+    raw = null;
+    source = 'aucune (ni variable, ni fichier)';
+  }
+  logTokenDiagnostics(raw, source);
+  return raw ? cleanToken(raw) : null;
 }
 
 (async () => {
