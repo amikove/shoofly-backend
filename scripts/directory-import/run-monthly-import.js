@@ -43,9 +43,40 @@
 const { execFileSync } = require('child_process');
 const path = require('path');
 
+// Phase 5 ter (2026-10-01), décision BOSS : observé en testant que fetch-overture.child.js /
+// fetch-overture-admin.child.js (DuckDB + S3) peuvent rester bloqués indéfiniment (CPU et mémoire
+// figés, aucune progression) de façon intermittente, sans jamais lever d'erreur ni se terminer —
+// rien n'empêchait cela de bloquer le Cron Job Render indéfiniment (jusqu'à sa limite dure de 12h).
+// Deux garde-fous :
+// - STEP_TIMEOUT_MS : chaque script enfant est tué (SIGTERM) s'il dépasse ce délai. L'échec est
+//   ensuite traité comme n'importe quel autre échec d'étape par les try/catch existants (le domaine
+//   est abandonné pour CE run, les autres domaines continuent normalement, aucune fiche supprimée —
+//   chaque run-import-*.js n'écrit qu'en upsert).
+// - TASK_TIMEOUT_MS : budget global pour toute la tâche. Vérifié avant CHAQUE étape (y compris la
+//   toute première d'un domaine) : au-delà, les étapes/domaines pas encore commencés sont marqués
+//   en échec sans être tentés, pour éviter qu'une série de blocages fasse dériver le job sur
+//   plusieurs heures.
+const STEP_TIMEOUT_MS = 10 * 60 * 1000; // 10 min — large marge au-dessus du cas sain observé (Overture ~1-2 min quand ça fonctionne)
+const TASK_TIMEOUT_MS = 60 * 60 * 1000; // 60 min pour l'ensemble du job (la limite dure Render est 12h)
+const taskStart = Date.now();
+
 function run(script, ...args) {
+  const elapsed = Date.now() - taskStart;
+  if (elapsed > TASK_TIMEOUT_MS) {
+    throw new Error(`budget global de la tâche dépassé (${Math.round(TASK_TIMEOUT_MS / 60000)} min écoulées) — étape ${script} non tentée`);
+  }
   console.log(`\n=== ${script} ${args.join(' ')} ===`);
-  execFileSync(process.execPath, [path.join(__dirname, script), ...args], { stdio: 'inherit', cwd: __dirname });
+  try {
+    // killSignal: SIGKILL explicite (pas le SIGTERM par défaut) — sur Linux (Render), un process
+    // bloqué dans du code natif (DuckDB) pourrait ignorer/retarder un SIGTERM ; on ne cherche pas
+    // un arrêt propre d'un process qu'on a déjà décidé d'abandonner, juste une mort certaine.
+    execFileSync(process.execPath, [path.join(__dirname, script), ...args], { stdio: 'inherit', cwd: __dirname, timeout: STEP_TIMEOUT_MS, killSignal: 'SIGKILL' });
+  } catch (e) {
+    if (e.signal) {
+      throw new Error(`${script} tué (${e.signal}) après dépassement du délai de ${Math.round(STEP_TIMEOUT_MS / 60000)} min — probable blocage réseau/DuckDB`);
+    }
+    throw e;
+  }
 }
 
 async function callDeployHook() {
