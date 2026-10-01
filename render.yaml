@@ -25,6 +25,11 @@ services:
   - type: cron
     name: shoofly-directory-cron
     env: node
+    # Phase 5 ter (2026-10-01) — palier recommandé après mesure réelle du pipeline (pic mémoire
+    # observé ~390 Mo, dominé par DuckDB httpfs+spatial pendant l'étape Overture) : marge large
+    # (~5x) pour un coût négligeable sur un job qui tourne ~20-30 min une fois par mois. Valeur
+    # Blueprint vérifiée dans la doc officielle Render (docs/blueprint-spec) : "1c-2g" = 1 CPU / 2 Go.
+    plan: 1c-2g
     schedule: "0 3 1 * *"
     buildCommand: cd scripts/directory-import && npm install
     startCommand: node scripts/directory-import/run-monthly-import.js
