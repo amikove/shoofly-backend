@@ -1,14 +1,20 @@
 #!/usr/bin/env node
 // Orchestrateur du pipeline mensuel complet (Phase 4, décision #3) — destiné au service Cron Job
 // Render DÉDIÉ (render.yaml, service "shoofly-directory-cron", séparé du service web "shoofly-api").
-// Santé + administrations + NARSA CCT, puis appel du Deploy Hook Vercel pour republier les pages.
+// Santé + administrations, puis appel du Deploy Hook Vercel pour republier les pages.
 //
-// Résilience (décision #6, étendue ici aux 3 sources) : chaque domaine (santé / administrations /
-// NARSA) est isolé dans son propre try/catch — l'échec d'UN domaine (ex. NARSA change de structure
-// HTML, ou data.gov.ma est indisponible) n'empêche jamais les autres domaines de s'importer, et
-// n'efface JAMAIS les fiches déjà en base de ce domaine (chaque run-import-*.js n'écrit qu'en
-// upsert, jamais de DELETE — voir leurs commentaires respectifs). Le Deploy Hook est appelé à la
-// fin dans tous les cas où AU MOINS un domaine a réussi, pour republier ce qui a pu être mis à jour.
+// Phase 5 quinquies (2026-10-01), décision BOSS : NARSA RETIRÉ de cet orchestrateur. Confirmé via
+// les logs du run Render n°2 : ConnectTimeout systématique depuis l'IP Render (Frankfurt) vers
+// khadamatnarsa.ma — blocage des IP étrangères côté NARSA, pas un bug de ce pipeline. NARSA
+// s'importe désormais via `npm run import:narsa` (run-narsa-local.js), lancé MANUELLEMENT depuis un
+// poste au Maroc (voir ce fichier pour le détail — mêmes garanties : upsert uniquement, jamais de
+// suppression de fiche en cas d'échec).
+//
+// Résilience (décision #6) : chaque domaine (santé / administrations) est isolé dans son propre
+// try/catch — l'échec d'UN domaine n'empêche jamais l'autre de s'importer, et n'efface JAMAIS les
+// fiches déjà en base de ce domaine (chaque run-import-*.js n'écrit qu'en upsert, jamais de DELETE —
+// voir leurs commentaires respectifs). Le Deploy Hook est appelé à la fin dans tous les cas où AU
+// MOINS un domaine a réussi, pour republier ce qui a pu être mis à jour.
 //
 // Ne PAS exécuter automatiquement dans ce chantier (Phase 4 : "aucun déploiement"). Prévu pour être
 // lancé par le Cron Job Render une fois le service créé par BOSS.
@@ -87,7 +93,7 @@ async function callDeployHook() {
 }
 
 async function main() {
-  const results = { sante: 'non tenté', administrations: 'non tenté', narsa: 'non tenté' };
+  const results = { sante: 'non tenté', administrations: 'non tenté' };
 
   try {
     run('fetch-boundaries-nominatim.js'); // limites de ville (Nominatim) — utilisées par les étapes suivantes
@@ -108,16 +114,6 @@ async function main() {
     run('run-import-admin.js');
     results.administrations = 'OK';
   } catch (e) { results.administrations = 'ÉCHEC : ' + e.message; console.error('[administrations] échec, domaine ignoré pour ce run :', e.message); }
-
-  try {
-    // Phase 5 bis (2026-09-30), décision BOSS #2 : NARSA ne dépend plus d'aucune sortie du domaine
-    // santé — assign-neighborhoods-narsa.js interroge directement le gazetteer déjà en base
-    // (table directory_neighborhoods). Un échec santé ne bloque donc plus jamais NARSA.
-    run('fetch-narsa-cct.js');
-    run('assign-neighborhoods-narsa.js');
-    run('run-import-narsa.js');
-    results.narsa = 'OK';
-  } catch (e) { results.narsa = 'ÉCHEC : ' + e.message; console.error('[NARSA] échec, domaine ignoré pour ce run :', e.message); }
 
   console.log('\n=== RÉSUMÉ DU RUN MENSUEL ===');
   console.log(JSON.stringify(results, null, 2));

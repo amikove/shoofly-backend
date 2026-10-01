@@ -4,7 +4,8 @@
   "private": true,
   "description": "Pipeline d'import annuaire SEO (Overture + Foursquare) — dépendances ISOLÉES du service web (décision BOSS #8 : service Cron Job Render dédié, jamais dans le npm install du service API). Voir RAPPORT_PHASE2_DONNEES.md.",
   "scripts": {
-    "import": "node run-import.js"
+    "import": "node run-import.js",
+    "import:narsa": "node run-narsa-local.js"
   },
   "dependencies": {
     "duckdb": "^1.1.3",
