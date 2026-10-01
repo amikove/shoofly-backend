@@ -15,7 +15,13 @@ const OUT_FILE = process.argv[2];
 const HF_ENV_PATH = process.argv[3];
 function jstr(obj) { return JSON.stringify(obj, (k, v) => typeof v === 'bigint' ? Number(v) : v, 2); }
 
+// Phase 5 quater (2026-10-01) — en production (Cron Render), HF_TOKEN est une variable
+// d'environnement du service, pas un fichier (seo-study/ n'existe pas sur Render, hors du dépôt).
+// On privilégie donc process.env.HF_TOKEN ; le fichier local (dev uniquement) reste un repli si la
+// variable d'environnement est absente.
 function readHfToken() {
+  if (process.env.HF_TOKEN) return process.env.HF_TOKEN;
+  if (!HF_ENV_PATH || !fs.existsSync(HF_ENV_PATH)) return null;
   const content = fs.readFileSync(HF_ENV_PATH, 'utf8');
   const m = content.match(/^HF_TOKEN\s*=\s*(.+)$/m);
   if (!m) return null;

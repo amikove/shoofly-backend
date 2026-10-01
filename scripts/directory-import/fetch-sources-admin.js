@@ -26,8 +26,10 @@ const HF_ENV_PATH = path.join(__dirname, '..', '..', '..', 'seo-study', '.env');
 
 function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
-  if (!fs.existsSync(HF_ENV_PATH)) {
-    console.error('ARRÊT : seo-study/.env introuvable — HF_TOKEN requis (décision BOSS #9).');
+  // Phase 5 quater (2026-10-01) : seo-study/ n'existe pas sur Render (hors du dépôt) — HF_TOKEN y
+  // est fourni en variable d'environnement du service, jamais via ce fichier.
+  if (!process.env.HF_TOKEN && !fs.existsSync(HF_ENV_PATH)) {
+    console.error('ARRÊT : HF_TOKEN absent (ni variable d\'environnement, ni seo-study/.env local) — requis pour Foursquare.');
     process.exit(2);
   }
 

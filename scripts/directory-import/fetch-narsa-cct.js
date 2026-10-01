@@ -63,9 +63,41 @@ function parseCards(html) {
   return cards;
 }
 
+// Phase 5 quater (2026-10-01) — un échec réseau depuis Render (Frankfurt) remontait juste comme
+// "fetch failed" (message générique d'undici/Node), sans jamais exposer error.cause où vit le vrai
+// diagnostic (code TLS, DNS, timeout...). Investigation faite depuis cet environnement avant
+// d'écrire ce correctif : chaîne de certificats de khadamatnarsa.ma vérifiée complète et valide
+// (openssl s_client, les 2 niveaux intermédiaires sont bien envoyés par le serveur) ; requête HTTP
+// réelle réussie (200, ~1s, cookies TS... caractéristiques d'un WAF F5 BIG-IP ASM). Hypothèse la
+// plus probable : blocage par IP/géolocalisation côté WAF NARSA (IP de Rabat/Maroc acceptée, IP
+// datacenter européenne Render refusée) — PAS un problème de certificat. Pas de contournement
+// appliqué (décision BOSS) : ce log détaillé permettra de confirmer avec les vraies données du
+// prochain run Render si l'échec persiste, et quelle en est la nature exacte.
+function describeNetworkError(e) {
+  const lines = [];
+  let cur = e, depth = 0;
+  while (cur && depth < 6) {
+    const bits = [`${cur.name || 'Error'}: ${cur.message}`];
+    if (cur.code) bits.push(`code=${cur.code}`);
+    if (cur.errno) bits.push(`errno=${cur.errno}`);
+    if (cur.syscall) bits.push(`syscall=${cur.syscall}`);
+    if (cur.address) bits.push(`address=${cur.address}`);
+    if (cur.port) bits.push(`port=${cur.port}`);
+    lines.push(`  [profondeur ${depth}] ${bits.join(', ')}`);
+    cur = cur.cause;
+    depth++;
+  }
+  return lines.join('\n');
+}
+
 async function fetchPrefecture(pref) {
   const url = `https://khadamatnarsa.ma/fr/carte-interactive?pfpv=${pref.value}`;
-  const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
+  let res;
+  try {
+    res = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
+  } catch (e) {
+    throw new Error(`NARSA ${pref.city} (pfpv=${pref.value}) : échec réseau (voir détail ci-dessous — TLS/DNS/timeout/blocage possible)\n${describeNetworkError(e)}`);
+  }
   if (!res.ok) throw new Error(`NARSA ${pref.city} (pfpv=${pref.value}) : HTTP ${res.status}`);
   const html = await res.text();
   const cards = parseCards(html);
