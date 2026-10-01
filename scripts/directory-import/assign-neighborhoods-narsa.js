@@ -1,9 +1,15 @@
 // NARSA CCT — quartier par plus-proche-voisin (même méthode que la santé, assign-neighborhoods.js
-// §nearest_point) : NARSA donne des coordonnées GPS réelles mais pas de champ quartier texte
-// (contrairement à MTNRA) — pas de détection d'adresse possible non plus (l'adresse NARSA est en
-// une seule ligne libre, souvent sans nom de quartier explicite).
+// §nearest_point), à partir du gazetteer DÉJÀ EN BASE (table directory_neighborhoods), PAS d'un
+// fichier produit par le domaine santé (Phase 5 bis, 2026-09-30, décision BOSS #2) : un échec du
+// domaine santé pendant CE run ne doit plus jamais empêcher NARSA de rattacher ses quartiers — le
+// gazetteer existant (peuplé par les runs précédents, santé ou administrations) suffit très
+// largement, les quartiers évoluent rarement d'un mois à l'autre. NARSA donne des coordonnées GPS
+// réelles mais pas de champ quartier texte (contrairement à MTNRA) — pas de détection d'adresse
+// possible non plus (l'adresse NARSA est en une seule ligne libre, souvent sans nom de quartier
+// explicite).
 const fs = require('fs');
 const path = require('path');
+const { Client } = require('pg');
 
 const OUT_DIR = path.join(__dirname, 'out');
 const NEAREST_POINT_RADIUS_M = 1200;
@@ -15,9 +21,22 @@ function haversineMeters(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-function main() {
+async function loadNeighborhoodsFromDb() {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    const { rows } = await client.query(
+      "SELECT id, city, centroid_lat, centroid_lng FROM directory_neighborhoods WHERE centroid_lat IS NOT NULL AND centroid_lng IS NOT NULL"
+    );
+    return rows.map((r) => ({ id: r.id, city: r.city, centroid_lat: Number(r.centroid_lat), centroid_lng: Number(r.centroid_lng) }));
+  } finally {
+    await client.end();
+  }
+}
+
+async function main() {
   const narsa = JSON.parse(fs.readFileSync(path.join(OUT_DIR, 'narsa_cct.json'), 'utf8'));
-  const neighborhoods = JSON.parse(fs.readFileSync(path.join(OUT_DIR, 'neighborhoods.json'), 'utf8'));
+  const neighborhoods = await loadNeighborhoodsFromDb();
   const byCity = {};
   for (const nb of neighborhoods) (byCity[nb.city] ||= []).push(nb);
 
@@ -34,8 +53,11 @@ function main() {
   }
 
   fs.writeFileSync(path.join(OUT_DIR, 'narsa_cct.json'), JSON.stringify(narsa, null, 2));
+  console.log('Quartiers en base disponibles :', neighborhoods.length);
   console.log('NARSA CCT rattachées à un quartier :', attached, '/', narsa.length);
 }
 
-if (require.main === module) main();
+if (require.main === module) {
+  main().catch((e) => { console.error('ERREUR assign-neighborhoods-narsa :', e.message); process.exit(1); });
+}
 module.exports = { main };

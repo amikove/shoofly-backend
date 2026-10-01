@@ -15,9 +15,30 @@
 //
 // Phase 5 (2026-09-30) : MTNRA (fetch-mtnra.js) et les limites de ville (fetch-boundaries-
 // nominatim.js) sont désormais téléchargés À L'EXÉCUTION (data.gov.ma / Nominatim), jamais
-// committés. fetch-boundaries-nominatim.js tourne en premier dans le bloc "santé" : un échec
-// Nominatim fait donc échouer tout le domaine santé pour ce run (seul domaine qui en dépend
-// aujourd'hui — voir son commentaire), mais jamais les administrations ni NARSA.
+// committés.
+//
+// Phase 5 bis (2026-09-30) : les 3 domaines sont maintenant RÉELLEMENT indépendants entre eux.
+// - fetch-boundaries-nominatim.js tourne séparément dans le bloc santé ET dans le bloc
+//   administrations (chacun sa propre requête Nominatim, 1 seule requête à chaque fois pour les
+//   3 villes) : un échec Nominatim pendant le bloc santé n'empêche plus les administrations de
+//   récupérer les leurs, et inversement.
+// - fetch-sources-admin.js (nouveau) câble les étapes Overture/Foursquare/OSM administrations qui
+//   manquaient à l'orchestrateur (merge-classify-admin.js en a besoin, générées manuellement lors
+//   de la Phase 2 bis jusqu'ici — jamais automatisées).
+// - assign-neighborhoods-narsa.js lit le gazetteer de quartiers directement EN BASE (table
+//   directory_neighborhoods) au lieu d'un fichier produit par le domaine santé : NARSA ne dépend
+//   plus d'aucune autre étape de ce run.
+// - fetch-neighborhoods-osm.js (quartiers OSM) manquait aussi au bloc santé : assign-neighborhoods.js
+//   attendait out/osm_neighborhoods.json sans qu'aucune étape ne le génère — trouvé en testant
+//   l'exécution autonome complète (le domaine santé échouait systématiquement sur un checkout
+//   frais). Ajouté ici.
+//
+// Point ouvert (PAS corrigé, hors périmètre de cette demande) : assign-neighborhoods-admin.js lit
+// out/neighborhoods.json, produit par assign-neighborhoods.js (domaine santé) — les
+// administrations dépendent donc encore du succès du domaine santé PENDANT LE MÊME RUN pour
+// rattacher leurs propres quartiers (fonctionne ici car santé s'exécute avant administrations,
+// mais un échec santé priverait administrations de cette donnée). Même nature de couplage que ce
+// qui vient d'être corrigé pour NARSA — à traiter séparément si BOSS le souhaite.
 
 const { execFileSync } = require('child_process');
 const path = require('path');
@@ -40,6 +61,7 @@ async function main() {
   try {
     run('fetch-boundaries-nominatim.js'); // limites de ville (Nominatim) — utilisées par les étapes suivantes
     run('fetch-sources.js');
+    run('fetch-neighborhoods-osm.js'); // gazetteer quartiers OSM — manquait à l'orchestrateur (trouvé en testant, Phase 5 bis)
     run('merge-classify.js');
     run('assign-neighborhoods.js');
     run('run-import.js');
@@ -47,7 +69,9 @@ async function main() {
   } catch (e) { results.sante = 'ÉCHEC : ' + e.message; console.error('[santé] échec, domaine ignoré pour ce run :', e.message); }
 
   try {
+    run('fetch-boundaries-nominatim.js'); // indépendant du bloc santé (Phase 5 bis) : chaque domaine fetch les siennes
     run('fetch-mtnra.js');
+    run('fetch-sources-admin.js'); // Overture + Foursquare + OSM admin (Phase 5 bis, décision BOSS #1 : n'était câblé nulle part)
     run('merge-classify-admin.js');
     run('assign-neighborhoods-admin.js');
     run('run-import-admin.js');
@@ -55,6 +79,9 @@ async function main() {
   } catch (e) { results.administrations = 'ÉCHEC : ' + e.message; console.error('[administrations] échec, domaine ignoré pour ce run :', e.message); }
 
   try {
+    // Phase 5 bis (2026-09-30), décision BOSS #2 : NARSA ne dépend plus d'aucune sortie du domaine
+    // santé — assign-neighborhoods-narsa.js interroge directement le gazetteer déjà en base
+    // (table directory_neighborhoods). Un échec santé ne bloque donc plus jamais NARSA.
     run('fetch-narsa-cct.js');
     run('assign-neighborhoods-narsa.js');
     run('run-import-narsa.js');
