@@ -83,6 +83,7 @@ const ticketRoutes = require('./routes/tickets');
 const paymentRoutes = require('./routes/payments');
 const blockAppealRoutes = require('./routes/blockAppeals');
 const pushRoutes = require('./routes/push');
+const directoryRoutes = require('./routes/directory'); // Chantier SEO annuaire, Phase 2 (2026-09-30)
 const { checkPushHealth } = require('./services/push');
 
 // ── CORS — liste blanche unique, source de vérité partagée par Express et Socket.IO ──
@@ -289,6 +290,7 @@ app.use('/api/tickets', ticketRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/block-appeals', blockAppealRoutes);
 app.use('/api/push', pushRoutes);
+app.use('/api/directory', directoryRoutes); // Chantier SEO annuaire, Phase 2 (2026-09-30)
 
 // Hash court du commit déployé (variable fournie par Render) — permet de vérifier quelle
 // version tourne en production. « local » hors Render.

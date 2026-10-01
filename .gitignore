@@ -4,3 +4,13 @@ node_modules/
 uploads/
 *.log
 _audit/
+
+# Chantier SEO annuaire (Phase 5, 2026-09-30) — jamais commités, dépôt PUBLIC :
+# - out/ : sorties intermédiaires du pipeline (fetch/merge), contiennent de vraies données
+#   d'établissement à chaque exécution locale.
+# - data/ : fichiers sources volumineux/tiers (xlsx MTNRA, polygones de limites de ville) —
+#   fetch-mtnra.js et assign-neighborhoods*.js en dépendent au runtime. ATTENTION : les exclure
+#   ici signifie qu'ils ne seront PAS présents sur le service Cron Render après un déploiement
+#   Git — voir le récapitulatif Phase 5 pour la décision à prendre avant mise en route du cron.
+scripts/directory-import/out/
+scripts/directory-import/data/
