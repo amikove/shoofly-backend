@@ -28,9 +28,21 @@ const REQUIRED_KEYS = ['DATABASE_URL'];
 const OPTIONAL_KEYS = ['VERCEL_DEPLOY_HOOK_URL'];
 
 function cleanValue(raw) {
-  return raw.trim().replace(/^['"]+|['"]+$/g, '').trim();
+  const trimmed = raw.trim();
+  // Guillemets retirés seulement s'ils encadrent toute la valeur (pas un '#'/'$'/'@' au milieu).
+  if (trimmed.length >= 2) {
+    const first = trimmed[0];
+    const last = trimmed[trimmed.length - 1];
+    if ((first === '"' || first === "'") && first === last) {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
 }
 
+// Parseur robuste : BOM, CRLF/LF/CR, lignes vides, commentaires (#...), valeur prise
+// telle quelle après le premier "=" (jamais via regex, pour ne pas trébucher sur
+// des caractères spéciaux comme # $ @ % * dans un mot de passe).
 function loadLocalEnv() {
   if (!fs.existsSync(LOCAL_ENV_PATH)) {
     console.error(`ARRÊT : fichier introuvable : ${LOCAL_ENV_PATH}`);
@@ -38,15 +50,22 @@ function loadLocalEnv() {
     console.error('Voir RAPPORT_PHASE5QUINQUIES.md pour où trouver chaque valeur.');
     process.exit(2);
   }
-  const content = fs.readFileSync(LOCAL_ENV_PATH, 'utf8');
+  let content = fs.readFileSync(LOCAL_ENV_PATH, 'utf8');
+  if (content.charCodeAt(0) === 0xfeff) content = content.slice(1); // BOM
   const found = new Set();
-  for (const line of content.split('\n')) {
-    const m = line.match(/^([A-Z_]+)\s*=\s*(.+)$/);
-    if (!m) continue;
-    const [, key, rawValue] = m;
-    process.env[key] = cleanValue(rawValue); // écrase volontairement une variable déjà présente
+  for (const rawLine of content.split(/\r\n|\r|\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    const value = cleanValue(line.slice(eq + 1));
+    process.env[key] = value; // écrase volontairement une variable déjà présente
     found.add(key);
   }
+  console.log(`(diagnostic) clés lues dans ${path.basename(LOCAL_ENV_PATH)} : ` +
+    [...found].map((k) => `${k}(longueur=${process.env[k].length})`).join(', ') || '(aucune)');
   const missing = REQUIRED_KEYS.filter((k) => !found.has(k));
   if (missing.length > 0) {
     console.error(`ARRÊT : variable(s) manquante(s) dans ${LOCAL_ENV_PATH} : ${missing.join(', ')}`);
