@@ -40,6 +40,29 @@ function cleanValue(raw) {
   return trimmed;
 }
 
+// Certaines box grand public (ex. poste de BOSS) renvoient en priorité des adresses IPv6
+// NAT64 pour les hôtes qui n'ont qu'un AAAA synthétique, ce qui fait échouer la connexion
+// Postgres/HTTPS vers des hôtes qui ne répondent qu'en IPv4. On force IPv4 d'abord :
+// - pour CE processus (fetch du Deploy Hook) via l'API dns, appelée au runtime ;
+// - pour les scripts enfants (fetch-narsa-cct.js, etc., lancés via execFileSync, qui
+//   démarrent un nouveau process Node) via NODE_OPTIONS, qu'ils héritent de process.env.
+function ensureIpv4First() {
+  require('dns').setDefaultResultOrder('ipv4first');
+  const existing = process.env.NODE_OPTIONS || '';
+  if (!/--dns-result-order/.test(existing)) {
+    process.env.NODE_OPTIONS = `${existing} --dns-result-order=ipv4first`.trim();
+  }
+}
+
+// Postgres exige une vérification TLS complète du certificat serveur en production ;
+// ajouté automatiquement si l'URL n'a pas déjà son propre sslmode (ne jamais écraser un
+// choix explicite du fichier .env).
+function ensureSslModeVerifyFull(databaseUrl) {
+  if (/[?&]sslmode=/i.test(databaseUrl)) return databaseUrl;
+  const sep = databaseUrl.includes('?') ? '&' : '?';
+  return `${databaseUrl}${sep}sslmode=verify-full`;
+}
+
 // Parseur robuste : BOM, CRLF/LF/CR, lignes vides, commentaires (#...), valeur prise
 // telle quelle après le premier "=" (jamais via regex, pour ne pas trébucher sur
 // des caractères spéciaux comme # $ @ % * dans un mot de passe).
@@ -60,7 +83,8 @@ function loadLocalEnv() {
     if (eq === -1) continue;
     const key = line.slice(0, eq).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    const value = cleanValue(line.slice(eq + 1));
+    let value = cleanValue(line.slice(eq + 1));
+    if (key === 'DATABASE_URL') value = ensureSslModeVerifyFull(value);
     process.env[key] = value; // écrase volontairement une variable déjà présente
     found.add(key);
   }
@@ -90,6 +114,7 @@ async function callDeployHook() {
 
 async function main() {
   loadLocalEnv();
+  ensureIpv4First();
 
   console.log('\n############################################################');
   console.log('#  ATTENTION : ce script écrit dans la base de PRODUCTION.  #');
