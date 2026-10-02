@@ -23,6 +23,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { Client } = require('pg');
 const { normalizeCore } = require('./keyword-rules');
 
 const OUT_DIR = path.join(__dirname, 'out');
@@ -30,6 +31,35 @@ const DATA_DIR = path.join(__dirname, 'data');
 const ADDRESS_VALIDATION_RADIUS_M = 3000;
 const NEAREST_POINT_RADIUS_M = 1200;
 const DEDUP_RADIUS_M = 500;
+const UNAVAILABLE_FLAG = path.join(OUT_DIR, 'osm_neighborhoods_unavailable.flag');
+
+// Phase 5 sexies (2026-10-02), décision BOSS : si fetch-neighborhoods-osm.js a dû dégrader (Overpass
+// indisponible après tous ses miroirs), on retombe sur le gazetteer DÉJÀ EN BASE (table
+// directory_neighborhoods) plutôt que d'échouer tout le domaine santé. Même technique que
+// assign-neighborhoods-narsa.js. Les "aliases" ne peuvent être reconstruits qu'à partir de
+// name_fr/name_ar (la richesse multi-variantes des points OSM bruts n'est pas stockée en base) —
+// dégradation acceptée, toujours mieux qu'aucun rattachement du tout. Si la base est elle-même vide
+// (premier run en prod, jamais d'import santé réussi avant) : gazetteer vide, chaque fiche reste
+// simplement sans quartier (assignNeighborhood gère déjà ce cas — candidates.length === 0).
+async function loadGazetteerFromDb() {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    const { rows } = await client.query(
+      `SELECT id, city, name_fr, name_ar, osm_type, osm_id, centroid_lat, centroid_lng, source
+       FROM directory_neighborhoods WHERE centroid_lat IS NOT NULL AND centroid_lng IS NOT NULL`
+    );
+    return rows.map((r) => ({
+      id: r.id, city: r.city, name_fr: r.name_fr, name_ar: r.name_ar,
+      osm_type: r.osm_type, osm_id: r.osm_id,
+      centroid_lat: Number(r.centroid_lat), centroid_lng: Number(r.centroid_lng),
+      source: r.source,
+      aliases: [r.name_fr, r.name_ar].filter(Boolean),
+    }));
+  } finally {
+    await client.end();
+  }
+}
 
 function haversineMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
@@ -140,12 +170,19 @@ function assignNeighborhood(establishment, neighborhoodsByCity) {
   return { neighborhood_id: null, method: 'none' };
 }
 
-function main() {
+async function main() {
   const merged = JSON.parse(fs.readFileSync(path.join(OUT_DIR, 'merged.json'), 'utf8'));
-  const osmRaw = JSON.parse(fs.readFileSync(path.join(OUT_DIR, 'osm_neighborhoods.json'), 'utf8'));
-  const polygons = loadCityPolygons();
+  const osmUnavailable = fs.existsSync(UNAVAILABLE_FLAG);
 
-  const gazetteer = buildNeighborhoodGazetteer(osmRaw, polygons);
+  let gazetteer;
+  if (osmUnavailable) {
+    console.warn('Overpass indisponible ce run (voir fetch-neighborhoods-osm.js) — gazetteer de quartiers chargé depuis la base (directory_neighborhoods) au lieu d\'OSM frais.');
+    gazetteer = await loadGazetteerFromDb();
+  } else {
+    const osmRaw = JSON.parse(fs.readFileSync(path.join(OUT_DIR, 'osm_neighborhoods.json'), 'utf8'));
+    const polygons = loadCityPolygons();
+    gazetteer = buildNeighborhoodGazetteer(osmRaw, polygons);
+  }
   const byCity = {};
   for (const nb of gazetteer) (byCity[nb.city] = byCity[nb.city] || []).push(nb);
 
@@ -161,12 +198,12 @@ function main() {
   fs.writeFileSync(path.join(OUT_DIR, 'merged.json'), JSON.stringify(merged, null, 2));
 
   const attached = merged.filter((r) => r.neighborhood_id).length;
-  console.log('Gazetteer quartiers (après dédoublonnage OSM) :', gazetteer.length, 'sur', osmRaw.length, 'points OSM bruts');
+  console.log('Gazetteer quartiers :', gazetteer.length, osmUnavailable ? '(chargé depuis la base, OSM indisponible ce run)' : '(après dédoublonnage OSM frais)');
   console.log('Par ville :', JSON.stringify(Object.fromEntries(Object.entries(byCity).map(([c, l]) => [c, l.length]))));
-  console.log('Fiches rattachées à un quartier :', attached, '/', merged.length, '(' + ((100 * attached) / merged.length).toFixed(1) + '%)');
+  console.log('Fiches rattachées à un quartier :', attached, '/', merged.length, merged.length ? '(' + ((100 * attached) / merged.length).toFixed(1) + '%)' : '');
   console.log('Méthode :', JSON.stringify(merged.reduce((a, r) => { a[r.neighborhood_method] = (a[r.neighborhood_method] || 0) + 1; return a; }, {})));
   console.log('Divergences adresse/géométrie résolues en faveur du texte adresse :', divergentCount);
 }
 
-if (require.main === module) main();
+if (require.main === module) main().catch((e) => { console.error('ERREUR:', e.message); process.exit(1); });
 module.exports = { main, haversineMeters, assignNeighborhood, buildNeighborhoodGazetteer };

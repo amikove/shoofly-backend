@@ -10,6 +10,7 @@ const { Client } = require('pg');
 const { normalizeCore } = require('./keyword-rules');
 
 const OUT_DIR = path.join(__dirname, 'out');
+const OSM_UNAVAILABLE_FLAG = path.join(OUT_DIR, 'osm_admin_unavailable.flag');
 
 function slugify(s) {
   return normalizeCore(s).replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'etablissement';
@@ -115,11 +116,22 @@ async function main() {
     // pas par run-import.js (santé Overture/Foursquare) — doit être inclus ici, sinon ni l'un ni
     // l'autre run ne détecterait jamais sa disparition d'une source. Bug de portée du même type que
     // celui déjà corrigé sur run-import.js (voir son commentaire) — trouvé en écrivant ce correctif.
+    //
+    // Phase 5 sexies (2026-10-02), décision BOSS : si Overpass était indisponible ce run (flag posé
+    // par fetch-osm-admin.js), les banques dont primary_source='osm_overpass' (trouvées UNIQUEMENT
+    // par OSM, jamais côté MTNRA ni Foursquare — merge-classify-admin.js §3) sont ABSENTES de
+    // merged_admin.json ce run, pas parce qu'elles ont disparu, mais parce que leur SEULE source est
+    // indisponible. Sans cette exclusion, elles seraient marquées à tort 'pending_review' à chaque
+    // panne Overpass. Une source indisponible ce mois-ci ne doit jamais faire passer ses propres
+    // fiches en revue.
+    const osmUnavailable = fs.existsSync(OSM_UNAVAILABLE_FLAG);
+    if (osmUnavailable) console.log("Overpass indisponible ce run — fiches primary_source='osm_overpass' exclues de la détection \"disparue\".");
     const { rows: disappearedRows } = await client.query(
       `UPDATE directory_establishments e SET status='pending_review', updated_at=NOW()
        FROM directory_categories c
        WHERE e.category_id = c.id AND (c.domain = 'administration' OR c.id = 'centres_sante_publics')
          AND e.last_seen_at < $1 AND e.status='published'
+         ${osmUnavailable ? "AND e.primary_source <> 'osm_overpass'" : ''}
        RETURNING e.id`,
       [runStart]
     );

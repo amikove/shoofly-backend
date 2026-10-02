@@ -16,6 +16,14 @@
 // voir leurs commentaires respectifs). Le Deploy Hook est appelé à la fin dans tous les cas où AU
 // MOINS un domaine a réussi, pour republier ce qui a pu être mis à jour.
 //
+// Phase 5 sexies (2026-10-02), décision BOSS : run Render n°3, Overpass ("fetch failed") faisait
+// échouer tout le domaine à chaque panne (une seule requête, un seul miroir, aucune retentative).
+// fetch-neighborhoods-osm.js et fetch-osm-admin.js utilisent désormais overpass-client.js (retries,
+// miroirs officiels, diagnostic détaillé) et DÉGRADENT PROPREMENT (exit 0, jamais une exception) si
+// Overpass reste indisponible après tous les miroirs — voir ces 2 fichiers, assign-neighborhoods.js
+// (repli sur le gazetteer déjà en base) et run-import-admin.js (exclusion des fiches
+// primary_source='osm_overpass' de la détection "disparue" le temps qu'Overpass est indisponible).
+//
 // Ne PAS exécuter automatiquement dans ce chantier (Phase 4 : "aucun déploiement"). Prévu pour être
 // lancé par le Cron Job Render une fois le service créé par BOSS.
 //

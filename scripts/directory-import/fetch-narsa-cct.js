@@ -14,6 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { describeNetworkError } = require('./network-diagnostics');
 
 const OUT_FILE = path.join(__dirname, 'out', 'narsa_cct.json');
 // Adresse de contact reprise de VAPID_SUBJECT (src/services/push.js) — déjà utilisée ailleurs dans
@@ -70,25 +71,10 @@ function parseCards(html) {
 // (openssl s_client, les 2 niveaux intermédiaires sont bien envoyés par le serveur) ; requête HTTP
 // réelle réussie (200, ~1s, cookies TS... caractéristiques d'un WAF F5 BIG-IP ASM). Hypothèse la
 // plus probable : blocage par IP/géolocalisation côté WAF NARSA (IP de Rabat/Maroc acceptée, IP
-// datacenter européenne Render refusée) — PAS un problème de certificat. Pas de contournement
-// appliqué (décision BOSS) : ce log détaillé permettra de confirmer avec les vraies données du
-// prochain run Render si l'échec persiste, et quelle en est la nature exacte.
-function describeNetworkError(e) {
-  const lines = [];
-  let cur = e, depth = 0;
-  while (cur && depth < 6) {
-    const bits = [`${cur.name || 'Error'}: ${cur.message}`];
-    if (cur.code) bits.push(`code=${cur.code}`);
-    if (cur.errno) bits.push(`errno=${cur.errno}`);
-    if (cur.syscall) bits.push(`syscall=${cur.syscall}`);
-    if (cur.address) bits.push(`address=${cur.address}`);
-    if (cur.port) bits.push(`port=${cur.port}`);
-    lines.push(`  [profondeur ${depth}] ${bits.join(', ')}`);
-    cur = cur.cause;
-    depth++;
-  }
-  return lines.join('\n');
-}
+// datacenter européenne Render refusée) — PAS un problème de certificat. Confirmé par le run Render
+// n°3 (ConnectTimeout systématique) : NARSA retiré du Cron (Phase 5 quinquies), voir run-narsa-
+// local.js. describeNetworkError() déplacé dans network-diagnostics.js (Phase 5 sexies), partagé
+// avec overpass-client.js (santé + administrations).
 
 async function fetchPrefecture(pref) {
   const url = `https://khadamatnarsa.ma/fr/carte-interactive?pfpv=${pref.value}`;
