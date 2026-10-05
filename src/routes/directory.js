@@ -22,6 +22,7 @@ const { authenticate } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const asyncHandler = require('../middleware/asyncHandler');
 const { getPublishedDirectoryData } = require('../utils/directoryExport');
+const { directoryRebuild } = require('../utils/directoryRebuild');
 
 // Comparaison à temps constant du jeton — évite une attaque par mesure de temps sur une comparaison
 // naïve (===) qui court-circuite au premier octet différent. crypto.timingSafeEqual exige deux
@@ -128,6 +129,7 @@ router.put('/admin/reports/:id', authenticate, requirePermission('moderation'), 
   // seulement overture/foursquare : sinon une fiche administration (mtnra_id/osm_id, ajoutés en
   // Phase 2 bis) repasserait au prochain import (bug trouvé en testant dans un navigateur réel,
   // corrigé ici — voir RAPPORT_PHASE2BIS.md).
+  let rebuildScheduled = false;
   if (action === 'actioned' && report.type === 'retrait') {
     await db.query(`UPDATE directory_establishments SET status='removed', updated_at=NOW() WHERE id=$1`, [report.establishment_id]);
     const sourceIds = [
@@ -145,9 +147,12 @@ router.put('/admin/reports/:id', authenticate, requirePermission('moderation'), 
         [source, sourceId, report.establishment_name, report.id, req.user.id]
       );
     }
+    // Exclusions en base : le rebuild peut partir. Asynchrone et anti-rafale (utils/directoryRebuild.js),
+    // un échec du hook ne fait jamais échouer le retrait.
+    rebuildScheduled = directoryRebuild.request();
   }
 
-  res.json({ ok: true });
+  res.json({ ok: true, rebuild_scheduled: rebuildScheduled });
 }));
 
 module.exports = router;
