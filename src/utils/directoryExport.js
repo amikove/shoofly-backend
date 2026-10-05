@@ -16,12 +16,27 @@ async function getPublishedDirectoryData(db) {
      ORDER BY e.confidence DESC NULLS LAST, e.name`
   );
 
+  // Fiches à rediriger : ne sont plus publiées aujourd'hui (retirées ou en attente de revue) MAIS ont été
+  // publiées au moins une fois (first_published_at renseigné), dans une catégorie qui est toujours
+  // publiée. Une fiche jamais publiée, ou dont la catégorie est dépubliée, n'apparaît JAMAIS : aucune URL
+  // ancienne ne doit révéler le nom d'un établissement qui n'a jamais été public. UNIQUEMENT slug, ville,
+  // catégorie.
+  const { rows: removed } = await db.query(
+    `SELECT e.slug, e.city, e.category_id
+     FROM directory_establishments e
+     JOIN directory_categories c ON c.id = e.category_id
+     WHERE e.status <> 'published'
+       AND e.first_published_at IS NOT NULL
+       AND c.is_published = TRUE
+     ORDER BY e.city, e.slug`
+  );
+
   const usedNeighborhoodIds = [...new Set(establishments.map((e) => e.neighborhood_id).filter(Boolean))];
   const { rows: neighborhoods } = usedNeighborhoodIds.length
     ? await db.query(`SELECT id, city, name_fr, name_ar FROM directory_neighborhoods WHERE id = ANY($1)`, [usedNeighborhoodIds])
     : { rows: [] };
 
-  return { categories, establishments, neighborhoods, meta: { exported_at: new Date().toISOString() } };
+  return { categories, establishments, neighborhoods, removed, meta: { exported_at: new Date().toISOString() } };
 }
 
 module.exports = { getPublishedDirectoryData };
