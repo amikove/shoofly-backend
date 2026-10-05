@@ -100,10 +100,9 @@ async function main() {
       for (const s of burst) { assert.strictEqual(await statusOf(s.id), 'removed'); assert.ok(await excluded(s.overtureId)); }
     });
     await wait(DELAY_MS * 3);
-    await check('rafale de 3 → UN SEUL appel au hook, en POST', () => {
-      assert.strictEqual(fA.calls.length, 1, `attendu 1 appel, obtenu ${fA.calls.length}`);
-      assert.strictEqual(fA.calls[0].url, HOOK);
-      assert.strictEqual(fA.calls[0].opts.method, 'POST');
+    await check('rafale de 3 → 2 appels (1 immédiat + 1 en fin de fenêtre), en POST', () => {
+      assert.strictEqual(fA.calls.length, 2, `attendu 2 appels, obtenu ${fA.calls.length}`);
+      for (const c of fA.calls) { assert.strictEqual(c.url, HOOK); assert.strictEqual(c.opts.method, 'POST'); }
     });
 
     console.log('Scénario B — hook en échec HTTP 500 :');

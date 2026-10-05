@@ -33,13 +33,14 @@ async function check(label, fn) {
 }
 
 async function main() {
-  await check('succès : 1 POST sur le hook après le délai, request() renvoie true', async () => {
+  await check('1 retrait : 1 POST immédiat, rien de plus à la fin de la fenêtre, request() renvoie true', async () => {
     const f = fakeFetch(200);
     const rb = createDirectoryRebuild({ env: { VERCEL_DEPLOY_HOOK_URL: HOOK }, fetchImpl: f, delayMs: 10 });
     assert.strictEqual(rb.request(), true);
-    assert.strictEqual(f.calls.length, 0, 'aucun appel avant la fin de la fenêtre');
+    await wait(5);
+    assert.strictEqual(f.calls.length, 1, 'appel immédiat (leading)');
     await wait(40);
-    assert.strictEqual(f.calls.length, 1);
+    assert.strictEqual(f.calls.length, 1, 'pas de second appel sans demande pendant la fenêtre');
     assert.strictEqual(f.calls[0].url, HOOK);
     assert.strictEqual(f.calls[0].opts.method, 'POST');
   });
@@ -81,21 +82,24 @@ async function main() {
     assert.strictEqual(f.calls.length, 0);
   });
 
-  await check('rafale de 3 retraits en quelques ms : UN SEUL appel', async () => {
+  await check('rafale de 3 : 1 appel immédiat, puis 1 seul en fin de fenêtre (2 au total)', async () => {
     const f = fakeFetch(200);
-    const rb = createDirectoryRebuild({ env: { VERCEL_DEPLOY_HOOK_URL: HOOK }, fetchImpl: f, delayMs: 30 });
+    const rb = createDirectoryRebuild({ env: { VERCEL_DEPLOY_HOOK_URL: HOOK }, fetchImpl: f, delayMs: 60 });
     assert.strictEqual(rb.request(), true);
     assert.strictEqual(rb.request(), true);
     assert.strictEqual(rb.request(), true);
-    await wait(80);
-    assert.strictEqual(f.calls.length, 1, `attendu 1 appel, obtenu ${f.calls.length}`);
+    await wait(10);
+    assert.strictEqual(f.calls.length, 1, `immédiat : attendu 1 appel, obtenu ${f.calls.length}`);
+    await wait(120);
+    assert.strictEqual(f.calls.length, 2, `attendu 2 appels au total, obtenu ${f.calls.length}`);
   });
 
-  await check('après la fenêtre, une nouvelle rafale déclenche un nouveau rebuild', async () => {
+  await check('après la fenêtre vide, un nouveau retrait déclenche immédiatement un rebuild', async () => {
     const f = fakeFetch(200);
     const rb = createDirectoryRebuild({ env: { VERCEL_DEPLOY_HOOK_URL: HOOK }, fetchImpl: f, delayMs: 10 });
     rb.request(); await wait(40);
-    rb.request(); rb.request(); await wait(40);
+    assert.strictEqual(f.calls.length, 1);
+    rb.request(); await wait(5);
     assert.strictEqual(f.calls.length, 2);
   });
 
