@@ -2036,6 +2036,35 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     CREATE INDEX IF NOT EXISTS idx_directory_establishments_city_category ON directory_establishments (city, category_id) WHERE status='published';
     CREATE INDEX IF NOT EXISTS idx_directory_establishments_neighborhood ON directory_establishments (neighborhood_id) WHERE status='published';
 
+    -- Redirections des fiches retirées (chantier liens annuaire, 2026-10-05) : date de PREMIÈRE mise en
+    -- publication. Renseignée une seule fois par le trigger ci-dessous (dès qu'une ligne est 'published'
+    -- et que la date est encore nulle), jamais modifiée ensuite. Sert uniquement à distinguer une fiche
+    -- réellement publiée un jour (à rediriger si elle est retirée) d'une fiche jamais publiée (rien à
+    -- rediriger, et aucun nom ne doit fuiter via une URL). Colonne NULL = jamais publiée.
+    ALTER TABLE directory_establishments ADD COLUMN IF NOT EXISTS first_published_at TIMESTAMPTZ;
+    -- Une fiche n'est « publiée » qu'à condition que sa catégorie soit publiée : une fiche rangée dans une
+    -- catégorie dépubliée n'est jamais visible, donc n'a jamais été publique (aucune date posée).
+    CREATE OR REPLACE FUNCTION directory_set_first_published() RETURNS trigger AS $$
+    BEGIN
+      IF NEW.first_published_at IS NULL AND NEW.status = 'published'
+         AND EXISTS (SELECT 1 FROM directory_categories c WHERE c.id = NEW.category_id AND c.is_published = TRUE) THEN
+        NEW.first_published_at := NOW();
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    DROP TRIGGER IF EXISTS directory_establishments_first_published ON directory_establishments;
+    CREATE TRIGGER directory_establishments_first_published
+      BEFORE INSERT OR UPDATE ON directory_establishments
+      FOR EACH ROW WHEN (NEW.first_published_at IS NULL AND NEW.status = 'published')
+      EXECUTE FUNCTION directory_set_first_published();
+    -- Rattrapage (idempotent) : fiches actuellement publiées dans une catégorie publiée. Les autres
+    -- (catégorie dépubliée) ne reçoivent pas de date : elles ne sont jamais redirigées.
+    UPDATE directory_establishments e SET first_published_at = NOW()
+      FROM directory_categories c
+     WHERE c.id = e.category_id AND c.is_published = TRUE
+       AND e.status = 'published' AND e.first_published_at IS NULL;
+
     -- Retraits définitifs (décision #11 du plan initial) — clé (source, source_id), INDÉPENDANTE de
     -- directory_establishments : vérifiée par le pipeline AVANT tout upsert, donc survit même à une
     -- suppression/recréation complète de la ligne establishments correspondante.

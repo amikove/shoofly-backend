@@ -16,14 +16,18 @@ async function getPublishedDirectoryData(db) {
      ORDER BY e.confidence DESC NULLS LAST, e.name`
   );
 
-  // Fiches retirées (signalement admin, status='removed') ou non publiées (pending_review, catégorie
-  // dépubliée) : le générateur s'en sert pour rediriger les anciennes URLs. UNIQUEMENT slug, ville et
-  // catégorie — aucune autre donnée d'établissement ne sort par cette liste.
+  // Fiches à rediriger : ne sont plus publiées aujourd'hui (retirées ou en attente de revue) MAIS ont été
+  // publiées au moins une fois (first_published_at renseigné), dans une catégorie qui est toujours
+  // publiée. Une fiche jamais publiée, ou dont la catégorie est dépubliée, n'apparaît JAMAIS : aucune URL
+  // ancienne ne doit révéler le nom d'un établissement qui n'a jamais été public. UNIQUEMENT slug, ville,
+  // catégorie.
   const { rows: removed } = await db.query(
     `SELECT e.slug, e.city, e.category_id
      FROM directory_establishments e
-     LEFT JOIN directory_categories c ON c.id = e.category_id
-     WHERE e.status <> 'published' OR c.is_published IS NOT TRUE
+     JOIN directory_categories c ON c.id = e.category_id
+     WHERE e.status <> 'published'
+       AND e.first_published_at IS NOT NULL
+       AND c.is_published = TRUE
      ORDER BY e.city, e.slug`
   );
 
