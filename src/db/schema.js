@@ -2099,6 +2099,22 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     );
     CREATE INDEX IF NOT EXISTS idx_directory_reports_status ON directory_reports (status, created_at);
 
+    -- Statistiques annuaire (feat/annuaire-stats, 2026-10-05) — AGRÉGATS PAR JOUR uniquement : une
+    -- ligne = (fiche, type d'événement, jour casablancais, compteur). Aucune donnée personnelle : ni
+    -- IP, ni user-agent, ni identifiant visiteur, pas de cookie. L'IP ne sert qu'à la limitation de
+    -- fréquence en mémoire (express-rate-limit, clé hachée), jamais écrite ici.
+    CREATE TABLE IF NOT EXISTS directory_establishment_daily_stats (
+      establishment_id TEXT NOT NULL REFERENCES directory_establishments(id) ON DELETE CASCADE,
+      event            TEXT NOT NULL CHECK (event IN ('view','itineraire','site_web','appel','un_oeil')),
+      day              DATE NOT NULL,
+      count            INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
+      PRIMARY KEY (establishment_id, event, day)
+    );
+    CREATE INDEX IF NOT EXISTS idx_directory_stats_day ON directory_establishment_daily_stats (day);
+    -- Mission créée depuis le pré-remplissage d'une fiche annuaire (NULL sinon, création normale inchangée).
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS directory_establishment_id TEXT REFERENCES directory_establishments(id) ON DELETE SET NULL;
+    CREATE INDEX IF NOT EXISTS idx_missions_directory_establishment ON missions (directory_establishment_id) WHERE directory_establishment_id IS NOT NULL;
+
     -- Historique des imports (traçabilité, décision #H du plan initial) — un run par exécution du
     -- pipeline mensuel (backend/scripts/directory-import/run-import.js).
     CREATE TABLE IF NOT EXISTS directory_import_runs (
