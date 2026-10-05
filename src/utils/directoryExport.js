@@ -16,12 +16,23 @@ async function getPublishedDirectoryData(db) {
      ORDER BY e.confidence DESC NULLS LAST, e.name`
   );
 
+  // Fiches retirées (signalement admin, status='removed') ou non publiées (pending_review, catégorie
+  // dépubliée) : le générateur s'en sert pour rediriger les anciennes URLs. UNIQUEMENT slug, ville et
+  // catégorie — aucune autre donnée d'établissement ne sort par cette liste.
+  const { rows: removed } = await db.query(
+    `SELECT e.slug, e.city, e.category_id
+     FROM directory_establishments e
+     LEFT JOIN directory_categories c ON c.id = e.category_id
+     WHERE e.status <> 'published' OR c.is_published IS NOT TRUE
+     ORDER BY e.city, e.slug`
+  );
+
   const usedNeighborhoodIds = [...new Set(establishments.map((e) => e.neighborhood_id).filter(Boolean))];
   const { rows: neighborhoods } = usedNeighborhoodIds.length
     ? await db.query(`SELECT id, city, name_fr, name_ar FROM directory_neighborhoods WHERE id = ANY($1)`, [usedNeighborhoodIds])
     : { rows: [] };
 
-  return { categories, establishments, neighborhoods, meta: { exported_at: new Date().toISOString() } };
+  return { categories, establishments, neighborhoods, removed, meta: { exported_at: new Date().toISOString() } };
 }
 
 module.exports = { getPublishedDirectoryData };
