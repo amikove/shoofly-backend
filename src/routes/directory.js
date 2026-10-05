@@ -155,4 +155,114 @@ router.put('/admin/reports/:id', authenticate, requirePermission('moderation'), 
   res.json({ ok: true, rebuild_scheduled: rebuildScheduled });
 }));
 
+// ── Statistiques annuaire (feat/annuaire-stats, 2026-10-05) ─────────────────────────────────
+// Événements PUBLICS envoyés par les fiches (navigator.sendBeacon en text/plain : requête « simple »,
+// donc sans preflight CORS). Rien de personnel n'est stocké : un compteur par (fiche, type, jour
+// casablancais). L'IP ne sert qu'à la limitation de fréquence, en mémoire, sous forme de hash.
+const DIRECTORY_EVENTS = ['view', 'itineraire', 'site_web', 'appel', 'un_oeil'];
+// Robots / crawlers / prévisualisations : ignorés (aucune écriture), réponse identique à un succès.
+const BOT_UA = /bot|crawl|spider|slurp|facebookexternalhit|lighthouse|headless|preview/i;
+// 60 événements / 10 min par IP : une visite normale = 1 vue + quelques clics.
+const eventLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 60,
+  keyGenerator: (req) => hashIp(req.ip),
+  message: { error: 'Trop d\'événements depuis cette adresse.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// POST /api/directory/events — public. Corps JSON (en text/plain pour sendBeacon) : { establishment_id, type }.
+// 400 si le type ou l'identifiant est mal formé ; 204 dans tous les autres cas (succès, bot, fiche
+// inconnue ou retirée) — une réponse qui ne révèle pas l'existence d'une fiche.
+router.post('/events', require('express').text({ type: ['text/plain', 'application/json'], limit: '1kb' }), eventLimiter, asyncHandler(async (req, res) => {
+  let body;
+  try { body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body; } catch { return res.status(400).json({ error: 'JSON invalide' }); }
+  const { establishment_id, type } = body || {};
+  if (!DIRECTORY_EVENTS.includes(type)) return res.status(400).json({ error: 'type invalide' });
+  if (typeof establishment_id !== 'string' || !establishment_id || establishment_id.length > 200) return res.status(400).json({ error: 'establishment_id requis' });
+  if (BOT_UA.test(req.get('user-agent') || '')) return res.sendStatus(204);
+
+  const db = getDb();
+  const { rows: [establishment] } = await db.query(`SELECT id FROM directory_establishments WHERE id=$1 AND status='published'`, [establishment_id]);
+  if (establishment) {
+    await db.query(
+      `INSERT INTO directory_establishment_daily_stats (establishment_id, event, day, count)
+       VALUES ($1, $2, (NOW() AT TIME ZONE 'Africa/Casablanca')::date, 1)
+       ON CONFLICT (establishment_id, event, day)
+       DO UPDATE SET count = directory_establishment_daily_stats.count + 1`,
+      [establishment.id, type]
+    );
+  }
+  res.sendStatus(204);
+}));
+
+// Date civile casablancaise, décalée de (jours - 1) : début de la fenêtre « 7 derniers jours » ou « 30 derniers jours ».
+function casablancaStartDate(days) {
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Casablanca' }).format(new Date());
+  const d = new Date(`${today}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - (days - 1));
+  return d.toISOString().slice(0, 10);
+}
+
+// GET /api/directory/admin/stats?period=7|30|all&city=&category= — admin, permission `stats` (profils
+// financier, technique, admin_complet). Une ligne par fiche ayant une activité sur la période.
+router.get('/admin/stats', authenticate, requirePermission('stats'), asyncHandler(async (req, res) => {
+  const periodDays = { '7': 7, '30': 30, all: null }[req.query.period ?? '30'];
+  if (periodDays === undefined) return res.status(400).json({ error: 'period invalide (7, 30 ou all)' });
+  const start = periodDays ? casablancaStartDate(periodDays) : null;
+  const city = typeof req.query.city === 'string' && req.query.city ? req.query.city : null;
+  const category = typeof req.query.category === 'string' && req.query.category ? req.query.category : null;
+
+  const db = getDb();
+  const { rows } = await db.query(
+    `WITH ev AS (
+       SELECT establishment_id,
+         COALESCE(SUM(count) FILTER (WHERE event = 'view'), 0)::int       AS views,
+         COALESCE(SUM(count) FILTER (WHERE event = 'itineraire'), 0)::int AS itineraire,
+         COALESCE(SUM(count) FILTER (WHERE event = 'site_web'), 0)::int   AS site_web,
+         COALESCE(SUM(count) FILTER (WHERE event = 'appel'), 0)::int      AS appel,
+         COALESCE(SUM(count) FILTER (WHERE event = 'un_oeil'), 0)::int    AS un_oeil
+       FROM directory_establishment_daily_stats
+       WHERE ($1::date IS NULL OR day >= $1::date)
+       GROUP BY establishment_id
+     ),
+     ms AS (
+       SELECT directory_establishment_id AS establishment_id, COUNT(*)::int AS missions
+       FROM missions
+       WHERE directory_establishment_id IS NOT NULL
+         AND ($1::date IS NULL OR created_at >= ($1::date)::timestamp AT TIME ZONE 'Africa/Casablanca')
+       GROUP BY directory_establishment_id
+     ),
+     act AS (SELECT establishment_id FROM ev UNION SELECT establishment_id FROM ms)
+     SELECT e.id, e.name, e.city, e.category_id, c.label_fr AS category_label_fr, c.label_ar AS category_label_ar,
+            COALESCE(ev.views, 0) AS views, COALESCE(ev.itineraire, 0) AS itineraire, COALESCE(ev.site_web, 0) AS site_web,
+            COALESCE(ev.appel, 0) AS appel, COALESCE(ev.un_oeil, 0) AS un_oeil, COALESCE(ms.missions, 0) AS missions
+     FROM act
+     JOIN directory_establishments e ON e.id = act.establishment_id
+     LEFT JOIN directory_categories c ON c.id = e.category_id
+     LEFT JOIN ev ON ev.establishment_id = e.id
+     LEFT JOIN ms ON ms.establishment_id = e.id
+     WHERE e.status = 'published'
+       AND ($2::text IS NULL OR e.city = $2)
+       AND ($3::text IS NULL OR e.category_id = $3)
+     ORDER BY views DESC, e.name`,
+    [start, city, category]
+  );
+
+  // Options des filtres (indépendantes de la période et des filtres courants : listes complètes).
+  const { rows: cityRows } = await db.query(`SELECT DISTINCT city FROM directory_establishments WHERE status = 'published' ORDER BY city`);
+  const { rows: categoryRows } = await db.query(`SELECT id, label_fr, label_ar FROM directory_categories WHERE is_published ORDER BY sort_order, id`);
+
+  const KEYS = ['views', 'itineraire', 'site_web', 'appel', 'un_oeil', 'missions'];
+  const totals = Object.fromEntries(KEYS.map((k) => [k, rows.reduce((sum, r) => sum + r[k], 0)]));
+  res.json({
+    period: req.query.period ?? '30',
+    start,
+    rows: rows.map((r) => ({ ...r, rate: r.views > 0 ? r.missions / r.views : null })),
+    totals: { ...totals, rate: totals.views > 0 ? totals.missions / totals.views : null },
+    options: { cities: cityRows.map((r) => r.city), categories: categoryRows },
+  });
+}));
+
 module.exports = router;

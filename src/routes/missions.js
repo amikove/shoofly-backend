@@ -392,6 +392,9 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
   }
 
   const status = oeil_id ? 'assigned' : 'pending';
+  // Statistiques annuaire (feat/annuaire-stats) : mission créée depuis le pré-remplissage d'une fiche.
+  // Ignoré (NULL) si absent, mal formé ou fiche non publiée : la création ne peut pas échouer à cause de ce champ.
+  const directoryEstablishmentId = await resolveDirectoryEstablishmentId(db, body.directory_establishment_id);
 
   return {
     insert: {
@@ -406,9 +409,16 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
       is_private_residence: privateFlag.value !== undefined ? privateFlag.value : defaultIsPrivateResidence(type),
       location_lat: location.lat,
       location_lng: location.lng,
+      directory_establishment_id: directoryEstablishmentId,
     },
     freePromo,
   };
+}
+
+async function resolveDirectoryEstablishmentId(db, raw) {
+  if (typeof raw !== 'string' || !raw || raw.length > 200) return null;
+  const { rows: [row] } = await db.query(`SELECT id FROM directory_establishments WHERE id=$1 AND status='published'`, [raw]);
+  return row ? row.id : null;
 }
 
 // ── Réutilisable : écriture DB de la mission + effets de bord synchrones (dépense promo
@@ -424,6 +434,7 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
     property_type, visit_type, video_call, institution, purpose,
     company_name, audit_type, frequency, criteria, subcategory,
     promo_code, discount, replacement_preference, status, payment_method,
+    directory_establishment_id,
   } = insertData;
   // Un mission_payload PayZone stocké avant ce champ (tentative en cours au déploiement) ne le
   // porte pas : même défaut que prepareMissionInsert, jamais FALSE implicite.
@@ -494,8 +505,8 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
       duration_est,price,commission,oeil_earning,is_urgent,
       property_type,visit_type,video_call,institution,purpose,
       company_name,audit_type,frequency,criteria,oeil_id,replacement_preference,payment_method,
-      is_private_residence, location_lat, location_lng, approx_lat, approx_lng
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
+      is_private_residence, location_lat, location_lng, approx_lat, approx_lng, directory_establishment_id
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)
     RETURNING *
   `, [
     id, clientId, type, subcategory||null, status, title, description||null, address, city, quartier,
@@ -503,7 +514,7 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
     !!is_urgent, property_type||null, visit_type||null, !!video_call,
     institution||null, purpose||null, company_name||null, audit_type||null,
     frequency||null, criteria||null, oeil_id||null, replacement_preference || 'fast', payment_method,
-    isPrivateResidence, location.lat, location.lng, approx.lat, approx.lng
+    isPrivateResidence, location.lat, location.lng, approx.lat, approx.lng, directory_establishment_id || null
   ]);
 
   if (directFreeOffer === 'start') await openFirstMissionFreeOffer(db, oeil_id, mission.id);
