@@ -1,3 +1,4 @@
+const { guardSend } = require('./sendGuard');
 const { getDb } = require('../db/schema');
 const { isTemplateRetired } = require('../config/whatsappPolicy');
 
@@ -25,6 +26,8 @@ function sanitizeTemplateVariable(value) {
 // d'erreur. `skipped:true` distingue un envoi jamais tenté (config/donnée manquante, pas un
 // échec réseau/API) d'un vrai échec d'envoi — seul ce dernier doit être journalisé/retenté.
 async function sendWhatsAppTemplateRaw(templateName, phone, variables) {
+  // Garde d'envoi (opt-in, NOTIFICATIONS_LIVE=1) : avant tout appel réseau.
+  if (!guardSend('whatsapp', `template=${templateName}`)) return { ok: false, skipped: true, guarded: true };
   // Politique d'envoi (chantier 2, config/whatsappPolicy.js) : modèle retiré → jamais envoyé,
   // ni journalisé comme échec (skipped), quel que soit l'appelant (route, cron ou relance).
   if (isTemplateRetired(templateName)) {
@@ -92,11 +95,25 @@ async function logSendFailure(db, templateName, phone, variables, errorMessage) 
 // (embauche, transition de statut, etc). Renvoie true en cas de succès, false sinon.
 // `db` par défaut sur le pool partagé (voir utils/ticketReference.js pour le même pattern) —
 // aucun appelant existant n'a besoin de le fournir explicitement.
-async function sendWhatsAppTemplate(templateName, phone, variables, db = getDb()) {
+// Journal des envois RÉUSSIS (whatsapp_send_log) : modèle, mission, statut. Aucun numéro ni contenu.
+// Best-effort : une erreur d'écriture n'interrompt jamais l'envoi.
+async function logSendSuccess(db, templateName, missionId) {
+  try {
+    await db.query(
+      `INSERT INTO whatsapp_send_log (template_name, mission_id, status) VALUES ($1, $2, 'sent')`,
+      [templateName, missionId || null]
+    );
+  } catch (err) {
+    console.error(`[wasel] Échec journalisation du succès (template="${templateName}")`, err.message);
+  }
+}
+
+async function sendWhatsAppTemplate(templateName, phone, variables, db = getDb(), meta = {}) {
   const result = await sendWhatsAppTemplateRaw(templateName, phone, variables);
   if (!result.ok && !result.skipped) {
     await logSendFailure(db, templateName, phone.trim(), variables, result.errorMessage);
   }
+  if (result.ok) await logSendSuccess(db, templateName, meta.missionId);
   return result.ok;
 }
 

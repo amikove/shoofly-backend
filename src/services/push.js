@@ -1,3 +1,4 @@
+const { guardSend } = require('./sendGuard');
 const crypto = require('crypto');
 const webpush = require('web-push');
 const Sentry = require('@sentry/node');
@@ -196,6 +197,7 @@ async function logSend(db, row) {
 //             urgency/ttl : options de livraison (non incluses dans le contenu chiffré).
 //   db      : pool partagé par défaut (même pattern que sendWhatsAppTemplate).
 async function sendWebPush(userId, payload, db = getDb()) {
+  if (!guardSend('push')) return false;
   if (!vapidConfigured) return false;
   if (!userId || !payload || !payload.title) return false;
 

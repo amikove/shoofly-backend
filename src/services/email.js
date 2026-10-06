@@ -1,3 +1,4 @@
+const { guardSend } = require('./sendGuard');
 const RESEND_API_URL = 'https://api.resend.com/emails';
 const EMAIL_FROM = 'SHOOFLY <noreply@shoofly.ma>';
 const RESET_PASSWORD_URL_BASE = 'https://shoofly.ma/reset-password';
@@ -8,6 +9,8 @@ const RESET_PASSWORD_URL_BASE = 'https://shoofly.ma/reset-password';
 // Utilise fetch nu plutôt que le SDK `resend` — même choix que wasel.js pour l'API Wasel,
 // évite une dépendance supplémentaire pour un simple POST JSON.
 async function sendEmailRaw(to, subject, html, text) {
+  // Garde d'envoi (opt-in, NOTIFICATIONS_LIVE=1) : avant tout appel réseau.
+  if (!guardSend('email')) return { ok: false, skipped: true, guarded: true };
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) {
     console.warn(`[email] RESEND_API_KEY non configurée — envoi ignoré (to=${to}, subject="${subject}")`);

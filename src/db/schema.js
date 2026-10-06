@@ -2,6 +2,7 @@ const { Pool } = require('pg');
 require('dotenv').config();
 const SETTINGS_DEFAULTS = require('../config/settingsDefaults');
 const SUBCATEGORY_MIN_PRICES_SEED = require('../config/subcategoryMinPricesSeed');
+const { markOverdueToVerifyAsNotified } = require('./toVerifyBackfill');
 const { PRIVATE_RESIDENCE_TYPES } = require('../constants/missionCategories');
 const { computeApproxCenter } = require('../utils/missionLocation');
 
@@ -1047,6 +1048,17 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- GET /missions, GET /missions/inbox). POST /:id/messages (blocage d'envoi) reste inchangé,
     -- aucun lien avec cette colonne.
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+    -- Rappel « mission à vérifier » : une seule notification par mission (idempotence, comme stale_notified_at).
+    ALTER TABLE missions ADD COLUMN IF NOT EXISTS to_verify_notified_at TIMESTAMPTZ;
+    -- Journal des envois WhatsApp réussis (modèle, mission, statut). AUCUN numéro, AUCUN contenu.
+    CREATE TABLE IF NOT EXISTS whatsapp_send_log (
+      id            BIGSERIAL PRIMARY KEY,
+      template_name TEXT NOT NULL,
+      mission_id    TEXT REFERENCES missions(id) ON DELETE SET NULL,
+      status        TEXT NOT NULL DEFAULT 'sent',
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_whatsapp_send_log_created ON whatsapp_send_log (created_at);
 
     -- Verrou structurel sur balance (2026-07-31, suite audit externe "ledger-only") : jusqu'ici
     -- rien n'empêchait une route d'écrire UPDATE oeil_profiles/users SET balance=... directement,
@@ -2201,6 +2213,11 @@ CREATE TABLE IF NOT EXISTS identity_documents (
   // formats : aucune donnée réécrite ni supprimée).
   await db.query(PHONE_E164_FUNCTION_SQL);
   await ensurePhoneUniqueIndex(db);
+  // Backfill run-once (2026-10-06) : les missions déjà en retard au déploiement ne reçoivent pas de vague.
+  await runDataMigrationOnce(db, 'to_verify_backfill_2026_10_06', async (client) => {
+    const { rows: [hs] } = await client.query("SELECT value FROM settings WHERE key='mission_overdue_verification_hours'");
+    return markOverdueToVerifyAsNotified(client, Number(hs ? hs.value : 24));
+  });
 
   console.log('✅ PostgreSQL schema ready');
 }

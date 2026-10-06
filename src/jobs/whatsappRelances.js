@@ -127,7 +127,7 @@ async function processRelance(db, id, kind) {
       const n = await countVisibleForMissionId(db, row.mission_id);
       variables = [String(n), row.title];
     }
-    ok = await wasel.sendWhatsAppTemplate(waselTemplates[templateKey].template_name, row.phone, variables, db);
+    ok = await wasel.sendWhatsAppTemplate(waselTemplates[templateKey].template_name, row.phone, variables, db, { missionId: row.mission_id });
   } catch (e) {
     console.error(`❌ Relance WhatsApp ${kind} — mission ${row.mission_id} :`, e.message);
   }
