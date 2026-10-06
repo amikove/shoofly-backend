@@ -25,8 +25,11 @@ const ADMIN_PREFIX = 'Administrations — ';
 const DEFAULT_CLOSING_HOUR = 17;
 const CODE = 'ADMINISTRATION_HOURS';
 
+// Exclues de la règle (décision BOSS) : professions libérales, pas des administrations.
+const EXCLUDED_SUBCATEGORIES = ['Administrations — Adoul / Notaires'];
+
 function isAdministrationSubcategory(subcategory) {
-  return typeof subcategory === 'string' && subcategory.startsWith(ADMIN_PREFIX);
+  return typeof subcategory === 'string' && subcategory.startsWith(ADMIN_PREFIX) && !EXCLUDED_SUBCATEGORIES.includes(subcategory);
 }
 
 // Raison du refus pour ce créneau, ou null si autorisé. Pure (testable sans base).

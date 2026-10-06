@@ -5,7 +5,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node start.js",
-    "test": "node --test tests/administration-hours.test.js",
+    "test": "node --test tests/administration-hours.test.js tests/administration-http.test.js",
     "dev": "nodemon src/index.js",
     "seed": "node src/db/seed.js",
     "check:notif-i18n": "node scripts/check-notif-i18n.js"

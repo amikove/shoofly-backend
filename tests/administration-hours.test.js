@@ -125,3 +125,29 @@ test('réglage en base : fermeture à 15 h appliquée immédiatement', { skip: S
   await db.query(`UPDATE settings SET value='17' WHERE key='administration_closing_hour'`);
   invalidateSettingsCache();
 });
+
+// ── Exclusion Adoul / Notaires (décision BOSS) ─────────────────────────────────────────────────
+test('Adoul / Notaires exclue : même à 17 h, la règle ne s\'applique pas', async () => {
+  const ADOUL = 'Administrations — Adoul / Notaires';
+  assert.equal(isAdministrationSubcategory(ADOUL), false);
+  assert.equal(await checkAdministrationSlot(null, { subcategory: ADOUL, scheduledAt: casa(5, 17, 0) }), null);
+});
+
+// ── Fuseau IANA : Casablanca à UTC+0 pendant le Ramadan (pas de décalage fixe) ─────────────────
+const { casaWallToInstant, casaOffsetHours } = require('./helpers/casa');
+test('Ramadan (Casablanca à UTC+0) : 16 h 59 accepté, 17 h 00 refusé, instants en UTC+0', () => {
+  // 15 février 2027 : lundi, Ramadan. Décalage réel mesuré par Intl = 0.
+  assert.equal(casaOffsetHours(new Date('2027-02-15T12:00:00Z')), 0);
+  const at1659 = casaWallToInstant(2027, 2, 15, 16, 59);
+  const at1700 = casaWallToInstant(2027, 2, 15, 17, 0);
+  assert.equal(at1659.toISOString(), '2027-02-15T16:59:00.000Z'); // un décalage fixe de +1 donnerait 15:59Z
+  assert.equal(at1700.toISOString(), '2027-02-15T17:00:00.000Z');
+  assert.equal(administrationSlotViolation(at1659, 17), null);
+  assert.equal(administrationSlotViolation(at1700, 17), 'after_closing');
+});
+
+test('Hors Ramadan (UTC+1) : 16 h 59 accepté, 17 h 00 refusé', () => {
+  assert.equal(casaOffsetHours(new Date('2026-10-06T12:00:00Z')), 1);
+  assert.equal(administrationSlotViolation(casaWallToInstant(2026, 10, 5, 16, 59), 17), null);
+  assert.equal(administrationSlotViolation(casaWallToInstant(2026, 10, 5, 17, 0), 17), 'after_closing');
+});
