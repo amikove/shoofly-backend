@@ -96,6 +96,7 @@ const SETTING_RULES = {
   // désactive la plage.
   quiet_hours_start:                           { min: 0, max: 23, integer: true }, // utils/quietHours.js
   quiet_hours_end:                             { min: 0, max: 23, integer: true }, // utils/quietHours.js
+  administration_closing_hour:                 { min: 0, max: 23, integer: true }, // utils/administrationHours.js
   pending_mission_expiration_hours:            { min: 0 }, // index.js cronPendingMissionExpiration  INTERVAL '1 hour' * $n
   mission_overdue_verification_hours:          { min: 0 }, // index.js:925
   late_start_alert_window_minutes:             { min: 0 }, // index.js:726/779  INTERVAL '1 minute' * $n

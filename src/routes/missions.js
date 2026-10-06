@@ -27,6 +27,7 @@ const { resolveMapsLink, MapsLinkError } = require('../utils/mapsLink');
 const { getSubcategoryMinPrice, loadSubcategoryMinPricesMap } = require('../utils/subcategoryMinPrices');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
 const { listCandidateRows, keepClientVisible, listClientVisibleCandidates } = require('../utils/candidates');
+const { checkAdministrationSlot } = require('../utils/administrationHours');
 const {
   checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins, notifyFirstMissionFreeOeil,
   requiredCashBalance, cashBalanceShortSet, cashBalanceCoverFilter, OEIL_UNAVAILABLE_CODE, OEIL_UNAVAILABLE_MESSAGE,
@@ -238,6 +239,10 @@ async function prepareMissionInsert(db, clientId, body, opts = {}) {
     promo_code, discount,
     replacement_preference,
   } = body;
+
+  // Règle administrations (décision BOSS) : création directe ET PayZone (même point d'entrée).
+  const adminSlot = await checkAdministrationSlot(db, { subcategory, scheduledAt: scheduled_at });
+  if (adminSlot) return { error: adminSlot.error, code: adminSlot.code };
 
   // Modèle de paiement cash (2026-08-13) — voir schema.js (missions.payment_method) et
   // RAPPORT_DIAGNOSTIC_COHERENCE_CASH_VS_PAYZONE.md. Obligatoire, aucune valeur par défaut
@@ -1539,6 +1544,14 @@ router.put('/:id', authenticate, requireRole('client'), asyncHandler(async (req,
   const { error, changes } = validateMissionEditFields(req.body, mission);
   if (error) return res.status(400).json({ error });
   if (Object.keys(changes).length === 0) return res.status(400).json({ error: 'Aucun champ à modifier' });
+  // Règle administrations (décision BOSS) : refus serveur si le créneau ou la sous-catégorie change.
+  if ('scheduled_at' in changes || 'subcategory' in changes) {
+    const adminSlot = await checkAdministrationSlot(db, {
+      subcategory: 'subcategory' in changes ? changes.subcategory : mission.subcategory,
+      scheduledAt: 'scheduled_at' in changes ? changes.scheduled_at : mission.scheduled_at,
+    });
+    if (adminSlot) return res.status(400).json({ error: adminSlot.error, code: adminSlot.code });
+  }
   // Vérifié ici plutôt que dans validateMissionEditFields (partagée avec PUT /:id/admin-edit,
   // qui doit rester libre de corriger une mission déjà passée) — voir commentaire sur
   // SCHEDULED_AT_PAST_TOLERANCE_MS.
@@ -1656,6 +1669,14 @@ router.put('/:id/admin-edit', authenticate, requireRole('admin'), requireSuperAd
   const { error, changes } = validateMissionEditFields(req.body, mission);
   if (error) return res.status(400).json({ error });
   if (Object.keys(changes).length === 0) return res.status(400).json({ error: 'Aucun champ à modifier' });
+  // Règle administrations (décision BOSS) : refus serveur si le créneau ou la sous-catégorie change.
+  if ('scheduled_at' in changes || 'subcategory' in changes) {
+    const adminSlot = await checkAdministrationSlot(db, {
+      subcategory: 'subcategory' in changes ? changes.subcategory : mission.subcategory,
+      scheduledAt: 'scheduled_at' in changes ? changes.scheduled_at : mission.scheduled_at,
+    });
+    if (adminSlot) return res.status(400).json({ error: adminSlot.error, code: adminSlot.code });
+  }
   // Verrou « logement privé » (Q4) : s'applique aussi au Super Admin — cocher après coup ne
   // « dé-révèle » pas une position déjà servie, décocher révélerait l'exact à tout le pool.
   const lockError = await privacyFlagLockError(db, mission, changes);
@@ -2027,11 +2048,13 @@ router.get('/pending-h30-resume', authenticate, requireRole('oeil'), asyncHandle
 // Doit rester AVANT `router.get('/:id')` (sinon capturé comme :id).
 router.get('/subcategory-min-prices', authenticate, asyncHandler(async (req, res) => {
   const db = getDb();
-  const [globalMin, floors] = await Promise.all([
+  const [globalMin, floors, closingHour] = await Promise.all([
     getSetting(db, 'min_price', 80),
     loadSubcategoryMinPricesMap(db),
+    // Règle administrations (décision BOSS) : le formulaire affiche les créneaux interdits.
+    getSetting(db, 'administration_closing_hour', 17),
   ]);
-  res.json({ global_min: Number(globalMin), floors });
+  res.json({ global_min: Number(globalMin), floors, administration_closing_hour: Number(closingHour) });
 }));
 
 // ── GET /missions/:id ──────────────────────────────────
