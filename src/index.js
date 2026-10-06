@@ -37,6 +37,8 @@ const path = require('path');
 const jwt = require('jsonwebtoken');
 
 const { initDb, getDb, checkDbConnection } = require('./db/schema');
+const { startupStatusLine } = require('./services/sendGuard');
+const { runMissionToVerify } = require('./jobs/missionToVerify');
 const { logReliabilityEvent } = require('./utils/reliabilityScore');
 const { getSetting } = require('./utils/settings');
 const { casablancaYMD } = require('./utils/schedule');
@@ -1014,47 +1016,13 @@ initDb().then(() => {
     finally { cronAlertHRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
-  // ── Cron toutes les heures — Missions expirées (niveau 3) ─
+  // ── Cron toutes les heures — Missions à vérifier (une seule notification par mission) ─
+  // Logique dans jobs/missionToVerify.js (idempotence to_verify_notified_at).
   cron.schedule('8 * * * *', async () => {
     if (cronExpiredMissionsRunning) { console.warn('⏭️ Cron missions expirées déjà en cours, tick ignoré'); return; }
     cronExpiredMissionsRunning = true;
     try {
-      const db = getDb();
-      const emitToUser = app.get('emitToUser');
-      const overdueVerificationHours = await getSetting(db, 'mission_overdue_verification_hours', 24);
-
-      // Missions active/en_route depuis plus de 24h après scheduled_at
-      const { rows: expired } = await db.query(`
-        SELECT m.*, u.first_name, u.last_name
-        FROM missions m
-        JOIN users u ON u.id = m.oeil_id
-        WHERE m.status IN ('active', 'en_route')
-        AND m.scheduled_at < NOW() - INTERVAL '1 hour' * $1::numeric
-        AND m.oeil_id IS NOT NULL
-      `, [overdueVerificationHours]);
-
-      // Un seul SELECT admins par tick, réutilisé pour chaque mission expirée ci-dessous
-      // (audit perf 2026-07-26).
-      const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
-      for (const m of expired) {
-        // Isolation par itération (RG9) — voir la boucle lateH plus haut.
-        try {
-        for (const admin of admins) {
-          // Migré vers notify() (chantier push) — in-app + socket live (emitToUser en scope,
-          // corrige L13) + push. Le `ON CONFLICT DO NOTHING` d'origine était inopérant
-          // (notifications n'a aucune contrainte unique) : rien perdu.
-          await notify(
-            db, admin.id,
-            '🔍 Mission à vérifier',
-            `La mission "${m.title}" de ${m.first_name} ${m.last_name} dont l'heure prévue est dépassée de plus de ${overdueVerificationHours} h. Vérification requise.`,
-            'warning', m.id, emitToUser, 'admin_missions',
-            'missionToVerifyAdminTitle', 'missionToVerifyAdminBody',
-            { missionTitle: m.title, oeilName: `${m.first_name} ${m.last_name}`, hours: overdueVerificationHours }
-          );
-        }
-        console.log(`🔍 Alerte mission expirée ${m.id}`);
-        } catch (e) { console.error(`❌ Cron missions expirées — mission ${m.id} :`, e.message); }
-      }
+      await runMissionToVerify(getDb(), app.get('emitToUser'));
     } catch (e) { console.error('❌ Cron missions expirées error:', e.message); }
     finally { cronExpiredMissionsRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
@@ -1807,6 +1775,7 @@ initDb().then(() => {
   }
 
   server.listen(PORT, () => {
+    console.log(startupStatusLine());
     console.log(`\n🚀 SHOOFLY API + WebSocket on port ${PORT}`);
     console.log(`   Health  : http://localhost:${PORT}/health`);
     console.log(`   WS      : ws://localhost:${PORT}\n`);

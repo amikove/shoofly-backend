@@ -51,7 +51,7 @@ async function runStaleMissions(db, emitToUser = null) {
           'staleMissionAdminTitle', 'staleMissionAdminBody', params
         );
         if (admin.phone) {
-          await sendWhatsAppTemplate(waselTemplates.mission_without_oeil_admin.template_name, admin.phone, [m.title]);
+          await sendWhatsAppTemplate(waselTemplates.mission_without_oeil_admin.template_name, admin.phone, [m.title], db, { missionId: m.id });
         }
       }
 
