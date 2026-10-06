@@ -587,9 +587,10 @@ async function notifyNewMission(db, mission, emitToUser, io) {
        AND u.city=$1`,
     [mission.city]
   );
-  // Diffusion non urgente au sens BOSS (2026-10-06, point 6) : respecte la plage de silence, sauf
-  // mission qui commence bientôt (notifyDifferable, exception + 3 h).
-  await Promise.all(oeils.map((o) => notifyDifferable(db, o.id, `Nouvelle mission${mission.is_urgent?' 🚨 URGENTE':''}`,
+  // Mission URGENTE : diffusion immédiate, même la nuit (décision BOSS). Mission non urgente :
+  // plage de silence respectée (notifyDifferable, exception « commence dans moins de fin de plage + 3 h »).
+  const send = mission.is_urgent ? notify : notifyDifferable;
+  await Promise.all(oeils.map((o) => send(db, o.id, `Nouvelle mission${mission.is_urgent?' 🚨 URGENTE':''}`,
     `${mission.title} — ${mission.city} · ${mission.price} MAD`, 'mission', mission.id, emitToUser, null,
     mission.is_urgent ? 'newMissionUrgentTitle' : 'newMissionAvailableTitle', 'newMissionBody',
     { missionTitle: mission.title, city: mission.city, price: mission.price }, null, mission.scheduled_at)));
@@ -5569,6 +5570,7 @@ router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
 router.checkAssistanceRequestExpiry = checkAssistanceRequestExpiry;
 router.checkPendingMissionExpiration = checkPendingMissionExpiration;
 router.checkUnfilledMissionReminder = checkUnfilledMissionReminder;
+router.notifyNewMission = notifyNewMission;
 router.checkPresenceConfirmationDeadlines = checkPresenceConfirmationDeadlines;
 router.checkActivityPhotoDeadlines = checkActivityPhotoDeadlines;
 router.hireOeilCore = hireOeilCore;
