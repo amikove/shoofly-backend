@@ -1,6 +1,7 @@
 const { getSetting } = require('../utils/settings');
 const wasel = require('../services/wasel');
 const waselTemplates = require('../config/waselTemplates');
+const { countVisibleForMissionId } = require('../utils/candidates');
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Chantier 2 lot 1 bis (décisions BOSS du 2026-09-27) — WhatsApp en RELANCE seulement.
@@ -122,11 +123,8 @@ async function processRelance(db, id, kind) {
     } else {
       templateKey = 'oeil_applied';
       // Nombre de candidatures d'Œils vérifiés AU MOMENT de l'envoi (même comptage que le seuil).
-      const { rows: [{ n }] } = await db.query(
-        `SELECT COUNT(*)::int AS n FROM mission_interests mi
-         JOIN oeil_profiles p ON p.user_id = mi.oeil_id AND p.is_verified = true
-         WHERE mi.mission_id = $1`, [row.mission_id]
-      );
+      // Même définition que le seuil et la liste client (utils/candidates.js).
+      const n = await countVisibleForMissionId(db, row.mission_id);
       variables = [String(n), row.title];
     }
     ok = await wasel.sendWhatsAppTemplate(waselTemplates[templateKey].template_name, row.phone, variables, db);

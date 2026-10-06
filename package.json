@@ -5,6 +5,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node start.js",
+    "test": "node --test tests/quiet-hours.test.js tests/notif-catalog.test.js tests/notifications.db.test.js",
     "dev": "nodemon src/index.js",
     "seed": "node src/db/seed.js",
     "check:notif-i18n": "node scripts/check-notif-i18n.js"

@@ -37,6 +37,12 @@ module.exports = {
   abandon_during_mission_cooldown_hours: '48',
   stale_mission_hours: '12',
   stale_mission_min_lead_hours: '4',
+  // Plage de silence (audit notifications, BOSS 2026-10-06) : les notifications NON urgentes
+  // (relances candidatures client, rappel de mission non pourvue, diffusion de création, alerte
+  // client « sans Œil ») sont reportées à la fin de la plage, heure de Casablanca. Exception : si
+  // la mission commence avant la fin de plage + 3 h, envoi immédiat. Début = fin : désactivée.
+  quiet_hours_start: '22',
+  quiet_hours_end: '7',
   // Correctif audit financier 2026-09-17, §2.4.1 : distinct de stale_mission_hours ci-dessus
   // (qui alerte 12h après CRÉATION, tant que le créneau reste encore lointain) — celui-ci couvre
   // le cas qu'aucun cron n'observait : une mission 'pending'/oeil_id NULL dont le créneau prévu
@@ -71,13 +77,11 @@ module.exports = {
   payment_attempt_abandoned_minutes: '30',
   urgent_mission_whatsapp_batch_size: '10',
   urgent_mission_whatsapp_batch_delay_minutes: '30',
-  // Audit santé technique 2026-09-18, §3.7 — délai avant la 1ère vague WhatsApp d'une mission
-  // (checkNewMissionWhatsappWave, routes/missions.js), compté depuis missions.created_at,
-  // seulement si aucune candidature n'est encore arrivée (mission_interests vide). Remplace
-  // l'ancien envoi immédiat à la création : s'applique à TOUTE mission, urgente ou non — une
-  // fois déclenchée, la 1ère vague réutilise sendUrgentWhatsAppWave telle quelle (mêmes réglages
-  // urgent_mission_whatsapp_batch_* ci-dessus pour les vagues suivantes). Valeur provisoire (2h,
-  // bas de la fourchette 2-3h demandée) — à ajuster depuis /admin/parametres une fois en prod.
+  // Délai avant le rappel « toujours sans Œil » (checkUnfilledMissionReminder, routes/missions.js),
+  // compté depuis missions.created_at tant que la mission n'a pas d'Œil assigné. Un seul rappel,
+  // envoyé aux Œils déjà notifiés à la création qui n'ont pas postulé (audit notifications, D1,
+  // 2026-10-06). Le nom de réglage est conservé pour ne pas casser /admin/parametres.
+  // Valeur provisoire (2h) — à ajuster depuis /admin/parametres une fois en prod.
   new_mission_whatsapp_delay_hours: '2',
   candidature_whatsapp_seuil_count: '3',
   candidature_whatsapp_seuil_minutes: '60',

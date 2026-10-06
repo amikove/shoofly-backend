@@ -1,5 +1,6 @@
 const { getSetting } = require('../utils/settings');
-const { notify } = require('../routes/missions');
+const { notify, notifyDifferable } = require('../utils/notify');
+const { listClientVisibleCandidates } = require('../utils/candidates');
 
 // PROMPT 5 point 5 (2026-08-18) — extrait dans son propre module, même raison que
 // jobs/autoValidateMissions.js : testable indépendamment (appel direct de la fonction, sans
@@ -21,9 +22,7 @@ async function runCandidatureRelance(db, emitToUser = null) {
   const imminentThresholdMinutes = await getSetting(db, 'candidature_relance_imminent_threshold_minutes', 120);
 
   const { rows: dueMissions } = await db.query(`
-    SELECT m.id, m.client_id, m.title, m.scheduled_at, m.candidature_relance_count,
-      (SELECT COUNT(*)::int FROM mission_interests mi WHERE mi.mission_id = m.id) AS n
-    FROM missions m
+    SELECT m.* FROM missions m
     WHERE m.status = 'pending'
       AND m.candidature_whatsapp_sent_at IS NOT NULL
       AND m.candidature_admin_alert_sent_at IS NULL
@@ -36,6 +35,11 @@ async function runCandidatureRelance(db, emitToUser = null) {
 
   for (const m of dueMissions) {
     try {
+      // Compte unique des candidatures (utils/candidates.js) : celui que le client voit dans sa liste.
+      const n = (await listClientVisibleCandidates(db, m)).length;
+      // Sans candidature visible, il n'y a rien à faire choisir au client : pas de relance.
+      if (n === 0) continue;
+
       const minutesToScheduled = (new Date(m.scheduled_at).getTime() - Date.now()) / 60000;
 
       if (minutesToScheduled < imminentThresholdMinutes) {
@@ -51,11 +55,11 @@ async function runCandidatureRelance(db, emitToUser = null) {
         const { rows: admins } = await db.query(`SELECT id FROM users WHERE role='admin' AND is_active=true`);
         for (const admin of admins) {
           await notify(db, admin.id, '⏰ Mission proche sans candidature validée',
-            `"${m.title}" est prévue bientôt et le client n'a toujours pas choisi d'Œil parmi ${m.n} candidature(s) reçues.`,
+            `"${m.title}" est prévue bientôt et le client n'a toujours pas choisi d'Œil parmi ${n} candidature(s) reçues.`,
             'warning', m.id, emitToUser, 'admin_missions_proches_validation',
-            'candidatureAdminAlertTitle', 'candidatureAdminAlertBody', { missionTitle: m.title, count: m.n });
+            'candidatureAdminAlertTitle', 'candidatureAdminAlertBody', { missionTitle: m.title, count: n });
         }
-        console.log(`⏰ Alerte admin — mission ${m.id} proche sans candidature validée (${m.n} candidature(s))`);
+        console.log(`⏰ Alerte admin — mission ${m.id} proche sans candidature validée (${n} candidature(s))`);
       } else {
         const { rowCount } = await db.query(
           `UPDATE missions SET candidature_relance_count = candidature_relance_count + 1, candidature_relance_last_sent_at = NOW() WHERE id=$1`,
@@ -66,11 +70,13 @@ async function runCandidatureRelance(db, emitToUser = null) {
         // candidats de la mission (même action que « Nouvel Œil intéressé »). Envoyée que le
         // client ait un téléphone ou non.
         if (rowCount > 0) {
-          await notify(db, m.client_id, 'Des Œils attendent votre choix 👁️',
-            `${m.n} candidature(s) pour "${m.title}". Choisissez votre Œil pour confirmer la mission.`,
+          // Relance non urgente : respecte la plage de silence (notifyDifferable).
+          await notifyDifferable(db, m.client_id, 'Des Œils attendent votre choix 👁️',
+            `${n} candidature(s) pour "${m.title}". Choisissez votre Œil pour confirmer la mission.`,
             'interest', m.id, emitToUser, 'interests_modal',
-            'candidatureRelanceClientTitle', 'candidatureRelanceClientBody', { missionTitle: m.title, count: m.n });
-          console.log(`🔔 Relance candidatures (notification) — mission ${m.id} (#${m.candidature_relance_count + 1}, ${m.n} candidature(s))`);
+            'candidatureRelanceClientTitle', 'candidatureRelanceClientBody', { missionTitle: m.title, count: n },
+            null, m.scheduled_at);
+          console.log(`🔔 Relance candidatures (notification) — mission ${m.id} (#${m.candidature_relance_count + 1}, ${n} candidature(s))`);
         }
       }
     } catch (e) {

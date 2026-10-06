@@ -1819,6 +1819,7 @@ const {
   first_mission_free_enabled,
   presence_confirmation_deadline_minutes_h45,
   password_reset_token_expiry_hours,
+  quiet_hours_start, quiet_hours_end,
   // Anti-fraude (routes/antiFraud.js) — voir config/settingsDefaults.js pour le détail ligne à ligne
   fraud_oeil_cancel_lookback_days, fraud_oeil_nomedia_lookback_days,
   fraud_oeil_too_fast_lookback_days, fraud_oeil_too_fast_seconds,
@@ -1867,6 +1868,7 @@ const {
     first_mission_free_enabled,
     presence_confirmation_deadline_minutes_h45,
     password_reset_token_expiry_hours,
+    quiet_hours_start, quiet_hours_end,
     fraud_oeil_cancel_lookback_days, fraud_oeil_nomedia_lookback_days,
     fraud_oeil_too_fast_lookback_days, fraud_oeil_too_fast_seconds,
     fraud_rating_spike_window_hours,
@@ -1923,6 +1925,23 @@ const {
     if (Number.isFinite(effValidation) && Number.isFinite(effReminder) && effReminder >= effValidation) {
       return res.status(400).json({
         error: `Configuration incohérente : le rappel intermédiaire de validation (client_validation_reminder_hours = ${effReminder}h) doit être strictement inférieur au délai d'auto-validation (client_validation_hours = ${effValidation}h). Sans cet écart, le rappel « à mi-parcours » serait envoyé après l'auto-validation de la mission — il perdrait tout son sens et cesserait même d'être déclenché.`
+      })
+    }
+  }
+
+  // Audit notifications (décision BOSS, 2026-10-06, point 1) : l'alerte « mission sans Œil » part
+  // après stale_mission_hours ; elle ne doit pas partir avant le délai de préavis minimal
+  // stale_mission_min_lead_hours. Même garde que C3 : valeur absente du corps → valeur en base.
+  if (stale_mission_hours !== undefined || stale_mission_min_lead_hours !== undefined) {
+    const { rows: curRows } = await db.query(
+      `SELECT key, value FROM settings WHERE key IN ('stale_mission_hours', 'stale_mission_min_lead_hours')`
+    )
+    const cur = Object.fromEntries(curRows.map(r => [r.key, r.value]))
+    const effHours = Number(stale_mission_hours ?? cur.stale_mission_hours ?? SETTINGS_DEFAULTS.stale_mission_hours)
+    const effLead = Number(stale_mission_min_lead_hours ?? cur.stale_mission_min_lead_hours ?? SETTINGS_DEFAULTS.stale_mission_min_lead_hours)
+    if (Number.isFinite(effHours) && Number.isFinite(effLead) && effHours < effLead) {
+      return res.status(400).json({
+        error: `Configuration incohérente : le délai d'alerte « mission sans Œil » (stale_mission_hours = ${effHours}h) doit être supérieur ou égal au délai de préavis minimal (stale_mission_min_lead_hours = ${effLead}h).`
       })
     }
   }

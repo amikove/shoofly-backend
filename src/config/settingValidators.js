@@ -88,8 +88,14 @@ const SETTING_RULES = {
   transfer_cooldown_hours:                     { min: 0 }, // missions.js:2694  NOW() + INTERVAL '1 hour' * $2
   transfer_cooldown_before_hours:              { min: 0 }, // index.js:845, missions.js:2701
   abandon_during_mission_cooldown_hours:       { min: 0 }, // missions.js:3611
-  stale_mission_hours:                         { min: 0 }, // index.js:1518  INTERVAL '1 hour' * $1
-  stale_mission_min_lead_hours:                { min: 0 }, // index.js:1519  INTERVAL '1 hour' * $2
+  // Audit notifications (BOSS, 2026-10-06) : plancher 6 h — en dessous, l'alerte « sans Œil »
+  // devient un bruit admin (mission pas encore assez ancienne pour qu'un Œil ait pu répondre).
+  stale_mission_hours:                         { min: 6 }, // jobs/staleMissions.js  INTERVAL '1 hour' * $1 ; garde croisée route PUT
+  stale_mission_min_lead_hours:                { min: 0 }, // jobs/staleMissions.js  INTERVAL '1 hour' * $2
+  // Plage de silence des notifications non urgentes (heure de Casablanca, 0-23). début = fin
+  // désactive la plage.
+  quiet_hours_start:                           { min: 0, max: 23, integer: true }, // utils/quietHours.js
+  quiet_hours_end:                             { min: 0, max: 23, integer: true }, // utils/quietHours.js
   pending_mission_expiration_hours:            { min: 0 }, // index.js cronPendingMissionExpiration  INTERVAL '1 hour' * $n
   mission_overdue_verification_hours:          { min: 0 }, // index.js:925
   late_start_alert_window_minutes:             { min: 0 }, // index.js:726/779  INTERVAL '1 minute' * $n
