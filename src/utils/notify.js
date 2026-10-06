@@ -1,5 +1,6 @@
 const push = require('../services/push');
 const notifI18n = require('../i18n');
+const { deferDeliveryAt } = require('./quietHours');
 
 // action_type dont le deep-link dépend du rôle du destinataire (chemin /oeil/... vs
 // /client/...) — seuls ceux-ci (ou une notification traduisible, voir la langue plus bas)
@@ -104,4 +105,22 @@ async function notify(db, userId, title, body, type = 'info', missionId = null, 
   return row;
 }
 
-module.exports = { notify };
+// ── Notification NON urgente — respecte la plage de silence (utils/quietHours.js) ─────────────
+// Même signature que notify() + `missionScheduledAt` (exception « mission dans moins de fin de
+// plage + 3 h » → envoi immédiat). Hors plage : notify() direct. Pendant la plage : la notification
+// est écrite dans deferred_notifications (table en base, donc survit à un redémarrage) et envoyée
+// par jobs/deferredNotifications.js à la fin de la plage. Ne jamais l'utiliser pour une échéance
+// (cascade, présence, retard, paiement, ticket urgent) : celles-là restent sur notify().
+async function notifyDifferable(db, userId, title, body, type = 'info', missionId = null, emitToUser = null, actionType = null, titleKey = null, bodyKey = null, params = null, pushOptions = null, missionScheduledAt = null) {
+  const deliverAt = await deferDeliveryAt(db, new Date(), missionScheduledAt);
+  if (!deliverAt) return notify(db, userId, title, body, type, missionId, emitToUser, actionType, titleKey, bodyKey, params, pushOptions);
+  // emitToUser n'est pas sérialisable : il est repris à l'envoi différé (le socket n'existe qu'au
+  // moment de l'envoi, pas au moment de la mise en file).
+  await db.query(
+    `INSERT INTO deferred_notifications (deliver_at, payload) VALUES ($1, $2)`,
+    [deliverAt, JSON.stringify({ userId, title, body, type, missionId, actionType, titleKey, bodyKey, params, pushOptions })]
+  );
+  return null;
+}
+
+module.exports = { notify, notifyDifferable };

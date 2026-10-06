@@ -26,6 +26,7 @@ const {
 const { resolveMapsLink, MapsLinkError } = require('../utils/mapsLink');
 const { getSubcategoryMinPrice, loadSubcategoryMinPricesMap } = require('../utils/subcategoryMinPrices');
 const { checkOeilAssignable, checkOeilsAssignableBulk, getScheduleConflictSetBulk } = require('../utils/oeilAssignment');
+const { listCandidateRows, keepClientVisible, listClientVisibleCandidates } = require('../utils/candidates');
 const {
   checkCashCommissionBalance, settleCashCommission, notifyShortfallAdmins, notifyFirstMissionFreeOeil,
   requiredCashBalance, cashBalanceShortSet, cashBalanceCoverFilter, OEIL_UNAVAILABLE_CODE, OEIL_UNAVAILABLE_MESSAGE,
@@ -38,7 +39,7 @@ const { parsePagination } = require('../utils/pagination');
 // notify() — point d'insertion unique in-app + socket live + push (voir utils/notify.js).
 // Extrait ici (il y vivait, dupliqué à l'identique dans routes/tickets.js) sans changer sa
 // signature ni ses appelants ; router.notify = notify plus bas reste l'export lu par index.js.
-const { notify } = require('../utils/notify');
+const { notify, notifyDifferable } = require('../utils/notify');
 const { scheduleClientAppliedRelance } = require('../jobs/whatsappRelances');
 
 
@@ -564,87 +565,6 @@ async function insertMissionRecord(db, clientId, insertData, freePromo) {
   return mission;
 }
 
-// ── Réutilisable : vague WhatsApp pour une mission — déclenchée une 1ère fois par
-// checkNewMissionWhatsappWave (cron, plus bas) après new_mission_whatsapp_delay_hours sans
-// aucune candidature reçue, PUIS par le cron de vagues suivantes (index.js) tant que le pool
-// n'est pas épuisé. Contacte au plus urgent_mission_whatsapp_batch_size Œils éligibles
-// (disponibles, vérifiés, même ville que la mission) PAS ENCORE contactés pour cette mission
-// précise (table dédiée mission_whatsapp_contacts — anti-doublon), classés reliability_score
-// DESC, rating_avg DESC (même principe que advanceCandidateCascade, sans réutiliser
-// mission_interests : ici personne n'a encore postulé, c'est le pool des Œils disponibles de la
-// ville, pas des candidats).
-// Programme la vague suivante (missions.urgent_whatsapp_next_wave_at) si le pool n'est pas
-// épuisé ; sinon laisse le champ à NULL — l'alerte admin "mission sans Œil depuis 12h" déjà
-// existante (index.js, cronStaleMissionsRunning) prend le relais, aucune nouvelle logique de
-// repli à construire ici (garde-fou explicite de la spec).
-// Audit santé technique 2026-09-18, §3.7 : nom de fonction/colonnes conservés tels quels
-// (infrastructure de vagues réutilisée, pas dupliquée) malgré l'usage désormais élargi aux
-// missions NON urgentes — plus de distinction produit trouvée entre les deux (urgency_fee,
-// seul réglage qui aurait pu en dépendre, est seedé mais jamais lu nulle part dans le code).
-async function sendUrgentWhatsAppWave(db, mission, emitToUser = null) {
-  const batchSize = await getSetting(db, 'urgent_mission_whatsapp_batch_size', 10);
-  const delayMinutes = await getSetting(db, 'urgent_mission_whatsapp_batch_delay_minutes', 30);
-
-  const { rows: pool } = await db.query(
-    `SELECT u.id FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-     WHERE u.role='oeil' AND u.is_active=true AND u.is_suspended=false AND p.is_verified=true AND p.is_available=true
-       AND u.city=$1
-       AND u.id NOT IN (SELECT oeil_id FROM mission_whatsapp_contacts WHERE mission_id=$2)
-     ORDER BY u.reliability_score DESC, p.rating_avg DESC
-     LIMIT $3`,
-    [mission.city, mission.id, batchSize]
-  );
-
-  // Sollicitation en parallèle de tout le pool (audit santé technique 2026-09-18, §3.7 — même
-  // correctif que notifyNewMission/advanceCandidateCascade ci-dessous) : chaque Œil du pool est
-  // indépendant des autres (rien ne dépend de l'ordre), Promise.all remplace le for...await
-  // séquentiel qui faisait grandir la durée de cette vague avec sa taille (jusqu'à
-  // urgent_mission_whatsapp_batch_size × ~10s de timeout WhatsApp dans le pire cas).
-  await Promise.all(pool.map(async (o) => {
-    await db.query(
-      `INSERT INTO mission_whatsapp_contacts (mission_id, oeil_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-      [mission.id, o.id]
-    );
-    // Chantier 2 (2026-09-26, décision A) : le WhatsApp de la vague est retiré — la vague reste
-    // (même pool, mêmes lots, même anti-doublon mission_whatsapp_contacts, noms conservés) et ne
-    // passe plus que par la notification in-app + push ci-dessous.
-    // Chantier notifications (2026-09-14), Partie A/C14 : en complément du WhatsApp ci-dessus
-    // (100% mort tant que G5 n'est pas résolu, voir waselTemplates.js), jamais à sa place — c'est
-    // le seul filet IA+push pour ce pool précis (Œils pas encore candidats, aucun autre chemin ne
-    // les touche). Inconditionnel (même Œil sans téléphone y compris) : notify() ne dépend pas du
-    // téléphone, contrairement à WhatsApp. Titre conditionné sur is_urgent (audit santé technique
-    // 2026-09-18) : cette vague se déclenche désormais aussi pour des missions NON urgentes
-    // (relance différée), le cadrage "urgente" serait trompeur pour ce sous-ensemble. Seul le
-    // canal in-app/push est ajustable ici : le template WhatsApp Meta lui-même (approuvé sous le
-    // nom "nouvelle_mission_urgente") reste figé tel quel, signalé au rapport de session.
-    await notify(db, o.id,
-      mission.is_urgent ? '🚨 Mission urgente disponible' : '📋 Mission disponible',
-      `${mission.title} — ${mission.city} · ${mission.price} MAD`, 'mission', mission.id, emitToUser, null,
-      mission.is_urgent ? 'urgentWaveOeilTitle' : 'missionAvailableOeilTitle', 'urgentWaveOeilBody',
-      { missionTitle: mission.title, city: mission.city, price: mission.price });
-  }));
-
-  // Reste-t-il des Œils éligibles non encore contactés ? Si oui, vague suivante programmée ;
-  // sinon pool épuisé, on ne programme rien de plus (voir garde-fou ci-dessus).
-  const { rows: [{ n: remaining }] } = await db.query(
-    `SELECT COUNT(*)::int AS n FROM users u JOIN oeil_profiles p ON p.user_id=u.id
-     WHERE u.role='oeil' AND u.is_active=true AND u.is_suspended=false AND p.is_verified=true AND p.is_available=true
-       AND u.city=$1
-       AND u.id NOT IN (SELECT oeil_id FROM mission_whatsapp_contacts WHERE mission_id=$2)`,
-    [mission.city, mission.id]
-  );
-
-  // Garde oeil_id IS NULL : évite d'écraser/reprogrammer une vague sur une mission qui vient
-  // d'être assignée par un autre chemin pendant l'envoi de cette vague (même esprit que la
-  // garde optimiste WHERE status='pending' AND oeil_id IS NULL d'advanceCandidateCascade).
-  await db.query(
-    `UPDATE missions SET urgent_whatsapp_next_wave_at=$1 WHERE id=$2 AND oeil_id IS NULL`,
-    [remaining > 0 ? new Date(Date.now() + delayMinutes * 60 * 1000) : null, mission.id]
-  );
-
-  return pool.length;
-}
-
 // ── Réutilisable : notifications + broadcast admin après création — JAMAIS à l'intérieur
 // d'une transaction. Identique que la mission vienne d'une création directe (POST /missions)
 // ou d'un paiement PayZone confirmé (POST /payments/payzone/callback).
@@ -667,56 +587,68 @@ async function notifyNewMission(db, mission, emitToUser, io) {
        AND u.city=$1`,
     [mission.city]
   );
-  await Promise.all(oeils.map((o) => notify(db, o.id, `Nouvelle mission${mission.is_urgent?' 🚨 URGENTE':''}`,
+  // Mission URGENTE : diffusion immédiate, même la nuit (décision BOSS). Mission non urgente :
+  // plage de silence respectée (notifyDifferable, exception « commence dans moins de fin de plage + 3 h »).
+  const send = mission.is_urgent ? notify : notifyDifferable;
+  await Promise.all(oeils.map((o) => send(db, o.id, `Nouvelle mission${mission.is_urgent?' 🚨 URGENTE':''}`,
     `${mission.title} — ${mission.city} · ${mission.price} MAD`, 'mission', mission.id, emitToUser, null,
     mission.is_urgent ? 'newMissionUrgentTitle' : 'newMissionAvailableTitle', 'newMissionBody',
-    { missionTitle: mission.title, city: mission.city, price: mission.price })));
+    { missionTitle: mission.title, city: mission.city, price: mission.price }, null, mission.scheduled_at)));
   if (io) io.to('room:admin').emit('new_mission', mission);
 }
 
-// ── Cron (index.js) : relance WhatsApp différée pour les missions sans AUCUNE candidature ──
-// Audit santé technique 2026-09-18, §3.7 — nouvelle direction produit : remplace l'ancien envoi
-// WhatsApp immédiat à la création (retiré de notifyNewMission ci-dessus) par une relance
-// déclenchée seulement si le client n'a toujours reçu aucune proposition après
-// new_mission_whatsapp_delay_hours (compté depuis missions.created_at). "Aucune proposition" =
-// aucune ligne mission_interests non refusée pour cette mission — même définition que celle déjà
-// utilisée par advanceCandidateCascade pour tirer son pool de candidats (mi.declined=false),
-// alignée ici plutôt qu'une nouvelle définition inventée (le client attend une candidature, pas
-// nécessairement déjà un Œil embauché).
-// S'applique à TOUTE mission, urgente ou non (voir justification sur sendUrgentWhatsAppWave) :
-// réutilise cette même fonction pour la 1ère vague, qui programme elle-même les vagues suivantes
-// (urgent_whatsapp_next_wave_at) — logique de lots non dupliquée ici.
-async function checkNewMissionWhatsappWave(db, emitToUser) {
+// ── Cron (index.js) : rappel « toujours sans Œil » (audit notifications, D1, BOSS 2026-10-06) ──
+// Remplace l'ancienne vague « 2 h après création » : elle renotifiait les 10 premiers Œils de la
+// ville, dont certains avaient déjà reçu « Nouvelle mission » à la création (doublon). Désormais
+// UN SEUL rappel par mission, envoyé uniquement aux Œils déjà notifiés à la création qui n'ont PAS
+// postulé, après new_mission_whatsapp_delay_hours sans Œil assigné. Plage de silence respectée.
+// Anti-doublon : missions.new_mission_whatsapp_relance_sent_at (colonne historique, sert ici à
+// « déjà rappelé »). Aucun WhatsApp : c'est une notification in-app + push.
+async function checkUnfilledMissionReminder(db, emitToUser) {
   const delayHours = await getSetting(db, 'new_mission_whatsapp_delay_hours', 2);
   const { rows: dueMissions } = await db.query(`
     SELECT * FROM missions
-    WHERE status='pending' AND oeil_id IS NULL
+    WHERE status = 'pending' AND oeil_id IS NULL
       AND created_at <= NOW() - INTERVAL '1 hour' * $1::numeric
       AND new_mission_whatsapp_relance_sent_at IS NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM mission_interests mi WHERE mi.mission_id = missions.id AND mi.declined = false
-      )
   `, [delayHours]);
 
   for (const mission of dueMissions) {
-    // Isolation par itération (O-BE-2) : un crash sur CETTE mission (vague WhatsApp) ne doit
-    // jamais abandonner le reste du lot — même granularité que les autres crons de ce fichier.
+    // Isolation par itération (O-BE-2).
     try {
-      // Garde d'idempotence AVANT l'envoi (même patron que checkPendingMissionExpiration) : si
-      // deux ticks se chevauchaient, un seul gagne la course et déclenche la vague.
+      // Garde d'idempotence AVANT l'envoi : si deux ticks se chevauchent, un seul rappelle.
       const { rowCount } = await db.query(
         `UPDATE missions SET new_mission_whatsapp_relance_sent_at=NOW() WHERE id=$1 AND new_mission_whatsapp_relance_sent_at IS NULL`,
         [mission.id]
       );
-      if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
+      if (rowCount === 0) continue;
 
-      const sent = await sendUrgentWhatsAppWave(db, mission, emitToUser);
-      console.log(`📲 Relance WhatsApp différée — mission ${mission.id} (${sent} Œil(s) contacté(s), toujours sans candidature après ${delayHours}h)`);
+      // Destinataires : les Œils notifiés à la création de la mission, qui n'ont pas postulé.
+      const { rows: recipients } = await db.query(`
+        SELECT DISTINCT n.user_id AS id FROM notifications n
+        WHERE n.mission_id = $1
+          AND n.title_key IN ('newMissionUrgentTitle', 'newMissionAvailableTitle')
+          AND NOT EXISTS (
+            SELECT 1 FROM mission_interests mi WHERE mi.mission_id = $1 AND mi.oeil_id = n.user_id
+          )
+      `, [mission.id]);
+
+      for (const o of recipients) {
+        await notifyDifferable(
+          db, o.id,
+          `Toujours sans Œil : « ${mission.title} »`,
+          `Cette mission est toujours ouverte et aucun Œil ne l'a encore choisie. Postulez si elle vous intéresse.`,
+          'mission', mission.id, emitToUser, 'mission_view',
+          'missionStillUnfilledOeilTitle', 'missionStillUnfilledOeilBody', { missionTitle: mission.title },
+          null, mission.scheduled_at
+        );
+      }
+      console.log(`🔔 Rappel « toujours sans Œil » — mission ${mission.id} (${recipients.length} Œil(s) notifié(s), sans candidature)`);
     } catch (e) {
-      console.error(`❌ checkNewMissionWhatsappWave: mission ${mission.id} :`, e.message);
+      console.error(`❌ Rappel « toujours sans Œil » mission ${mission.id} :`, e.message);
       Sentry.captureException(e, {
         level: 'error',
-        tags: { area: 'new_mission_whatsapp_wave' },
+        tags: { area: 'unfilled_mission_reminder' },
         extra: { missionId: mission.id },
       });
     }
@@ -2252,18 +2184,9 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
     await db.query('UPDATE missions SET client_interests_viewed_at = NOW() WHERE id = $1', [mission.id]);
   }
 
-  const { rows } = await db.query(
-      `SELECT u.id, u.first_name, u.last_name, u.city, u.avatar_url,
-              p.rating_avg, p.rating_count, p.total_missions, p.bio, p.coverage_zone,
-              mi.message, mi.created_at as interested_at
-       FROM mission_interests mi
-       JOIN users u ON u.id = mi.oeil_id
-       LEFT JOIN oeil_profiles p ON p.user_id = mi.oeil_id
-       WHERE mi.mission_id = $1
-          AND mi.oeil_id IS DISTINCT FROM $2
-        ORDER BY mi.created_at ASC`,
-        [req.params.id, mission.transferred_from]
-      );
+  // Définition unique des candidatures visibles (utils/candidates.js) : le client voit les
+  // candidatures non déclinées et éligibles ; l'admin voit tout, déclinées comprises.
+  const rows = await listCandidateRows(db, mission, { includeDeclined: req.user.role !== 'client' });
 
     // Masquage strict côté client : une candidature dont l'Œil échoue une des 5
     // vérifications de checkOeilAssignable (vérifié/disponible/suspendu-bloqué/conflit de
@@ -2273,14 +2196,7 @@ router.get('/:id/interests', authenticate, asyncHandler(async (req, res) => {
     // blocage est une information interne de fiabilité, non communicable au client, même via
     // un onglet réseau). L'admin, qui peut aussi consulter cette liste, garde la liste complète
     // et non filtrée — cet écran n'est pas celui visé par la règle badge/override (assign-admin).
-    let visibleRows = rows;
-    if (req.user.role === 'client') {
-      const eligibility = await checkOeilsAssignableBulk(db, rows.map(o => o.id), {
-        scheduledAt: mission.scheduled_at,
-        excludeMissionId: mission.id,
-      });
-      visibleRows = rows.filter(o => eligibility[o.id]?.ok === true);
-    }
+    const visibleRows = req.user.role === 'client' ? await keepClientVisible(db, rows, mission) : rows;
 
     // Le client voit des tiers (Œils candidats) : masque la note d'un débutant
     // (< 10 missions) pour ne pas afficher un signal peu significatif.
@@ -2520,9 +2436,10 @@ router.post('/:id/status', authenticate, [
 
     // PROMPT 2 — première demande de photo (sans visage) de la fenêtre qui vient de s'ouvrir
     // (activity_photo_next_due_at posé ci-dessus).
+    const photoMinutes = await getSetting(db, 'activity_photo_interval_minutes', 45);
     await notify(db, updated.oeil_id, '📸 Photo de suivi requise',
-      "Merci d'envoyer une photo dans la messagerie de la mission toutes les 45 minutes pendant son déroulement (aucun visage ne doit apparaître sur la photo).",
-      'mission', updated.id, emitToUser, 'mission_view', 'activityPhotoRequestTitle', 'activityPhotoRequestBody', { missionTitle: updated.title });
+      `Merci d'envoyer une photo dans la messagerie de la mission toutes les ${photoMinutes} minutes pendant son déroulement (aucun visage ne doit apparaître sur la photo).`,
+      'mission', updated.id, emitToUser, 'mission_view', 'activityPhotoRequestTitle', 'activityPhotoRequestBody', { missionTitle: updated.title, minutes: photoMinutes });
   }
 
   // Remboursement en cas d'annulation — dépend de QUI est à l'origine de l'annulation,
@@ -2582,7 +2499,9 @@ router.post('/:id/status', authenticate, [
       } else if (refund > 0) {
         await notify(db, mission.client_id, '💰 Remboursement partiel', `${refund} MAD crédités sur votre portefeuille suite à l'annulation.`, 'info', mission.id, emitToUser, null, 'partialRefundTitle', 'partialRefundBody', {amount: refund});
       } else {
-        await notify(db, mission.client_id, 'Mission annulée', `Annulation dans les 2h — aucun remboursement conformément aux CGV.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledNoRefundBody', null);
+        // Seuil de remboursement partiel (utils/refund.js) : en deçà, aucun remboursement.
+        const refundHours = await getSetting(db, 'refund_partial_threshold_hours', 2);
+        await notify(db, mission.client_id, 'Mission annulée', `Annulation dans les ${refundHours} h — aucun remboursement conformément aux CGV.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledNoRefundBody', { hours: refundHours });
       }
       if (mission.oeil_id) {
         await notify(db, mission.oeil_id, 'Mission annulée', `La mission "${mission.title}" a été annulée par le client.`, 'info', mission.id, emitToUser, null, 'missionCancelledByClientTitle', 'missionCancelledByClientBody', {missionTitle: mission.title});
@@ -2631,7 +2550,9 @@ router.post('/:id/status', authenticate, [
       `UPDATE oeil_profiles SET total_missions=total_missions+1 WHERE user_id=$1`,
       [mission.oeil_id]
     );
-    await notify(db, mission.client_id, 'Mission terminée ✅', `"${mission.title}" est terminée. Vous avez 12h pour réclamer si nécessaire.`, 'mission', mission.id, emitToUser, null, 'missionCompletedClientTitle', 'missionCompletedClientBody', {missionTitle: mission.title});
+    // Fenêtre de réclamation = fenêtre d'auto-validation (autoValidateMissions : client_validation_hours).
+    const claimHours = await getSetting(db, 'client_validation_hours', 12);
+    await notify(db, mission.client_id, 'Mission terminée ✅', `"${mission.title}" est terminée. Vous avez ${claimHours} h pour réclamer si nécessaire.`, 'mission', mission.id, emitToUser, null, 'missionCompletedClientTitle', 'missionCompletedClientBody', {missionTitle: mission.title, hours: claimHours});
     await notify(db, mission.oeil_id, 'Mission terminée', `"${mission.title}" marquée comme terminée. Paiement en attente de validation.`, 'mission', mission.id, emitToUser, null, 'missionCompletedOeilTitle', 'missionCompletedOeilBody', {missionTitle: mission.title});
 
     // WhatsApp client « mission terminée » retiré (chantier 2, décision D3 —
@@ -3062,47 +2983,38 @@ router.post('/:id/interest', authenticate, requireRole('oeil'), interestLimiter,
   // nouvelle.
   if (interestInsertCount > 0) {
     const emitToUser = req.app.get('emitToUser');
-    const notifBody = `Un Œil est intéressé par votre mission : ${mission.title}`
-    await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', notifBody, 'interest', req.params.id, emitToUser, 'interests_modal', 'newOeilInterestTitle', 'newOeilInterestBody', {missionTitle: mission.title});
+    // Définition unique des candidatures visibles par le client (utils/candidates.js) : le seuil,
+    // la relance et l'alerte comptent exactement ce que le client voit dans sa liste.
+    const visible = await listClientVisibleCandidates(db, mission);
+    const thisVisible = visible.some((o) => o.id === req.user.id);
+    const seuilCount = await getSetting(db, 'candidature_whatsapp_seuil_count', 3);
 
-    // WhatsApp au client : jamais à chaque candidature individuelle — un seul envoi par
-    // mission, déclenché dès que le nombre de candidatures d'Œils vérifiés atteint
-    // candidature_whatsapp_seuil_count (défaut 3). Ne compte que les Œils avec oeil_profiles.
-    // is_verified=true (audit sécurité post-chantiers, Partie D) : sinon plusieurs comptes
-    // jetables non vérifiés peuvent forcer artificiellement l'envoi. Si ce seuil n'est jamais
-    // atteint, le cron dédié (index.js) envoie après candidature_whatsapp_seuil_minutes depuis
-    // la première candidature vérifiée. Garde atomique (UPDATE ... WHERE candidature_whatsapp_
-    // sent_at IS NULL) pour éviter un double envoi si deux candidatures arrivent presque
-    // simultanément.
-    if (!mission.candidature_whatsapp_sent_at) {
-      const seuilCount = await getSetting(db, 'candidature_whatsapp_seuil_count', 3);
-      const { rows: [{ n: interestCount }] } = await db.query(
-        `SELECT COUNT(*)::int AS n FROM mission_interests mi
-         JOIN oeil_profiles p ON p.user_id = mi.oeil_id AND p.is_verified = true
-         WHERE mi.mission_id=$1`, [req.params.id]
+    // Seuil « des Œils ont postulé » (audit notifications, D2) : la candidature qui franchit le
+    // seuil ne déclenche QUE cette notification, pas « Nouvel Œil intéressé ». Un seul envoi par
+    // mission : garde atomique UPDATE ... WHERE candidature_whatsapp_sent_at IS NULL. La
+    // candidature n'attend jamais Wasel (la relance WhatsApp est programmée, pas envoyée ici).
+    let seuilSent = false;
+    if (!mission.candidature_whatsapp_sent_at && visible.length >= seuilCount) {
+      const { rowCount } = await db.query(
+        `UPDATE missions SET candidature_whatsapp_sent_at=NOW() WHERE id=$1 AND candidature_whatsapp_sent_at IS NULL`,
+        [req.params.id]
       );
-      if (interestCount >= seuilCount) {
-        const { rowCount } = await db.query(
-          `UPDATE missions SET candidature_whatsapp_sent_at=NOW() WHERE id=$1 AND candidature_whatsapp_sent_at IS NULL`,
-          [req.params.id]
+      if (rowCount > 0) {
+        const seuilNotif = await notify(
+          db, mission.client_id,
+          'Des Œils ont postulé 👁️',
+          `Candidatures reçues pour "${mission.title}" : ${visible.length}. Choisissez votre Œil pour confirmer la mission.`,
+          'interest', mission.id, emitToUser, 'interests_modal',
+          'candidatureSeuilClientTitle', 'candidatureSeuilClientBody', { missionTitle: mission.title, count: visible.length }
         );
-        if (rowCount > 0) {
-          // Chantier 2 lot 1 bis (décision BOSS B) : au seuil, notification + push au client. Le
-          // WhatsApp oeil_applied n'est plus qu'une RELANCE, envoyée en arrière-plan par le cron
-          // des relances (jobs/whatsappRelances.js) après candidature_whatsapp_relance_minutes,
-          // seulement si le client n'a ni lu cette notification ni ouvert la liste des candidats.
-          // La garde atomique ci-dessus reste l'anti-doublon du seuil (un par mission) ; la
-          // candidature n'attend jamais Wasel.
-          const seuilNotif = await notify(
-            db, mission.client_id,
-            'Des Œils ont postulé 👁️',
-            `Candidatures reçues pour "${mission.title}" : ${interestCount}. Choisissez votre Œil pour confirmer la mission.`,
-            'interest', mission.id, emitToUser, 'interests_modal',
-            'candidatureSeuilClientTitle', 'candidatureSeuilClientBody', { missionTitle: mission.title, count: interestCount }
-          );
-          await scheduleClientAppliedRelance(db, mission.id, mission.client_id, seuilNotif && seuilNotif.id);
-        }
+        await scheduleClientAppliedRelance(db, mission.id, mission.client_id, seuilNotif && seuilNotif.id);
+        seuilSent = true;
       }
+    }
+
+    // « Nouvel Œil intéressé » seulement pour une candidature que le client voit réellement.
+    if (!seuilSent && thisVisible) {
+      await notify(db, mission.client_id, 'Nouvel Œil intéressé 👁️', `Un Œil est intéressé par votre mission : ${mission.title}`, 'interest', req.params.id, emitToUser, 'interests_modal', 'newOeilInterestTitle', 'newOeilInterestBody', {missionTitle: mission.title});
     }
 
     // Relance la cascade de confirmation par lot si cette mission est en recherche élargie
@@ -5558,13 +5470,14 @@ async function checkPendingMissionExpiration(db, io, emitToUser) {
           [m.id]
         );
         if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
+        const graceHours = await getSetting(db, 'pending_mission_expiration_hours', 24);
         for (const admin of admins) {
           await notify(
             db, admin.id,
             '⏰ Mission jamais assignée, créneau dépassé',
-            `"${m.title}" est toujours sans Œil alors que son créneau prévu est déjà passé. Annulation automatique et remboursement du client si la situation ne change pas d'ici la fin du délai de grâce.`,
+            `"${m.title}" est toujours sans Œil alors que son créneau prévu est déjà passé. Annulation automatique et remboursement du client si la situation ne change pas d'ici ${graceHours} h après le créneau.`,
             'warning', m.id, emitToUser, 'admin_missions',
-            'pendingExpiredAdminTitle', 'pendingExpiredAdminBody', { missionTitle: m.title }
+            'pendingExpiredAdminTitle', 'pendingExpiredAdminBody', { missionTitle: m.title, hours: graceHours }
           );
         }
       } catch (e) { console.error(`❌ checkPendingMissionExpiration: alerte mission ${m.id} :`, e.message); }
@@ -5634,7 +5547,7 @@ async function checkPendingMissionExpiration(db, io, emitToUser) {
           ? `Aucun Œil n'a été trouvé pour "${updated.title}" et le créneau prévu est dépassé depuis plus de ${pendingMissionExpirationHours}h. La mission a été annulée automatiquement et ${refund} MAD ont été recrédités sur votre portefeuille.`
           : `Aucun Œil n'a été trouvé pour "${updated.title}" et le créneau prévu est dépassé depuis plus de ${pendingMissionExpirationHours}h. La mission a été annulée automatiquement.`,
         'info', updated.id, emitToUser, null,
-        'pendingExpiredCancelledClientTitle', 'pendingExpiredCancelledClientBody', { missionTitle: updated.title, refund }
+        'pendingExpiredCancelledClientTitle', refund > 0 ? 'pendingExpiredCancelledClientRefundBody' : 'pendingExpiredCancelledClientBody', { missionTitle: updated.title, refund, hours: pendingMissionExpirationHours }
       );
       for (const s of solicited) {
         await notify(db, s.oeil_id, 'Mission annulée',
@@ -5656,7 +5569,8 @@ router.checkTransferDeadlines = checkTransferDeadlines;
 router.checkMissionEditRequestExpiry = checkMissionEditRequestExpiry;
 router.checkAssistanceRequestExpiry = checkAssistanceRequestExpiry;
 router.checkPendingMissionExpiration = checkPendingMissionExpiration;
-router.checkNewMissionWhatsappWave = checkNewMissionWhatsappWave;
+router.checkUnfilledMissionReminder = checkUnfilledMissionReminder;
+router.notifyNewMission = notifyNewMission;
 router.checkPresenceConfirmationDeadlines = checkPresenceConfirmationDeadlines;
 router.checkActivityPhotoDeadlines = checkActivityPhotoDeadlines;
 router.hireOeilCore = hireOeilCore;
@@ -5671,7 +5585,6 @@ router.pricing = pricing;
 router.prepareMissionInsert = prepareMissionInsert;
 router.insertMissionRecord = insertMissionRecord;
 router.notifyNewMission = notifyNewMission;
-router.sendUrgentWhatsAppWave = sendUrgentWhatsAppWave;
 router.missionCreateValidators = missionCreateValidators;
 router.missionCreateLimiter = missionCreateLimiter;
 router.detectSensitiveContent = detectSensitiveContent;

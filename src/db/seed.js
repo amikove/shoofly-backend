@@ -4,13 +4,15 @@ require('dotenv').config();
 const bcrypt = require('@node-rs/bcrypt');
 const { v4: uuidv4 } = require('uuid');
 const { initDb, getDb } = require('./schema');
+const { seedGuardError } = require('./seedGuard');
 
 async function seed() {
   // Garde de sécurité : ce script TRUNCATE toutes les tables et recrée des comptes
   // avec des mots de passe triviaux — ne doit JAMAIS tourner en production.
-  if (process.env.NODE_ENV === 'production') {
-    console.log('⛔ Seed bloqué : NODE_ENV=production, ce script ne doit pas s\'exécuter en prod.');
-    process.exit(0);
+  const refusal = seedGuardError(process.env, process.env.DATABASE_URL);
+  if (refusal) {
+    console.log(`⛔ ${refusal}`);
+    process.exit(1);
   }
 
   await initDb();

@@ -1747,6 +1747,17 @@ CREATE TABLE IF NOT EXISTS identity_documents (
     -- Relance « des Œils ont postulé » : le client a ouvert la liste des candidats (GET
     -- /missions/:id/interests appelé par le client lui-même — seul appelant : InterestsModal).
     ALTER TABLE missions ADD COLUMN IF NOT EXISTS client_interests_viewed_at TIMESTAMPTZ;
+    -- deferred_notifications (audit notifications, 2026-10-06, point 6) : file des notifications
+    -- NON urgentes reportées par la plage de silence (utils/notify.js notifyDifferable, envoi par
+    -- jobs/deferredNotifications.js). Table en base : survit à un redémarrage du serveur.
+    CREATE TABLE IF NOT EXISTS deferred_notifications (
+      id          BIGSERIAL PRIMARY KEY,
+      deliver_at  TIMESTAMPTZ NOT NULL,
+      payload     JSONB NOT NULL,
+      claimed_at  TIMESTAMPTZ,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_deferred_notifications_due ON deferred_notifications (deliver_at);
     -- whatsapp_relances : un WhatsApp de RELANCE programmé (jobs/whatsappRelances.js). Une ligne
     -- par (mission, étape, destinataire) — index UNIQUE ci-dessous : jamais deux relances pour la
     -- même étape d'une mission et le même Œil (ou client), quel que soit le nombre de processus ;

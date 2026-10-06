@@ -48,6 +48,9 @@ const { runWhatsAppRetry } = require('./jobs/whatsappRetry');
 const { runWalletReconciliation } = require('./jobs/walletReconciliation');
 const { runCashplusExpiry } = require('./jobs/cashplusExpiry');
 const { runCandidatureRelance } = require('./jobs/candidatureRelance');
+const { runStaleMissions } = require('./jobs/staleMissions');
+const { runDeferredNotifications } = require('./jobs/deferredNotifications');
+const { listClientVisibleCandidates } = require('./utils/candidates');
 const { runUnreadWhatsappEmailFallback } = require('./jobs/unreadWhatsappEmailFallback');
 const { runWhatsappRelances, schedulePresenceRelance, scheduleClientAppliedRelance } = require('./jobs/whatsappRelances');
 const { sendWhatsAppTemplate } = require('./services/wasel');
@@ -68,14 +71,13 @@ const checkTransferDeadlines = missionRoutesModule.checkTransferDeadlines;
 const checkMissionEditRequestExpiry = missionRoutesModule.checkMissionEditRequestExpiry;
 const checkAssistanceRequestExpiry = missionRoutesModule.checkAssistanceRequestExpiry;
 const checkPendingMissionExpiration = missionRoutesModule.checkPendingMissionExpiration;
-const checkNewMissionWhatsappWave = missionRoutesModule.checkNewMissionWhatsappWave;
+const checkUnfilledMissionReminder = missionRoutesModule.checkUnfilledMissionReminder;
 const checkPresenceConfirmationDeadlines = missionRoutesModule.checkPresenceConfirmationDeadlines;
 const checkActivityPhotoDeadlines = missionRoutesModule.checkActivityPhotoDeadlines;
 const advanceCandidateCascade = missionRoutesModule.advanceCandidateCascade;
 const hireOeilCore = missionRoutesModule.hireOeilCore;
 const notify = missionRoutesModule.notify;
 const detectSensitiveContent = missionRoutesModule.detectSensitiveContent;
-const sendUrgentWhatsAppWave = missionRoutesModule.sendUrgentWhatsAppWave;
 const mediaRoutes   = require('./routes/media');
 const userRoutes    = require('./routes/users');
 const reportRoutes = require('./routes/reports');
@@ -557,7 +559,7 @@ initDb().then(() => {
   let cronCandidateWindowRunning = false;
   let cronTicketAutoResolveRunning = false;
   let cronPresenceConfirmationRunning = false;
-  let cronUrgentWhatsAppWaveRunning = false;
+  let cronDeferredNotificationsRunning = false;
   let cronCandidatureWhatsAppRunning = false;
   let cronWhatsappRetryRunning = false;
   let cronWalletReconciliationRunning = false;
@@ -626,7 +628,7 @@ initDb().then(() => {
         const j1Notif = await notify(
           db, m.oeil_id,
           '✅ Confirmez votre présence — mission demain',
-          `Confirmez votre présence pour "${m.title}" prévue demain à ${missionTime}. Vous avez jusqu'à ${deadlineTime} ce soir pour confirmer, sinon nous chercherons un remplaçant.`,
+          `Confirmez votre présence pour "${m.title}" prévue demain à ${missionTime}. Vous devez confirmer avant ${deadlineTime}, sinon nous chercherons un remplaçant.`,
           'warning', m.id, emitToUser, 'mission_view',
           'presenceConfirmationRequestJ1Title', 'presenceConfirmationRequestJ1Body',
           { missionTitle: m.title, time: missionTime, deadlineTime }
@@ -1044,10 +1046,10 @@ initDb().then(() => {
           await notify(
             db, admin.id,
             '🔍 Mission à vérifier',
-            `La mission "${m.title}" de ${m.first_name} ${m.last_name} est en cours depuis plus de 24h. Vérification requise.`,
+            `La mission "${m.title}" de ${m.first_name} ${m.last_name} dont l'heure prévue est dépassée de plus de ${overdueVerificationHours} h. Vérification requise.`,
             'warning', m.id, emitToUser, 'admin_missions',
             'missionToVerifyAdminTitle', 'missionToVerifyAdminBody',
-            { missionTitle: m.title, oeilName: `${m.first_name} ${m.last_name}` }
+            { missionTitle: m.title, oeilName: `${m.first_name} ${m.last_name}`, hours: overdueVerificationHours }
           );
         }
         console.log(`🔍 Alerte mission expirée ${m.id}`);
@@ -1127,10 +1129,10 @@ initDb().then(() => {
         const h2Notif = await notify(
           db, m.oeil_id,
           '✅ Confirmez votre présence — mission bientôt',
-          `Confirmez votre présence pour "${m.title}" prévue dans ~2 heures. Vous avez jusqu'à ${deadlineTime} pour confirmer, sinon nous chercherons un remplaçant en urgence.`,
+          `Confirmez votre présence pour "${m.title}" prévue dans environ ${reminderEarlyMinutes} minutes. Vous devez confirmer avant ${deadlineTime}, sinon nous chercherons un remplaçant en urgence.`,
           'warning', m.id, emitToUser, 'mission_view',
           'presenceConfirmationRequestSamedayTitle', 'presenceConfirmationRequestSamedayBody',
-          { missionTitle: m.title, deadlineTime }
+          { missionTitle: m.title, deadlineTime, minutes: reminderEarlyMinutes }
         );
         // WhatsApp Œil : RELANCE seulement (chantier 2 lot 1 bis) — après
         // presence_whatsapp_relance_h2_minutes si toujours non confirmée (jobs/whatsappRelances.js).
@@ -1493,45 +1495,6 @@ initDb().then(() => {
     finally { cronCandidateWindowRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
-  // ── Cron toutes les 5 min — Vagues WhatsApp suivantes ─────
-  // Cadence alignée sur checkTransferDeadlines/checkMissionEditRequestExpiry/
-  // checkPresenceConfirmationDeadlines ci-dessus (vérifications de deadline sur des fenêtres de
-  // dizaines de minutes à quelques heures) — pas la cadence 2min de la cascade candidat
-  // ci-dessus, réservée à ses propres fenêtres plus courtes (candidate_confirmation_minutes,
-  // candidate_tiebreak_window_minutes). urgent_whatsapp_next_wave_at est posé par
-  // sendUrgentWhatsAppWave (routes/missions.js) : NULL tant qu'aucune vague n'est en attente
-  // (aucune vague encore déclenchée, mission déjà assignée, ou pool d'Œils éligibles épuisé — dans
-  // ce dernier cas l'alerte admin "mission sans Œil depuis 12h" ci-dessous prend le relais).
-  // Audit santé technique 2026-09-18, §3.7 : le filtre is_urgent=true a été retiré — la 1ère
-  // vague est désormais déclenchée par checkNewMissionWhatsappWave (relance différée, plus bas)
-  // pour TOUTE mission sans candidature, plus seulement les urgentes à la création. Le sentinel
-  // urgent_whatsapp_next_wave_at (posé uniquement par sendUrgentWhatsAppWave) est déjà une
-  // condition suffisante à lui seul — is_urgent=true excluait à tort les vagues suivantes des
-  // missions non urgentes désormais entrées dans ce mécanisme.
-  cron.schedule('1-59/5 * * * *', async () => {
-    if (cronUrgentWhatsAppWaveRunning) { console.warn('⏭️ Cron vagues WhatsApp suivantes déjà en cours, tick ignoré'); return; }
-    cronUrgentWhatsAppWaveRunning = true;
-    try {
-      const db = getDb();
-      const emitToUser = app.get('emitToUser');
-      const { rows: dueMissions } = await db.query(`
-        SELECT * FROM missions
-        WHERE oeil_id IS NULL
-          AND urgent_whatsapp_next_wave_at IS NOT NULL AND urgent_whatsapp_next_wave_at <= NOW()
-      `);
-      for (const mission of dueMissions) {
-        // Isolation par itération (RG9) — trouvée pendant l'analyse, hors liste initiale de
-        // l'audit, même classe de défaut que les 12 boucles listées : sendUrgentWhatsAppWave
-        // qui lève sur une mission abandonnait les vagues des missions suivantes du tick.
-        try {
-        const sent = await sendUrgentWhatsAppWave(db, mission, emitToUser);
-        console.log(`📲 Vague WhatsApp mission ${mission.id} — ${sent} Œil(s) contacté(s)`);
-        } catch (e) { console.error(`❌ Cron vagues WhatsApp suivantes — mission ${mission.id} :`, e.message); }
-      }
-    } catch (e) { console.error('❌ Cron vagues WhatsApp suivantes error:', e.message); }
-    finally { cronUrgentWhatsAppWaveRunning = false; }
-  }, { timezone: 'Africa/Casablanca' });
-
   // ── Cron toutes les 15 min — Relance WhatsApp différée (missions sans candidature) ──
   // Audit santé technique 2026-09-18, §3.7 : remplace l'ancien envoi WhatsApp immédiat à la
   // création. Logique dans checkNewMissionWhatsappWave (routes/missions.js, même convention que
@@ -1546,64 +1509,58 @@ initDb().then(() => {
     try {
       const db = getDb();
       const emitToUser = app.get('emitToUser');
-      await checkNewMissionWhatsappWave(db, emitToUser);
+      await checkUnfilledMissionReminder(db, emitToUser);
     } catch (e) { console.error('❌ Cron relance WhatsApp différée error:', e.message); }
     finally { cronNewMissionWhatsappWaveRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
-  // ── Cron toutes les 5 min — Seuil WhatsApp candidatures (repli délai) ────
-  // Complète le déclencheur synchrone par nombre de candidatures (POST /:id/interest,
-  // routes/missions.js) : si une mission n'atteint jamais candidature_whatsapp_seuil_count
-  // candidatures vérifiées, ce cron envoie quand même le WhatsApp au client après
-  // candidature_whatsapp_seuil_minutes depuis sa toute première candidature d'un Œil vérifié —
-  // à condition qu'il y en ait eu au moins une (JOIN oeil_profiles ... is_verified=true, audit
-  // sécurité post-chantiers Partie D). Un seul envoi total par mission, garanti par le même
-  // champ de suivi que le déclencheur synchrone (missions.candidature_whatsapp_sent_at, garde
-  // atomique WHERE ... IS NULL). Exclut les missions déjà résolues (status != 'pending')
-  // — inutile d'alerter le client sur des candidatures d'une mission déjà assignée/annulée.
+  // ── Cron toutes les 5 min — Seuil « des Œils ont postulé » (repli délai) ────
+  // Complète le déclencheur synchrone (POST /:id/interest, routes/missions.js) : si une mission
+  // n'atteint jamais candidature_whatsapp_seuil_count candidatures visibles, ce cron déclenche
+  // après candidature_whatsapp_seuil_minutes depuis la première candidature VISIBLE par le client
+  // (utils/candidates.js, définition unique). Une seule fois par mission (garde
+  // candidature_whatsapp_sent_at). Missions résolues exclues.
   cron.schedule('2-59/5 * * * *', async () => {
-    if (cronCandidatureWhatsAppRunning) { console.warn('⏭️ Cron seuil WhatsApp candidatures déjà en cours, tick ignoré'); return; }
+    if (cronCandidatureWhatsAppRunning) { console.warn('⏭️ Cron seuil candidatures déjà en cours, tick ignoré'); return; }
     cronCandidatureWhatsAppRunning = true;
     try {
       const db = getDb();
+      const emitToUser = app.get('emitToUser');
       const seuilMinutes = await getSetting(db, 'candidature_whatsapp_seuil_minutes', 60);
-      const { rows: dueMissions } = await db.query(`
-        SELECT m.id, m.title, m.client_id, COUNT(mi.id)::int AS n
-        FROM missions m
-        JOIN mission_interests mi ON mi.mission_id = m.id
-        JOIN oeil_profiles p ON p.user_id = mi.oeil_id AND p.is_verified = true
+      const { rows: candidates } = await db.query(`
+        SELECT m.* FROM missions m
         WHERE m.status = 'pending' AND m.candidature_whatsapp_sent_at IS NULL
-        GROUP BY m.id, m.title, m.client_id
-        HAVING MIN(mi.created_at) <= NOW() - INTERVAL '1 minute' * $1::numeric
+          AND EXISTS (
+            SELECT 1 FROM mission_interests mi
+            WHERE mi.mission_id = m.id AND mi.declined = false
+              AND mi.created_at <= NOW() - INTERVAL '1 minute' * $1::numeric
+          )
       `, [seuilMinutes]);
+      const seuilCutMs = Date.now() - seuilMinutes * 60000;
 
-      for (const m of dueMissions) {
-        // Isolation par itération (RG9) — trouvée pendant l'analyse, hors liste initiale de
-        // l'audit, même classe de défaut que les 12 boucles listées.
+      for (const m of candidates) {
+        // Isolation par itération (RG9).
         try {
-        const { rowCount } = await db.query(
-          `UPDATE missions SET candidature_whatsapp_sent_at=NOW() WHERE id=$1 AND candidature_whatsapp_sent_at IS NULL`,
-          [m.id]
-        );
-        if (rowCount > 0) {
-          // Chantier 2 lot 1 bis (décision BOSS B) : au seuil, notification + push au client ; le
-          // WhatsApp oeil_applied n'est plus qu'une RELANCE, envoyée après
-          // candidature_whatsapp_relance_minutes seulement si le client n'a ni lu cette
-          // notification ni ouvert la liste des candidats (jobs/whatsappRelances.js). La colonne
-          // candidature_whatsapp_sent_at garde son rôle d'anti-doublon du SEUIL (un par mission).
-          const seuilNotif = await notify(
-            db, m.client_id,
-            'Des Œils ont postulé 👁️',
-            `Candidatures reçues pour "${m.title}" : ${m.n}. Choisissez votre Œil pour confirmer la mission.`,
-            'interest', m.id, app.get('emitToUser'), 'interests_modal',
-            'candidatureSeuilClientTitle', 'candidatureSeuilClientBody', { missionTitle: m.title, count: m.n }
+          const visible = await listClientVisibleCandidates(db, m);
+          if (visible.length === 0 || !visible.some((o) => new Date(o.interested_at).getTime() <= seuilCutMs)) continue;
+          const { rowCount } = await db.query(
+            `UPDATE missions SET candidature_whatsapp_sent_at=NOW() WHERE id=$1 AND candidature_whatsapp_sent_at IS NULL`,
+            [m.id]
           );
-          await scheduleClientAppliedRelance(db, m.id, m.client_id, seuilNotif && seuilNotif.id);
-          console.log(`📲 Seuil candidatures (délai) déclenché pour mission ${m.id} — ${m.n} candidature(s), notification envoyée, relance WhatsApp programmée`);
-        }
-        } catch (e) { console.error(`❌ Cron seuil WhatsApp candidatures — mission ${m.id} :`, e.message); }
+          if (rowCount > 0) {
+            const seuilNotif = await notify(
+              db, m.client_id,
+              'Des Œils ont postulé 👁️',
+              `Candidatures reçues pour "${m.title}" : ${visible.length}. Choisissez votre Œil pour confirmer la mission.`,
+              'interest', m.id, emitToUser, 'interests_modal',
+              'candidatureSeuilClientTitle', 'candidatureSeuilClientBody', { missionTitle: m.title, count: visible.length }
+            );
+            await scheduleClientAppliedRelance(db, m.id, m.client_id, seuilNotif && seuilNotif.id);
+            console.log(`📲 Seuil candidatures (délai) déclenché pour mission ${m.id} — ${visible.length} candidature(s)`);
+          }
+        } catch (e) { console.error(`❌ Cron seuil candidatures — mission ${m.id} :`, e.message); }
       }
-    } catch (e) { console.error('❌ Cron seuil WhatsApp candidatures error:', e.message); }
+    } catch (e) { console.error('❌ Cron seuil candidatures error:', e.message); }
     finally { cronCandidatureWhatsAppRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
@@ -1682,76 +1639,23 @@ initDb().then(() => {
     if (cronStaleMissionsRunning) { console.warn('⏭️ Cron missions sans Œil déjà en cours, tick ignoré'); return; }
     cronStaleMissionsRunning = true;
     try {
-      const db = getDb();
-      const emitToUser = app.get('emitToUser');
-      const staleMissionHours = await getSetting(db, 'stale_mission_hours', 12);
-      const staleMissionMinLeadHours = await getSetting(db, 'stale_mission_min_lead_hours', 4);
-
-      const { rows: staleMissions } = await db.query(`
-        SELECT * FROM missions
-        WHERE status = 'pending'
-          AND oeil_id IS NULL
-          AND created_at <= NOW() - INTERVAL '1 hour' * $1::numeric
-          AND scheduled_at >= NOW() + INTERVAL '1 hour' * $2::numeric
-          AND stale_notified_at IS NULL
-      `, [staleMissionHours, staleMissionMinLeadHours]);
-
-      // Un seul SELECT admins par tick, réutilisé pour chaque mission ci-dessous (audit perf
-      // 2026-07-26).
-      const { rows: admins } = await db.query(`SELECT id, phone FROM users WHERE role='admin' AND is_active=true`);
-      for (const m of staleMissions) {
-        // Isolation par itération (RG9) — voir la boucle lateH plus haut.
-        try {
-          // Groupe 3 point 3.5 (audit exhaustif backend 2026-09-05 §2.4) — garde d'idempotence
-          // AVANT les effets (notifications admin + WhatsApp + notification client). Avant : le
-          // UPDATE stale_notified_at était la DERNIÈRE ligne ; un échec au milieu de la boucle
-          // admin (ou sur l'envoi WhatsApp) faisait re-notifier toute la mission au tick suivant.
-          // Même forme que candidature_whatsapp_sent_at et les rappels J-1/H-2. Compromis assumé :
-          // un envoi raté après cette ligne n'est pas rejoué (mieux qu'un doublon d'alerte admin).
-          const { rowCount } = await db.query(
-            `UPDATE missions SET stale_notified_at = NOW() WHERE id = $1 AND stale_notified_at IS NULL`,
-            [m.id]
-          );
-          if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
-          for (const admin of admins) {
-            // Migré vers notify() (chantier push) — in-app + socket live (emitToUser en scope,
-            // corrige L13) + push. Idempotence garantie en amont par stale_notified_at.
-            await notify(
-              db, admin.id,
-              '⏳ Mission sans Œil depuis 12h',
-              `Aucun Œil n'a encore été trouvé pour "${m.title}", en attente depuis plus de 12h.`,
-              'warning', m.id, emitToUser, 'admin_missions',
-              'staleMissionAdminTitle', 'staleMissionAdminBody', { missionTitle: m.title }
-            );
-            if (admin.phone) {
-              await sendWhatsAppTemplate(waselTemplates.mission_without_oeil_admin.template_name, admin.phone, [m.title]);
-            }
-          }
-
-          // Constat 20 (audit-360, BE-5) — notification client restaurée : retirée le 2026-07-11
-          // (commit 2d73ade) faute de page d'édition côté client et de compte WhatsApp Wasel actif.
-          // Les deux blocages ont évolué depuis : PUT /missions/:id applique désormais directement
-          // les modifications sur une mission encore 'pending' (voir validateMissionEditFields),
-          // et notify()/l'infra WhatsApp existent pour le reste du produit. `price` reste dans
-          // FORBIDDEN_EDIT_FIELDS (verrouillé pour le client, PROMPT 1 anti-fraude) — pas de
-          // gabarit WhatsApp dédié côté client (créer un template Wasel est hors périmètre de ce
-          // chantier, voir constat 03) : notification in-app uniquement, pas d'envoi WhatsApp ici.
-          // Migré vers notify() (chantier push) : l'emit partiel { title, body, missionId, type }
-          // devient la ligne complète (id, action_type, title_key, params…) comme partout
-          // ailleurs — le clic in-app peut désormais deep-linker et se marquer lu. + push.
-          await notify(
-            db, m.client_id,
-            '💡 Toujours aucun Œil pour votre mission',
-            `Votre mission "${m.title}" n'a pas encore trouvé d'Œil après 12h. Augmenter le budget peut attirer plus de candidats. Consultez votre mission pour l'ajuster.`,
-            'warning', m.id, emitToUser, 'mission_view',
-            'staleMissionClientTitle', 'staleMissionClientBody', { missionTitle: m.title }
-          );
-
-          console.log(`⏳ Notification mission sans Œil envoyée pour ${m.id}`);
-        } catch (e) { console.error(`❌ Cron missions sans Œil — mission ${m.id} :`, e.message); }
-        }
+      // Logique dans jobs/staleMissions.js (texte paramétré par le réglage réel, candidatures
+      // comptées comme le client les voit, alerte client seulement sans candidature).
+      await runStaleMissions(getDb(), app.get('emitToUser'));
     } catch (e) { console.error('❌ Cron missions sans Œil error:', e.message); }
     finally { cronStaleMissionsRunning = false; }
+  }, { timezone: 'Africa/Casablanca' });
+
+  // ── Cron chaque minute — Notifications non urgentes reportées (plage de silence) ──
+  // File deferred_notifications (utils/notify.js notifyDifferable) : envoi à la fin de la plage
+  // 22 h – 7 h (heure de Casablanca). Persistée en base : un redémarrage ne fait rien perdre.
+  cron.schedule('* * * * *', async () => {
+    if (cronDeferredNotificationsRunning) { console.warn('⏭️ Cron notifications différées déjà en cours, tick ignoré'); return; }
+    cronDeferredNotificationsRunning = true;
+    try {
+      await runDeferredNotifications(getDb(), app.get('emitToUser'));
+    } catch (e) { console.error('❌ Cron notifications différées error:', e.message); }
+    finally { cronDeferredNotificationsRunning = false; }
   }, { timezone: 'Africa/Casablanca' });
 
   // ── Cron toutes les 30 min — Missions pending jamais assignées, créneau déjà dépassé ──
@@ -1814,17 +1718,17 @@ initDb().then(() => {
         );
         await db.query(
           `INSERT INTO ticket_messages (ticket_id, sender_id, sender_role, content, is_system)
-           VALUES ($1, $2, 'admin', 'Ticket résolu automatiquement après 72h sans réponse de votre part.', true)`,
-          [ticket.id, systemSenderId]
+           VALUES ($1, $2, 'admin', $3, true)`,
+          [ticket.id, systemSenderId, `Ticket résolu automatiquement après ${ticketAutoResolveHours} h sans réponse de votre part.`]
         );
         await notify(
           db, ticket.user_id,
           `📋 Ticket ${ticket.reference} résolu automatiquement`,
-          'Aucune réponse de votre part depuis 72h — le ticket a été résolu automatiquement. Vous pouvez le rouvrir en répondant.',
+          `Aucune réponse de votre part depuis ${ticketAutoResolveHours} h — le ticket a été résolu automatiquement. Vous pouvez le rouvrir en répondant.`,
           'info', ticket.mission_id, emitToUser, 'ticket_view',
-          'ticketAutoResolvedTitle', 'ticketAutoResolvedBody', { reference: ticket.reference, ticketId: ticket.id }
+          'ticketAutoResolvedTitle', 'ticketAutoResolvedBody', { reference: ticket.reference, ticketId: ticket.id, hours: ticketAutoResolveHours }
         );
-        console.log(`📋 Ticket ${ticket.reference} auto-résolu après 72h d'inactivité`);
+        console.log(`📋 Ticket ${ticket.reference} auto-résolu après ${ticketAutoResolveHours} h d'inactivité`);
         } catch (e) { console.error(`❌ Cron auto-résolution tickets — ticket ${ticket.id} :`, e.message); }
       }
     } catch (e) { console.error('❌ Cron auto-résolution tickets error:', e.message); }
