@@ -37,6 +37,9 @@ module.exports = {
   abandon_during_mission_cooldown_hours: '48',
   stale_mission_hours: '12',
   stale_mission_min_lead_hours: '4',
+  // Règle administrations (décision BOSS) : heure limite (Casablanca) au-delà de laquelle une mission
+  // dont la catégorie est une administration ne peut plus commencer, ni un samedi/dimanche (utils/administrationHours.js).
+  administration_closing_hour: '17',
   // Correctif audit financier 2026-09-17, §2.4.1 : distinct de stale_mission_hours ci-dessus
   // (qui alerte 12h après CRÉATION, tant que le créneau reste encore lointain) — celui-ci couvre
   // le cas qu'aucun cron n'observait : une mission 'pending'/oeil_id NULL dont le créneau prévu

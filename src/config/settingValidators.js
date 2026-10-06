@@ -90,6 +90,7 @@ const SETTING_RULES = {
   abandon_during_mission_cooldown_hours:       { min: 0 }, // missions.js:3611
   stale_mission_hours:                         { min: 0 }, // index.js:1518  INTERVAL '1 hour' * $1
   stale_mission_min_lead_hours:                { min: 0 }, // index.js:1519  INTERVAL '1 hour' * $2
+  administration_closing_hour:                 { min: 0, max: 23, integer: true }, // utils/administrationHours.js
   pending_mission_expiration_hours:            { min: 0 }, // index.js cronPendingMissionExpiration  INTERVAL '1 hour' * $n
   mission_overdue_verification_hours:          { min: 0 }, // index.js:925
   late_start_alert_window_minutes:             { min: 0 }, // index.js:726/779  INTERVAL '1 minute' * $n
