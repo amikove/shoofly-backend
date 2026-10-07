@@ -2124,7 +2124,7 @@ router.get('/admin/claims', authenticate, requireRole('admin'), requirePermissio
   // TIMESTAMPTZ est indépendante du fuseau, mais NOW() doit rester la référence serveur).
   const { rows } = await db.query(`
     SELECT cl.*,
-      m.title AS mission_title, m.price AS mission_price, m.oeil_earning, m.oeil_id,
+      m.title AS mission_title, m.price AS mission_price, m.oeil_earning, m.oeil_id, m.payment_method,
       c.first_name||' '||c.last_name AS client_name,
       o.first_name||' '||o.last_name AS oeil_name,
       EXTRACT(EPOCH FROM (NOW() - cl.created_at)) / 3600 AS age_hours

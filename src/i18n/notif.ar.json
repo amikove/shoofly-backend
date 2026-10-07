@@ -237,7 +237,7 @@
   "missionCompletedOeilTitle": "انتهت المهمة",
   "missionUrgentBroadenedBody": "نقوم بتوسيع نطاق البحث عن بديل لمهمة \"{{missionTitle}}\" ليشمل جميع العيون الميدانية المتاحة.",
   "missionUrgentBroadenedTitle": "🔎 توسيع نطاق البحث",
-  "pendingExpiredAdminBody": "\"{{missionTitle}}\" لا تزال دون عين رغم أن موعدها المقرر قد مضى بالفعل. إلغاء تلقائي واسترجاع مبلغ العميل إذا لم تتغير الوضعية خلال {{hours}} ساعة بعد الموعد.",
+  "pendingExpiredAdminBody": "\"{{missionTitle}}\" لا تزال دون عين رغم أن موعدها المقرر قد مضى بالفعل. إلغاء تلقائي واسترجاع كامل مبلغ العميل إذا لم تتغير الوضعية خلال {{hours}} ساعة بعد الموعد.",
   "pendingExpiredAdminTitle": "⏰ مهمة لم تُسنَد أبدًا، الموعد تجاوَزَه الوقت",
   "presenceNotConfirmedAdminBody": "العين الميدانية {{oeilName}} لم تؤكد حضورها في الوقت المحدد لمهمة \"{{missionTitle}}\". تم إطلاق إعادة الإسناد التلقائية دون أي عقوبة.",
   "presenceNotConfirmedAdminTitle": "🔄 إعادة إسناد تلقائية — لم يتم تأكيد الحضور",
@@ -257,5 +257,6 @@
   "pendingExpiredCancelledClientBody": "لم يُعثر على عين لمهمة \"{{missionTitle}}\" وموعدها المقرر قد تجاوزه الوقت منذ أكثر من {{hours}} ساعة. تم إلغاء المهمة تلقائيًا.",
   "missionStillUnfilledOeilTitle": "لا تزال بدون عين: « {{missionTitle}} »",
   "missionStillUnfilledOeilBody": "هذه المهمة ما زالت مفتوحة ولم تختر أي عين ميدانية بعد. قدّم ترشحك إذا كانت تهمك.",
-  "pendingExpiredCancelledClientRefundBody": "لم يُعثر على عين لمهمة \"{{missionTitle}}\" وموعدها المقرر قد تجاوزه الوقت منذ أكثر من {{hours}} ساعة. تم إلغاء المهمة تلقائيًا وإعادة {{refund}} درهم إلى محفظتك."
+  "pendingExpiredCancelledClientRefundBody": "لم يُعثر على عين لمهمة \"{{missionTitle}}\" وموعدها المقرر قد تجاوزه الوقت منذ أكثر من {{hours}} ساعة. تم إلغاء المهمة تلقائيًا وإعادة {{refund}} درهم إلى محفظتك.",
+  "pendingExpiredAdminNoPaymentBody": "\"{{missionTitle}}\" لا تزال دون عين رغم أن موعدها قد مضى. إلغاء تلقائي إذا لم تتغير الوضعية خلال {{hours}} ساعة بعد الموعد. الدفع نقدًا: لا يوجد أي استرجاع."
 }

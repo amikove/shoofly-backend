@@ -237,7 +237,7 @@
   "missionCompletedOeilTitle": "Mission terminée",
   "missionUrgentBroadenedBody": "Nous élargissons la recherche d'un remplaçant pour \"{{missionTitle}}\" à tous les Œils disponibles.",
   "missionUrgentBroadenedTitle": "🔎 Recherche élargie",
-  "pendingExpiredAdminBody": "\"{{missionTitle}}\" est toujours sans Œil alors que son créneau prévu est déjà passé. Annulation automatique et remboursement du client si la situation ne change pas d'ici {{hours}} h après le créneau.",
+  "pendingExpiredAdminBody": "\"{{missionTitle}}\" est toujours sans Œil alors que son créneau prévu est déjà passé. Annulation automatique et remboursement intégral du client si la situation ne change pas d'ici {{hours}} h après le créneau.",
   "pendingExpiredAdminTitle": "⏰ Mission jamais assignée, créneau dépassé",
   "presenceNotConfirmedAdminBody": "L'Œil {{oeilName}} n'a pas confirmé sa présence à temps pour \"{{missionTitle}}\". Réattribution automatique lancée, aucune pénalité appliquée.",
   "presenceNotConfirmedAdminTitle": "🔄 Réattribution automatique — présence non confirmée",
@@ -257,5 +257,6 @@
   "pendingExpiredCancelledClientBody": "Aucun Œil n'a été trouvé pour \"{{missionTitle}}\" et le créneau prévu est dépassé depuis plus de {{hours}}h. La mission a été annulée automatiquement.",
   "missionStillUnfilledOeilTitle": "Toujours sans Œil : « {{missionTitle}} »",
   "missionStillUnfilledOeilBody": "Cette mission est toujours ouverte et aucun Œil ne l'a encore choisie. Postulez si elle vous intéresse.",
-  "pendingExpiredCancelledClientRefundBody": "Aucun Œil n'a été trouvé pour \"{{missionTitle}}\" et le créneau prévu est dépassé depuis plus de {{hours}}h. La mission a été annulée automatiquement et {{refund}} MAD ont été recrédités sur votre portefeuille."
+  "pendingExpiredCancelledClientRefundBody": "Aucun Œil n'a été trouvé pour \"{{missionTitle}}\" et le créneau prévu est dépassé depuis plus de {{hours}}h. La mission a été annulée automatiquement et {{refund}} MAD ont été recrédités sur votre portefeuille.",
+  "pendingExpiredAdminNoPaymentBody": "\"{{missionTitle}}\" est toujours sans Œil alors que son créneau est passé. Annulation automatique si rien ne change d'ici {{hours}} h après le créneau. Paiement en espèces : aucun remboursement."
 }

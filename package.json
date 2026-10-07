@@ -5,7 +5,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node start.js",
-    "test": "node --test --test-concurrency=1 tests/quiet-hours.test.js tests/notif-catalog.test.js tests/notifications.db.test.js tests/notifications.urgent.test.js tests/seed-guard.test.js tests/administration-hours.test.js tests/administration-http.test.js tests/send-guard.test.js tests/mission-to-verify.test.js tests/whatsapp-send-log.test.js",
+    "test": "node --test --test-concurrency=1 tests/quiet-hours.test.js tests/notif-catalog.test.js tests/notifications.db.test.js tests/notifications.urgent.test.js tests/seed-guard.test.js tests/administration-hours.test.js tests/administration-http.test.js tests/send-guard.test.js tests/mission-to-verify.test.js tests/whatsapp-send-log.test.js tests/pending-expired-admin-text.test.js",
     "dev": "nodemon src/index.js",
     "seed": "node src/db/seed.js",
     "check:notif-i18n": "node scripts/check-notif-i18n.js"

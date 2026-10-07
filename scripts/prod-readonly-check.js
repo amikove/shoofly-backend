@@ -64,6 +64,18 @@ const QUERIES = {
     WHERE status IN ('active', 'en_route')
       AND scheduled_at < NOW() - INTERVAL '24 hours'
       AND oeil_id IS NOT NULL`,
+  // Audit « remboursement sur mission cash » (2026-10-07) — devrait toujours renvoyer 0 ligne :
+  // le code conditionne chaque appel à refundOnCancellation() sur payment_method !== 'cash'
+  // (voir rapport). Cette requête est un filet de sécurité, pas une preuve de bug : elle
+  // vérifierait un crédit wallet qui ne devrait jamais exister pour une mission cash.
+  '4. Crédits wallet "remboursement" sur des missions payées en espèces, par statut (attendu : aucune ligne)': `
+    SELECT m.status, COUNT(*)::int AS n, COALESCE(SUM(wt.amount), 0)::numeric(12,2) AS montant_total
+    FROM wallet_transactions wt
+    JOIN missions m ON m.id = wt.mission_id
+    WHERE m.payment_method = 'cash'
+      AND wt.type = 'credit'
+      AND (wt.reason ILIKE '%rembours%' OR wt.reason ILIKE '%refund%')
+    GROUP BY m.status ORDER BY n DESC`,
 };
 
 async function main() {
