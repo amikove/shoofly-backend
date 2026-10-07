@@ -74,7 +74,7 @@ const QUERIES = {
     JOIN missions m ON m.id = wt.mission_id
     WHERE m.payment_method = 'cash'
       AND wt.type = 'credit'
-      AND wt.reason ILIKE '%remboursement%'
+      AND (wt.reason ILIKE '%rembours%' OR wt.reason ILIKE '%refund%')
     GROUP BY m.status ORDER BY n DESC`,
 };
 

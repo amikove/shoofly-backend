@@ -5208,6 +5208,7 @@ router.get('/admin/problems', authenticate, requireRole('admin'), asyncHandler(a
       const { rows } = await db.query(`
           SELECT r.*,
           m.title AS mission_title, m.city, m.scheduled_at, m.id AS mission_ref_id,
+          m.price AS mission_price, m.payment_method,
           u.first_name AS reporter_first, u.last_name AS reporter_last,
           c.id AS client_id, c.first_name AS client_first, c.last_name AS client_last,
           o.id AS oeil_id, o.first_name AS oeil_first, o.last_name AS oeil_last
@@ -5494,13 +5495,20 @@ async function checkPendingMissionExpiration(db, io, emitToUser) {
         );
         if (rowCount === 0) continue; // déjà traité entre le SELECT et cette itération
         const graceHours = await getSetting(db, 'pending_mission_expiration_hours', 24);
+        // Mission cash (audit remboursement, 2026-10-07) : Shoofly n'a jamais encaissé le client,
+        // donc pas de promesse de remboursement dans l'alerte admin — texte et clé dédiés.
+        const isCashMission = m.payment_method === 'cash';
+        const adminBody = isCashMission
+          ? `"${m.title}" est toujours sans Œil alors que son créneau est passé. Annulation automatique si rien ne change d'ici ${graceHours} h après le créneau. Paiement en espèces : aucun remboursement.`
+          : `"${m.title}" est toujours sans Œil alors que son créneau prévu est déjà passé. Annulation automatique et remboursement intégral du client si la situation ne change pas d'ici ${graceHours} h après le créneau.`;
+        const adminBodyKey = isCashMission ? 'pendingExpiredAdminNoPaymentBody' : 'pendingExpiredAdminBody';
         for (const admin of admins) {
           await notify(
             db, admin.id,
             '⏰ Mission jamais assignée, créneau dépassé',
-            `"${m.title}" est toujours sans Œil alors que son créneau prévu est déjà passé. Annulation automatique et remboursement du client si la situation ne change pas d'ici ${graceHours} h après le créneau.`,
+            adminBody,
             'warning', m.id, emitToUser, 'admin_missions',
-            'pendingExpiredAdminTitle', 'pendingExpiredAdminBody', { missionTitle: m.title, hours: graceHours }
+            'pendingExpiredAdminTitle', adminBodyKey, { missionTitle: m.title, hours: graceHours }
           );
         }
       } catch (e) { console.error(`❌ checkPendingMissionExpiration: alerte mission ${m.id} :`, e.message); }
